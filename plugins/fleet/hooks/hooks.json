@@ -1,0 +1,17 @@
+{
+  "description": "Re-brief a fleet lane or orchestrator from its .fleet/ files after /clear or compaction.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/fleet\" hook session-start",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "herdr-fleet",
+  "description": "Run fleets of coding-agent lanes in Herdr panes: open lanes, hand off to a new pane, keep context small, and pick accounts with remuda when it is installed.",
+  "owner": {
+    "name": "Tao Luo"
+  },
+  "plugins": [
+    {
+      "name": "fleet",
+      "description": "Open Herdr lanes (worktree + pane + agent + brief), hand work off to a new pane, manage context with /clear and /compact, and choose remuda accounts when remuda is installed.",
+      "source": "./plugins/fleet",
+      "category": "productivity"
+    }
+  ]
+}

@@ -1,0 +1,1375 @@
+#!/usr/bin/env python3
+"""fleet: helper CLI for the `fleet` Claude Code plugin.
+
+Runs coding-agent lanes in Herdr panes. remuda is optional. Without it, every
+lane uses the agent's own login (the caller's CLAUDE_CONFIG_DIR / CODEX_HOME
+when set) and there is no account switching.
+
+Commands:
+  fleet doctor [--json]                   check the environment (onboarding)
+  fleet conventions [--path]              the user's fleet conventions (or the plugin defaults)
+  fleet accounts [--live]                 remuda accounts and usage (cached unless --live)
+  fleet prep [DIR] [--handoff]            create <git top>/.fleet and keep it out of git
+  fleet worktree BRANCH [--base REF]      herdr worktree + workspace for a lane, .fleet/ ready
+  fleet spawn [options] [-- ARGS...]      open a pane and start an agent in it
+  fleet send PANE (--text T | --file F)   submit a prompt to an agent and verify it landed
+  fleet watch PANE [--marker M]           wait for a file marker, or for the agent to stop or block
+  fleet reset PANE [--compact [FOCUS]]    /clear (or /compact) a claude lane, then resume it
+  fleet status [--workspace W] [--json]   agent panes with role, account, branch and lane files
+  fleet retire PANE [--close]             exit the agent in PANE (never the calling pane)
+  fleet hook session-start                SessionStart hook: re-brief after /clear or compaction
+
+Python 3.8+, standard library only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+VERSION = "0.1.0"
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+FLEET_DIR = ".fleet"
+LANE_FILES = ("BRIEF.md", "STATUS.md", "HANDOFF.md")
+ORCHESTRATOR_FILE = "FLEET.md"
+PANES_FILE = "panes.json"  # pane id -> role record, written by `fleet spawn --role`
+ROLES = ("impl", "critic", "orchestrator", "helper")
+ORCHESTRATOR_LINE = re.compile(r"^\s*Orchestrator:\s*pane\s+([A-Za-z0-9]+:[A-Za-z0-9]+)", re.M)
+SESSION_ID = re.compile(r"[0-9A-Za-z-]{8,64}")
+PROMPT_MAX = 500  # longer text, or any newline, is written to a file and sent as a pointer
+AGENTS = ("claude", "codex")
+EXIT_COMMAND = {"claude": "/exit", "codex": "/quit"}
+COMPOSER_MARK = {"claude": "❯", "codex": "›"}
+REPLY_MARKS = ("⏺", "•")
+
+# Dialogs that block a freshly started agent.
+TRUST_DIALOG = re.compile(
+    r"Yes, I trust this folder|Do you trust the files in this folder|"
+    r"allow Codex to work in this folder|Do you trust the contents of this directory",
+    re.I,
+)
+TRUST_ACCEPT = re.compile(r"Yes, I trust this folder|Yes, allow Codex|^\s*(?:[❯›>]\s*)?(?:\d+\.\s*)?Yes\b", re.I)
+FULLSCREEN_PROMPT = re.compile(r"fullscreen renderer", re.I)
+CODEX_UPDATE_MENU = re.compile(r"Update now", re.I)
+CODEX_UPDATE_SKIP = re.compile(r"^\s*(?:[❯›>]\s*)?(?:\d+\.\s*)?Skip\b", re.I)
+
+
+class FleetError(Exception):
+    def __init__(self, message: str, code: int = 1):
+        super().__init__(message)
+        self.code = code
+
+
+# --------------------------------------------------------------------------
+# Process helpers
+
+
+def run(cmd: list[str], timeout: float = 30, input_text: str | None = None) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=input_text)
+    except FileNotFoundError:
+        raise FleetError(f"{cmd[0]}: command not found")
+    except subprocess.TimeoutExpired:
+        raise FleetError(f"timed out after {timeout:g}s: {shlex.join(cmd)}")
+
+
+def first_line(text: str) -> str:
+    for line in (text or "").splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def tool_version(path: str | None, args: tuple[str, ...] = ("--version",)) -> str | None:
+    if not path:
+        return None
+    try:
+        cp = run([path, *args], timeout=10)
+    except FleetError:
+        return None
+    return first_line(cp.stdout or cp.stderr) or None
+
+
+# --------------------------------------------------------------------------
+# Herdr
+
+
+def require_herdr() -> None:
+    if os.environ.get("HERDR_ENV") != "1":
+        raise FleetError("not running inside a Herdr pane (HERDR_ENV is not 1)")
+    if not shutil.which("herdr"):
+        raise FleetError("herdr not found in PATH")
+
+
+def herdr(*args: str, timeout: float = 30) -> dict:
+    cp = run(["herdr", *args], timeout=timeout)
+    out = (cp.stdout or "").strip()
+    if cp.returncode != 0:
+        detail = (cp.stderr or out).strip()
+        raise FleetError(f"herdr {' '.join(args[:2])} failed: {detail[:400]}")
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        raise FleetError(f"herdr {' '.join(args[:2])}: expected JSON, got: {out[:200]}")
+    if isinstance(data, dict) and data.get("error"):
+        raise FleetError(f"herdr {' '.join(args[:2])}: {data['error']}")
+    return data.get("result", data) if isinstance(data, dict) else data
+
+
+def herdr_ok(*args: str, timeout: float = 30) -> bool:
+    try:
+        return run(["herdr", *args], timeout=timeout).returncode == 0
+    except FleetError:
+        return False
+
+
+def pane_info(pane: str) -> dict:
+    return herdr("pane", "get", pane)["pane"]
+
+
+def find_pane_id(result: dict) -> str:
+    for key in ("pane", "root_pane"):
+        if isinstance(result.get(key), dict) and result[key].get("pane_id"):
+            return result[key]["pane_id"]
+    raise FleetError(f"no pane id in herdr response: {json.dumps(result)[:300]}")
+
+
+def pane_lines(pane: str, rows: int | None = None, extra: int = 200) -> list[str]:
+    """Non-empty, non-rule lines of the pane's recent scrollback.
+
+    A TUI pads its viewport with blank rows, so read viewport_rows + extra
+    lines and drop the padding; a short read returns only blank padding.
+    """
+    if rows is None:
+        rows = pane_info(pane).get("scroll", {}).get("viewport_rows", 120)
+    cp = run(["herdr", "pane", "read", pane, "--source", "recent-unwrapped", "--lines", str(int(rows) + extra)])
+    if cp.returncode != 0:
+        raise FleetError(f"herdr pane read failed: {(cp.stderr or cp.stdout).strip()[:300]}")
+    return clean_lines(cp.stdout)
+
+
+def clean_lines(text: str) -> list[str]:
+    lines = []
+    for raw in (text or "").splitlines():
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped or re.fullmatch(r"[─━═\-]+", stripped):
+            continue
+        lines.append(line)
+    return lines
+
+
+def send_keys(pane: str, *keys: str) -> None:
+    run(["herdr", "pane", "send-keys", pane, *keys])
+
+
+def auto_direction(rect: dict) -> str:
+    """Split a visually wide pane to the right and a tall one down.
+
+    Terminal cells are about twice as tall as they are wide.
+    """
+    width, height = rect.get("width", 0), rect.get("height", 0)
+    return "right" if width >= 2 * height else "down"
+
+
+def pane_rect(pane: str) -> dict:
+    layout = herdr("pane", "layout", "--pane", pane)["layout"]
+    for p in layout.get("panes", []):
+        if p.get("pane_id") == pane:
+            return p.get("rect", {})
+    return {}
+
+
+# --------------------------------------------------------------------------
+# Accounts (remuda is optional)
+
+
+def remuda_path() -> str | None:
+    if os.environ.get("FLEET_NO_REMUDA") == "1":
+        return None
+    return shutil.which("remuda")
+
+
+def parse_remuda_list(text: str) -> list[dict]:
+    """Parse `remuda list` (columns ACCOUNT EMAIL ORG PLAN HOME, 2+ spaces apart)."""
+    accounts = []
+    for line in (text or "").splitlines():
+        if not line.strip() or line.lstrip().startswith("ACCOUNT"):
+            continue
+        cols = re.split(r"\s{2,}", line.strip())
+        if not cols or ":" not in cols[0]:
+            continue
+        provider, name = cols[0].split(":", 1)
+        accounts.append({
+            "account": cols[0],
+            "provider": provider,
+            "name": name,
+            "email": cols[1] if len(cols) > 1 else "",
+            "plan": cols[3] if len(cols) > 4 else "",
+            "home": cols[-1] if len(cols) > 1 else "",
+        })
+    return accounts
+
+
+def remuda_accounts(remuda: str) -> list[dict]:
+    cp = run([remuda, "list"], timeout=20)
+    if cp.returncode != 0:
+        raise FleetError(f"remuda list failed: {(cp.stderr or cp.stdout).strip()[:300]}")
+    return parse_remuda_list(cp.stdout)
+
+
+def resolve_account(account: str, agent: str | None, accounts: list[dict]) -> dict:
+    """Map a user-facing account name to one remuda account row."""
+    if ":" in account:
+        matches = [a for a in accounts if a["account"] == account]
+    else:
+        matches = [a for a in accounts if a["name"] == account]
+        if agent:
+            matches = [a for a in matches if a["provider"] == agent]
+    if agent:
+        wrong = [a for a in matches if a["provider"] != agent]
+        if wrong:
+            raise FleetError(f"account {account} is a {wrong[0]['provider']} account, not {agent}")
+    if not matches:
+        known = ", ".join(a["account"] for a in accounts) or "none"
+        raise FleetError(f"no remuda account named {account} (known: {known})")
+    if len(matches) > 1:
+        names = ", ".join(a["account"] for a in matches)
+        raise FleetError(f"account {account} is ambiguous ({names}); pass --agent or a provider-qualified name")
+    return matches[0]
+
+
+DEFAULT_HOME = {"claude": "~/.claude", "codex": "~/.codex"}
+HOME_VAR = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
+
+
+def account_home(agent: str, row: dict | None) -> str:
+    """Config dir of a remuda account row ("default" means the agent's own default dir)."""
+    if row and row.get("home") and row["home"] != "default":
+        return os.path.expanduser(row["home"])
+    return os.path.expanduser(DEFAULT_HOME[agent])
+
+
+def home_matches(home: str, env_dir: str | None) -> bool:
+    if home == "default":
+        return not env_dir
+    if not env_dir:
+        return False
+    try:
+        return os.path.realpath(os.path.expanduser(home)) == os.path.realpath(os.path.expanduser(env_dir))
+    except OSError:
+        return False
+
+
+def caller_account(agent: str, accounts: list[dict], env: dict) -> dict | None:
+    env_dir = env.get("CLAUDE_CONFIG_DIR") if agent == "claude" else env.get("CODEX_HOME")
+    for a in accounts:
+        if a["provider"] == agent and home_matches(a["home"], env_dir):
+            return a
+    return None
+
+
+def agent_args(agent: str, model: str | None, permission_mode: str | None, name: str | None, extra: list[str]) -> list[str]:
+    args: list[str] = []
+    if model:
+        args += ["--model", model]
+    if permission_mode:
+        if agent != "claude":
+            raise FleetError("--permission-mode applies to claude only; pass codex approval flags after --")
+        args += ["--permission-mode", permission_mode]
+    if name and agent == "claude":
+        args += ["-n", name]
+    return args + list(extra)
+
+
+def build_launch(agent: str, account: str | None, model: str | None, permission_mode: str | None,
+                 name: str | None, prompt: str | None, extra: list[str],
+                 remuda: str | None, accounts: list[dict] | None, env: dict) -> dict:
+    """Return the shell command that starts the agent, and how its account was chosen."""
+    if agent not in AGENTS:
+        raise FleetError(f"--agent must be one of {', '.join(AGENTS)}")
+    args = agent_args(agent, model, permission_mode, name, extra)
+    tail = [prompt] if prompt else []
+    var = HOME_VAR[agent]
+    if not remuda:
+        if account:
+            raise FleetError("accounts need remuda; remuda is not installed (or FLEET_NO_REMUDA=1)")
+        # Same login as the caller: carry its config dir, if it set one. An
+        # assignment word must stay unquoted, so quote the value alone.
+        prefix = f"{var}={shlex.quote(env[var])} " if env.get(var) else ""
+        command = prefix + shlex.join([agent, *args, *tail])
+        home = os.path.expanduser(env.get(var) or DEFAULT_HOME[agent])
+        return {"command": command, "account": None, "account_source": "plain", "agent": agent, "home": home}
+    accounts = accounts or []
+    if account:
+        row = resolve_account(account, agent, accounts)
+        source = "explicit"
+    else:
+        row = caller_account(agent, accounts, env)
+        source = "caller"
+    if not row:
+        # A new pane does not inherit the caller's config dir: bare agent = default login.
+        return {"command": shlex.join([agent, *args, *tail]), "account": None,
+                "account_source": "agent default", "agent": agent, "home": account_home(agent, None)}
+    argv = [remuda, "run", row["account"], *args, *tail]
+    return {"command": shlex.join(argv), "account": row["account"], "account_source": source, "agent": agent,
+            "home": account_home(agent, row)}
+
+
+def transcript_visible(home: str, session_id: str) -> bool:
+    """True when a claude config dir holds the transcript of `session_id`."""
+    pattern = os.path.join(glob.escape(os.path.expanduser(home)), "projects", "*", f"{glob.escape(session_id)}.jsonl")
+    return bool(glob.glob(pattern))
+
+
+# --------------------------------------------------------------------------
+# Pane screen analysis
+
+
+def composer_index(lines: list[str], agent: str) -> int | None:
+    """Index of the agent's input line: the last line that starts with its prompt mark."""
+    mark = COMPOSER_MARK.get(agent, "❯")
+    start = max(0, len(lines) - 30)
+    for i in range(len(lines) - 1, start - 1, -1):
+        if lines[i].lstrip().startswith(mark):
+            return i
+    return None
+
+
+def composer_line(lines: list[str], agent: str) -> str | None:
+    """Text in the agent's input line (empty when the composer is empty)."""
+    i = composer_index(lines, agent)
+    if i is None:
+        return None
+    mark = COMPOSER_MARK.get(agent, "❯")
+    return lines[i].strip()[len(mark):].strip()
+
+
+def text_head(text: str, size: int = 32) -> str:
+    return re.sub(r"\s+", " ", first_line(text))[:size]
+
+
+def submitted_count(lines: list[str], head: str, agent: str) -> int:
+    """How often the prompt's first words show above the composer (that is, as sent messages)."""
+    if not head:
+        return 0
+    end = composer_index(lines, agent)
+    if end is None:
+        return 0
+    return sum(1 for line in lines[:end] if head in re.sub(r"\s+", " ", line))
+
+
+def selected_line(lines: list[str]) -> int | None:
+    for i in range(len(lines) - 1, -1, -1):
+        if re.match(r"^\s*[❯›>]\s+\S", lines[i]):
+            return i
+    return None
+
+
+def choose_option(pane: str, target: re.Pattern, max_steps: int = 6) -> bool:
+    """Move a TUI menu's highlight to the first option matching `target`, then press Enter.
+
+    Menus sit at the bottom of the screen; look at the last lines only, so a
+    `❯ prompt` line in the history is never taken for the highlight.
+    """
+    for _ in range(max_steps + 1):
+        lines = pane_lines(pane)[-20:]
+        sel = selected_line(lines)
+        if sel is None:
+            return False
+        if target.search(lines[sel]):
+            send_keys(pane, "Enter")
+            return True
+        hits = [i for i, l in enumerate(lines) if target.search(l)]
+        if not hits:
+            return False
+        send_keys(pane, "Down" if hits[0] > sel else "Up")
+        time.sleep(0.4)
+    return False
+
+
+# --------------------------------------------------------------------------
+# worktree / spawn
+
+
+def create_worktree(branch: str, base: str | None, repo: str | None, label: str | None) -> dict:
+    """herdr worktree create: a linked worktree in its own workspace, with a shell pane."""
+    repo = repo or git_toplevel(os.getcwd()) or os.getcwd()
+    cmd = ["worktree", "create", "--cwd", repo, "--branch", branch, "--no-focus"]
+    if base:
+        cmd += ["--base", base]
+    if label:
+        cmd += ["--label", label]
+    result = herdr(*cmd, timeout=120)
+    path = (result.get("worktree") or {}).get("path") or (result.get("root_pane") or {}).get("cwd")
+    return {"pane_id": find_pane_id(result), "tab_id": (result.get("tab") or {}).get("tab_id"),
+            "workspace_id": (result.get("workspace") or {}).get("workspace_id"),
+            "cwd": path, "branch": branch, "placement": f"worktree {branch}"}
+
+
+def cmd_worktree(args: argparse.Namespace) -> int:
+    require_herdr()
+    target = create_worktree(args.branch, args.base, args.repo, args.name)
+    prep = prep_dir(target["cwd"])
+    print(json.dumps({"ok": True, **target, **prep}, indent=2))
+    return 0
+
+
+def create_pane(args: argparse.Namespace) -> dict:
+    """Create the pane the agent will run in. Returns ids and cwd."""
+    if args.pane:
+        info = pane_info(args.pane)
+        if info.get("agent"):
+            raise FleetError(f"pane {args.pane} already runs {info['agent']}; pick a shell pane")
+        return {"pane_id": args.pane, "tab_id": info.get("tab_id"), "workspace_id": info.get("workspace_id"),
+                "cwd": info.get("cwd"), "placement": "existing pane"}
+    if args.worktree:
+        return create_worktree(args.worktree, args.base, args.repo, args.name)
+    cwd = os.path.abspath(os.path.expanduser(args.cwd or os.getcwd()))
+    if args.tab:
+        cmd = ["tab", "create", "--cwd", cwd, "--no-focus"]
+        workspace = args.workspace or os.environ.get("HERDR_WORKSPACE_ID")
+        if workspace:
+            cmd += ["--workspace", workspace]
+        if args.name:
+            cmd += ["--label", args.name]
+        result = herdr(*cmd)
+        return {"pane_id": find_pane_id(result), "tab_id": (result.get("tab") or {}).get("tab_id"),
+                "workspace_id": (result.get("tab") or {}).get("workspace_id"), "cwd": cwd, "placement": "new tab"}
+    if args.new_workspace:
+        cmd = ["workspace", "create", "--cwd", cwd, "--no-focus"]
+        if args.name:
+            cmd += ["--label", args.name]
+        result = herdr(*cmd)
+        return {"pane_id": find_pane_id(result), "tab_id": None,
+                "workspace_id": (result.get("workspace") or {}).get("workspace_id"), "cwd": cwd,
+                "placement": "new workspace"}
+    source = args.from_pane or os.environ.get("HERDR_PANE_ID")
+    if not source:
+        raise FleetError("no pane to split from: pass --from PANE or run inside Herdr")
+    if not args.cwd:
+        # A split works where the pane it splits works (a critic next to its lane).
+        cwd = pane_info(source).get("cwd") or cwd
+    direction = args.split
+    if direction == "auto":
+        direction = auto_direction(pane_rect(source))
+    result = herdr("pane", "split", source, "--direction", direction, "--cwd", cwd, "--no-focus")
+    pane = find_pane_id(result)
+    info = result.get("pane", {})
+    return {"pane_id": pane, "tab_id": info.get("tab_id"), "workspace_id": info.get("workspace_id"),
+            "cwd": cwd, "placement": f"split {direction} of {source}"}
+
+
+def wait_for_start(pane: str, agent: str, prompt: str | None, accept_trust: bool, timeout: float) -> dict:
+    """Clear first-run dialogs and confirm the agent is ready or working on the prompt."""
+    deadline = time.time() + timeout
+    notes: list[str] = []
+    head = text_head(prompt) if prompt else ""
+    idle_since: float | None = None
+    nudged = 0
+    trust_answered = False
+    while time.time() < deadline:
+        time.sleep(1.0)
+        info = pane_info(pane)
+        detected = info.get("agent")
+        status = info.get("agent_status")
+        if not detected:
+            continue
+        lines = pane_lines(pane, info.get("scroll", {}).get("viewport_rows"))
+        tail = "\n".join(lines[-30:])
+        # One answer only: after it, stale dialog text must never send keys
+        # into a live composer.
+        if (not trust_answered and status in ("blocked", "idle")
+                and TRUST_DIALOG.search("\n".join(lines[-15:]))):
+            if not accept_trust:
+                return {"ok": False, "status": "blocked", "reason": "folder trust dialog; answer it in the pane or rerun with --accept-trust", "notes": notes}
+            trust_answered = True
+            if choose_option(pane, TRUST_ACCEPT):
+                notes.append("accepted the folder trust dialog")
+                time.sleep(1.5)
+                continue
+            return {"ok": False, "status": "blocked", "reason": "could not select the trust option", "notes": notes}
+        if FULLSCREEN_PROMPT.search(tail) and status in ("blocked", "idle"):
+            send_keys(pane, "Escape")
+            notes.append("dismissed the fullscreen renderer prompt")
+            time.sleep(1.0)
+            continue
+        if agent == "codex" and CODEX_UPDATE_MENU.search(tail) and status == "blocked":
+            if choose_option(pane, CODEX_UPDATE_SKIP):
+                notes.append("skipped the codex update prompt")
+                time.sleep(1.5)
+                continue
+        if status == "blocked":
+            idle_since = None
+            continue
+        if not prompt:
+            if status in ("idle", "done"):
+                return {"ok": True, "status": status, "notes": notes}
+            continue
+        if status == "working":
+            return {"ok": True, "status": "working", "notes": notes}
+        if status in ("idle", "done"):
+            if submitted_count(lines, head, agent) > 0:
+                # Above the composer means sent. Claude may already be done;
+                # codex sits idle while its MCP servers start, then works.
+                return {"ok": True, "status": status, "notes": notes + ["the prompt shows as sent"]}
+            idle_since = idle_since or time.time()
+            composer = composer_line(lines, agent) or ""
+            stuck = "[Pasted text" in composer or (head and head[:20] in composer)
+            if stuck and nudged < 2 and time.time() - idle_since > 3:
+                send_keys(pane, "Enter")
+                nudged += 1
+                notes.append("pressed Enter to submit a prompt left in the composer")
+                idle_since = None
+    return {"ok": False, "status": pane_info(pane).get("agent_status"), "reason": f"agent not ready after {timeout:g}s", "notes": notes}
+
+
+def cmd_spawn(args: argparse.Namespace) -> int:
+    prompt = args.prompt
+    if prompt and (len(prompt) > PROMPT_MAX or "\n" in prompt):
+        raise FleetError(f"--prompt must be one line of at most {PROMPT_MAX} characters; write the task to a file and pass a pointer such as 'Read .fleet/BRIEF.md and execute it.'")
+    remuda = remuda_path()
+    accounts = remuda_accounts(remuda) if remuda else None
+    agent = args.agent
+    if not agent and args.account and accounts is not None:
+        agent = resolve_account(args.account, None, accounts)["provider"]
+    agent = agent or "claude"
+    extra = list(args.agent_args)
+    if args.resume:
+        if agent != "claude":
+            raise FleetError("--resume works with claude only")
+        if not SESSION_ID.fullmatch(args.resume):
+            raise FleetError(f"not a session id: {args.resume}")
+        # A fork leaves the old transcript alone, so the old session may still
+        # be running (a self-handoff) without two writers on one file.
+        extra = ["--resume", args.resume, "--fork-session", *extra]
+    launch = build_launch(agent, args.account, args.model, args.permission_mode, args.name, prompt,
+                          extra, remuda, accounts, dict(os.environ))
+    if args.resume and not transcript_visible(launch["home"], args.resume):
+        who = launch["account"] or launch["home"]
+        raise FleetError(f"{who} cannot see session {args.resume} (no transcript under {launch['home']}/projects); "
+                         "hand off with a handoff file instead")
+    if args.dry_run:
+        print(json.dumps({"dry_run": True, **launch}, indent=2))
+        return 0
+    require_herdr()
+    target = create_pane(args)
+    pane = target["pane_id"]
+    if args.name:
+        herdr_ok("pane", "rename", pane, args.name)
+    if args.role and target.get("cwd"):
+        target["registry"] = register_pane(target["cwd"], pane, {
+            "role": args.role, "agent": agent, "account": launch["account"], "label": args.name,
+            "spawned_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "spawned_by": os.environ.get("HERDR_PANE_ID"),
+        })
+    run(["herdr", "pane", "run", pane, launch["command"]])
+    if args.no_wait:
+        result = {"ok": True, "status": "launched", "notes": ["did not wait for the agent"]}
+    else:
+        result = wait_for_start(pane, agent, prompt, args.accept_trust, args.timeout)
+    out = {**result, **target, **launch, "label": args.name, "role": args.role}
+    print(json.dumps(out, indent=2))
+    return 0 if result["ok"] else 2
+
+
+# --------------------------------------------------------------------------
+# pane roles (.fleet/panes.json)
+
+
+def load_panes(fleet_dir: Path) -> dict:
+    try:
+        data = json.loads((Path(fleet_dir) / PANES_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_panes(fleet_dir: Path, data: dict) -> None:
+    path = Path(fleet_dir) / PANES_FILE
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, path)
+
+
+def register_pane(cwd: str, pane: str, record: dict) -> str:
+    fleet_dir = Path(prep_dir(cwd)["fleet_dir"])
+    data = load_panes(fleet_dir)
+    data[pane] = record
+    save_panes(fleet_dir, data)
+    return str(fleet_dir / PANES_FILE)
+
+
+def unregister_pane(cwd: str, pane: str) -> bool:
+    fleet_dir = Path(git_toplevel(cwd) or cwd) / FLEET_DIR
+    data = load_panes(fleet_dir)
+    if pane not in data:
+        return False
+    del data[pane]
+    save_panes(fleet_dir, data)
+    return True
+
+
+# --------------------------------------------------------------------------
+# send
+
+
+def spill_to_file(text: str, cwd: str) -> Path:
+    fleet_dir = prep_dir(cwd)["fleet_dir"]
+    inbox = Path(fleet_dir) / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    path = inbox / f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:6]}.md"
+    path.write_text(text if text.endswith("\n") else text + "\n")
+    return path
+
+
+def target_agent_pane(pane: str) -> dict:
+    if pane == os.environ.get("HERDR_PANE_ID"):
+        raise FleetError("refusing to drive the calling pane")
+    info = pane_info(pane)
+    if not info.get("agent"):
+        raise FleetError(f"pane {pane} has no detected agent")
+    return info
+
+
+def wait_not_working(pane: str, timeout: float) -> bool:
+    if pane_info(pane).get("agent_status") != "working":
+        return True
+    cp = run(["herdr", "agent", "wait", pane, "--until", "idle", "--until", "done",
+              "--timeout", str(int(timeout * 1000))], timeout=timeout + 10)
+    return cp.returncode == 0
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    require_herdr()
+    pane = args.pane
+    info = target_agent_pane(pane)
+    sent_file = None
+    if args.file:
+        sent_file = Path(args.file).expanduser().resolve()
+        if not sent_file.is_file():
+            raise FleetError(f"no such file: {sent_file}")
+        text = f"Read {sent_file} and follow it."
+    else:
+        text = args.text
+        if len(text) > PROMPT_MAX or "\n" in text:
+            sent_file = spill_to_file(text, info.get("cwd") or os.getcwd())
+            text = f"Read {sent_file} and follow it."
+    if not args.queue and not wait_not_working(pane, args.timeout):
+        print(json.dumps({"ok": False, "pane_id": pane, "status": "working", "reason": "agent still busy; rerun later or pass --queue"}, indent=2))
+        return 3
+    out = submit_prompt(pane, info["agent"], text)
+    out["file"] = str(sent_file) if sent_file else None
+    print(json.dumps(out, indent=2))
+    return 0 if out["ok"] else 2
+
+
+def submit_prompt(pane: str, agent: str, text: str) -> dict:
+    """Submit one line to an agent and confirm it was taken: working, or shown as sent."""
+    head = text_head(text)
+    before = submitted_count(pane_lines(pane), head, agent)
+    attempts = 1
+    cp = run(["herdr", "agent", "prompt", pane, text, "--wait", "--until", "working", "--timeout", "15000"], timeout=30)
+    ok = cp.returncode == 0
+    how = "working" if ok else ""
+    while not ok and attempts <= 3:
+        lines = pane_lines(pane)
+        if submitted_count(lines, head, agent) > before:
+            ok, how = True, "sent (already finished, or queued)"
+            break
+        composer = composer_line(lines, agent) or ""
+        if "[Pasted text" in composer or (head and head[:20] in composer):
+            send_keys(pane, "Enter")
+            attempts += 1
+            cp = run(["herdr", "agent", "wait", pane, "--until", "working", "--timeout", "10000"], timeout=20)
+            if cp.returncode == 0:
+                ok, how = True, "working after Enter"
+            continue
+        break
+    out = {"ok": ok, "pane_id": pane, "agent": agent, "sent": text, "attempts": attempts,
+           "status": how or pane_info(pane).get("agent_status")}
+    if not ok:
+        out["reason"] = "could not confirm the prompt was submitted; read the pane"
+    return out
+
+
+RESUME_PROMPT = ("Resume this lane: read .fleet/BRIEF.md, .fleet/STATUS.md and .fleet/HANDOFF.md (when present), "
+                 "run git status and git log --oneline -15, then continue from the next step in .fleet/STATUS.md.")
+
+
+def session_id_of(info: dict) -> str | None:
+    return (info.get("agent_session") or {}).get("value")
+
+
+def screen_tail(pane: str, n: int = 15) -> list[str]:
+    try:
+        return [l[:200] for l in pane_lines(pane)[-n:]]
+    except FleetError:
+        return []
+
+
+def confirm_clear(pane: str, before_id: str | None, before_count: int, timeout: float = 20) -> tuple[bool, list[str]]:
+    """/clear starts a new session: wait until herdr reports a new session id.
+
+    Without a session id (no herdr agent integration), accept one more `/clear`
+    shown above an empty composer.
+    """
+    notes: list[str] = []
+    nudged = 0
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(1.0)
+        info = pane_info(pane)
+        now_id = session_id_of(info)
+        if before_id and now_id and now_id != before_id:
+            return True, notes
+        lines = pane_lines(pane, info.get("scroll", {}).get("viewport_rows"))
+        composer = composer_line(lines, "claude") or ""
+        if composer.startswith("/clear") and nudged < 2:
+            send_keys(pane, "Enter")
+            nudged += 1
+            notes.append("pressed Enter to submit /clear")
+            continue
+        if not before_id and composer == "" and submitted_count(lines, "/clear", "claude") > before_count:
+            notes.append("no session id from herdr; /clear shows as sent")
+            return True, notes
+    return False, notes
+
+
+def confirm_compact(pane: str, timeout: float) -> tuple[bool, list[str]]:
+    """/compact keeps the session: wait for it to start working, finish, and print `Compacted`."""
+    notes: list[str] = []
+    for attempt in range(2):
+        run(["herdr", "agent", "wait", pane, "--until", "working", "--timeout", "15000"], timeout=25)
+        if not wait_not_working(pane, timeout):
+            notes.append(f"still compacting after {timeout:g}s")
+            return False, notes
+        lines = pane_lines(pane)
+        if any(re.search(r"\bCompacted\b", l) for l in lines[-20:]):
+            return True, notes
+        composer = composer_line(lines, "claude") or ""
+        if attempt == 0 and composer.startswith("/compact"):
+            send_keys(pane, "Enter")
+            notes.append("pressed Enter to submit /compact")
+            continue
+        break
+    notes.append("no 'Compacted' line on screen")
+    return False, notes
+
+
+def cmd_reset(args: argparse.Namespace) -> int:
+    """/clear (default) or /compact a lane, then tell it to resume from its .fleet/ files."""
+    require_herdr()
+    pane = args.pane
+    info = target_agent_pane(pane)
+    if info["agent"] != "claude":
+        raise FleetError("reset supports claude panes; for codex, send /compact or /new yourself")
+    top = git_toplevel(info.get("cwd") or "") or info.get("cwd") or ""
+    files = lane_files(top) if top else []
+    if args.compact is None and not set(files) & set(LANE_FILES):
+        raise FleetError(f"no .fleet/BRIEF.md, STATUS.md or HANDOFF.md under {top}; /clear would lose the task. "
+                         "Write them first, or pass --compact")
+    if not wait_not_working(pane, args.timeout):
+        raise FleetError("agent still busy; reset it at its next boundary", code=3)
+    info = pane_info(pane)
+    if args.compact is None:
+        command = "/clear"
+        before_count = submitted_count(pane_lines(pane), "/clear", "claude")
+        run(["herdr", "pane", "run", pane, command])
+        ok, notes = confirm_clear(pane, session_id_of(info), before_count)
+    else:
+        command = ("/compact " + args.compact).strip()
+        run(["herdr", "pane", "run", pane, command])
+        ok, notes = confirm_compact(pane, args.timeout)
+    out = {"ok": ok, "pane_id": pane, "command": command, "lane_files": files, "notes": notes,
+           "session_id": session_id_of(pane_info(pane))}
+    if not ok:
+        out["reason"] = f"could not confirm {command.split()[0]}; read the pane"
+        out["screen"] = screen_tail(pane)
+    elif not args.no_resume:
+        message = args.message or (RESUME_PROMPT if set(files) & set(LANE_FILES) else "Continue the task.")
+        time.sleep(1.0)
+        out["resume"] = submit_prompt(pane, "claude", message)
+        out["ok"] = ok = out["resume"]["ok"]
+    print(json.dumps(out, indent=2))
+    return 0 if ok else 2
+
+
+# --------------------------------------------------------------------------
+# retire
+
+
+def cmd_retire(args: argparse.Namespace) -> int:
+    require_herdr()
+    pane = args.pane
+    if pane == os.environ.get("HERDR_PANE_ID"):
+        raise FleetError("refusing to retire the calling pane; exit it yourself")
+    info = pane_info(pane)
+    agent = info.get("agent")
+    if agent:
+        command = EXIT_COMMAND.get(agent)
+        if not command:
+            raise FleetError(f"don't know how to exit {agent}; exit it in the pane")
+        if info.get("agent_status") == "working":
+            if not args.force:
+                raise FleetError(f"{agent} in {pane} is working; wait for it, or pass --force to interrupt it", code=3)
+            send_keys(pane, "Escape")
+            time.sleep(1.5)
+        run(["herdr", "pane", "run", pane, command])
+        deadline = time.time() + args.timeout
+        while time.time() < deadline and pane_info(pane).get("agent"):
+            time.sleep(1)
+        if pane_info(pane).get("agent"):
+            print(json.dumps({"ok": False, "pane_id": pane, "reason": f"{agent} still running after {command}"}, indent=2))
+            return 2
+    unregistered = bool(info.get("cwd")) and unregister_pane(info["cwd"], pane)
+    closed = False
+    if args.close:
+        herdr("pane", "close", pane)
+        closed = True
+    print(json.dumps({"ok": True, "pane_id": pane, "exited": agent, "closed": closed,
+                      "unregistered": unregistered}, indent=2))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# status
+
+
+def git_toplevel(path: str) -> str | None:
+    try:
+        cp = run(["git", "-C", path, "rev-parse", "--show-toplevel"], timeout=3)
+    except FleetError:
+        return None
+    return cp.stdout.strip() if cp.returncode == 0 and cp.stdout.strip() else None
+
+
+def git_branch(path: str) -> str:
+    try:
+        cp = run(["git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"], timeout=3)
+    except FleetError:
+        return ""
+    return cp.stdout.strip() if cp.returncode == 0 else ""
+
+
+def lane_files(path: str) -> list[str]:
+    top = git_toplevel(path) or path
+    d = Path(top) / FLEET_DIR
+    return [f for f in (*LANE_FILES, ORCHESTRATOR_FILE) if (d / f).is_file()]
+
+
+def claude_home(account: dict) -> str:
+    return account_home("claude", account)
+
+
+def session_account(session_id: str, accounts: list[dict]) -> str | None:
+    """The claude account whose config dir lists this running session.
+
+    Homes often share projects/ through symlinks, so a transcript's location
+    says nothing about the account. Each home keeps its own sessions/<pid>.json
+    for running sessions; a sessions/ dir shared by several homes is skipped.
+    """
+    homes: dict[str, list[dict]] = {}
+    for a in accounts:
+        if a["provider"] == "claude":
+            sdir = os.path.join(claude_home(a), "sessions")
+            if os.path.isdir(sdir):
+                homes.setdefault(os.path.realpath(sdir), []).append(a)
+    for sdir, owners in homes.items():
+        if len(owners) != 1:
+            continue
+        for f in glob.glob(os.path.join(glob.escape(sdir), "*.json")):
+            try:
+                with open(f) as fh:
+                    if json.load(fh).get("sessionId") == session_id:
+                        return owners[0]["account"]
+            except (OSError, ValueError):
+                continue
+    return None
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    require_herdr()
+    agents = herdr("agent", "list").get("agents", [])
+    if args.workspace:
+        agents = [a for a in agents if a.get("workspace_id") == args.workspace]
+    remuda = remuda_path()
+    accounts = remuda_accounts(remuda) if remuda else []
+    registries: dict[str, dict] = {}
+    rows = []
+    for a in agents:
+        cwd = a.get("cwd") or ""
+        pane = a.get("pane_id")
+        session = (a.get("agent_session") or {}).get("value")
+        account = session_account(session, accounts) if (accounts and session and a.get("agent") == "claude") else None
+        top = (git_toplevel(cwd) or cwd) if cwd else ""
+        if top and top not in registries:
+            registries[top] = load_panes(Path(top) / FLEET_DIR)
+        record = registries.get(top, {}).get(pane) or {}
+        rows.append({
+            "pane": pane, "agent": a.get("agent"), "status": a.get("agent_status"), "role": record.get("role"),
+            "account": account or record.get("account"), "branch": git_branch(cwd) if cwd else "",
+            "lane": lane_files(cwd) if cwd else [], "session_id": session,
+            "title": a.get("terminal_title_stripped") or "", "cwd": cwd, "self": pane == os.environ.get("HERDR_PANE_ID"),
+        })
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    header = ["PANE", "AGENT", "STATUS", "ROLE"] + (["ACCOUNT"] if remuda else []) + ["BRANCH", "LANE", "TITLE"]
+    table = [header]
+    for r in rows:
+        lane = ",".join(f.replace(".md", "") for f in r["lane"]) or "-"
+        row = [r["pane"] + ("*" if r["self"] else ""), r["agent"] or "-", r["status"] or "-", r["role"] or "-"]
+        if remuda:
+            row.append(r["account"] or "-")
+        row += [r["branch"] or "-", lane, r["title"][:48]]
+        table.append(row)
+    widths = [max(len(str(r[i])) for r in table) for i in range(len(header))]
+    for r in table:
+        print("  ".join(str(c).ljust(widths[i]) for i, c in enumerate(r)).rstrip())
+    return 0
+
+
+# --------------------------------------------------------------------------
+# prep
+
+
+def prep_dir(path: str) -> dict:
+    top = git_toplevel(path)
+    base = Path(top or path)
+    fleet_dir = base / FLEET_DIR
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    excluded = False
+    exclude_file = None
+    if top:
+        cp = run(["git", "-C", top, "rev-parse", "--git-common-dir"], timeout=5)
+        common = cp.stdout.strip()
+        if cp.returncode == 0 and common:
+            common_path = Path(common) if os.path.isabs(common) else Path(top) / common
+            exclude = common_path / "info" / "exclude"
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            existing = exclude.read_text() if exclude.exists() else ""
+            entry = f"/{FLEET_DIR}/"
+            if entry not in existing.splitlines():
+                with exclude.open("a") as fh:
+                    if existing and not existing.endswith("\n"):
+                        fh.write("\n")
+                    fh.write(f"# fleet plugin lane files\n{entry}\n")
+            excluded = True
+            exclude_file = str(exclude)
+    return {"fleet_dir": str(fleet_dir), "git_toplevel": top, "excluded": excluded, "exclude_file": exclude_file}
+
+
+def handoff_path(fleet_dir: Path) -> Path:
+    """Where a handoff goes: HANDOFF.md in a lane worktree, else a new file under handoffs/.
+
+    Outside a lane, .fleet/HANDOFF.md would make the SessionStart hook brief
+    every other session in that checkout as a lane.
+    """
+    fleet_dir = Path(fleet_dir)
+    if (fleet_dir / "BRIEF.md").is_file():
+        return fleet_dir / "HANDOFF.md"
+    d = fleet_dir / "handoffs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{time.strftime('%Y%m%d-%H%M%S')}.md"
+
+
+def cmd_prep(args: argparse.Namespace) -> int:
+    out = prep_dir(os.path.abspath(os.path.expanduser(args.dir or os.getcwd())))
+    fleet_dir = Path(out["fleet_dir"])
+    out["lane"] = (fleet_dir / "BRIEF.md").is_file()
+    out["fleet_md"] = str(fleet_dir / ORCHESTRATOR_FILE) if (fleet_dir / ORCHESTRATOR_FILE).is_file() else None
+    out["pane_role"] = (load_panes(fleet_dir).get(os.environ.get("HERDR_PANE_ID") or "") or {}).get("role")
+    if args.handoff:
+        out["handoff_path"] = str(handoff_path(fleet_dir))
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# watch
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Block until a marker shows in a lane file, or the agent stops, blocks or exits.
+
+    Exit codes: 0 marker found, 4 blocked on a dialog, 5 agent exited or pane
+    gone, 6 stopped without the marker, 7 timeout.
+    """
+    require_herdr()
+    pane = args.pane
+    info = pane_info(pane)
+    top = git_toplevel(info.get("cwd") or "") or info.get("cwd") or os.getcwd()
+    path = pattern = None
+    if args.marker:
+        f = Path(args.file or f"{FLEET_DIR}/STATUS.md").expanduser()
+        path = f if f.is_absolute() else Path(top) / f
+        pattern = re.compile(re.escape(args.marker) + r"(?!\w)")
+    start = time.time()
+    stopped_since: float | None = None
+    blocked_since: float | None = None
+
+    def emit(event: str, code: int, **extra) -> int:
+        out = {"event": event, "pane_id": pane, "elapsed_s": int(time.time() - start), **extra}
+        if path is not None:
+            out.setdefault("file", str(path))
+        print(json.dumps(out, indent=2))
+        return code
+
+    while True:
+        if path is not None and path.is_file():
+            text = path.read_text(errors="replace")
+            if pattern.search(text):
+                return emit("marker", 0, marker=args.marker, placeholders=text.count("PLACEHOLDER"))
+        try:
+            info = pane_info(pane)
+        except FleetError:
+            return emit("pane-gone", 5)
+        status = info.get("agent_status")
+        if not info.get("agent"):
+            return emit("agent-exited", 5, screen=screen_tail(pane))
+        now = time.time()
+        blocked_since = (blocked_since or now) if status == "blocked" else None
+        if blocked_since and now - blocked_since >= args.blocked_grace:
+            return emit("blocked", 4, status=status, screen=screen_tail(pane))
+        stopped_since = (stopped_since or now) if status in ("idle", "done") else None
+        if stopped_since and now - stopped_since >= args.idle_grace:
+            return emit("stopped", 6, status=status, screen=screen_tail(pane))
+        if args.timeout and now - start >= args.timeout:
+            return emit("timeout", 7, status=status)
+        time.sleep(args.interval)
+
+
+# --------------------------------------------------------------------------
+# doctor / accounts
+
+
+def conventions_path() -> Path:
+    override = os.environ.get("FLEET_CONVENTIONS")
+    if override:
+        return Path(override).expanduser()
+    base = os.environ.get("XDG_CONFIG_HOME") or "~/.config"
+    return Path(base).expanduser() / "fleet" / "conventions.md"
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    herdr_bin = shutil.which("herdr")
+    remuda = remuda_path()
+    accounts: list[dict] = []
+    remuda_error = None
+    if remuda:
+        try:
+            accounts = remuda_accounts(remuda)
+        except FleetError as e:
+            remuda_error = str(e)
+    claude = shutil.which("claude")
+    codex = shutil.which("codex")
+    conv = conventions_path()
+    report = {
+        "fleet": VERSION,
+        "python": sys.version.split()[0],
+        "mode": "remuda" if remuda else "plain",
+        "herdr": {"path": herdr_bin, "version": tool_version(herdr_bin), "inside_herdr": os.environ.get("HERDR_ENV") == "1",
+                  "pane": os.environ.get("HERDR_PANE_ID")},
+        "remuda": {"path": remuda, "version": tool_version(remuda), "accounts": accounts, "error": remuda_error,
+                   "disabled_by_env": os.environ.get("FLEET_NO_REMUDA") == "1"},
+        "claude": {"path": claude, "version": tool_version(claude),
+                   "config_dir": os.environ.get("CLAUDE_CONFIG_DIR")},
+        "codex": {"path": codex, "version": tool_version(codex), "home": os.environ.get("CODEX_HOME")},
+        "git": shutil.which("git"),
+        "conventions": {"path": str(conv), "exists": conv.is_file()},
+    }
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return 0
+    def show(label: str, value: str) -> None:
+        print(f"{label:<12} {value}")
+    show("fleet", VERSION)
+    show("mode", "remuda (account switching on)" if remuda else "plain (no remuda: one login per agent, no account switching)")
+    show("herdr", f"{report['herdr']['version'] or 'missing'}" + ("" if report["herdr"]["inside_herdr"] else "  (this shell is not inside Herdr)"))
+    if remuda:
+        show("remuda", f"{report['remuda']['version']}  {len(accounts)} accounts" + (f"  error: {remuda_error}" if remuda_error else ""))
+        for a in accounts:
+            show("", f"{a['account']:<16} {a['plan'] or '-':<6} {a['home']}")
+    elif report["remuda"]["disabled_by_env"]:
+        show("remuda", "disabled by FLEET_NO_REMUDA=1")
+    else:
+        show("remuda", "not installed (optional)")
+    show("claude", report["claude"]["version"] or "missing")
+    show("codex", report["codex"]["version"] or "missing")
+    show("conventions", f"{conv}" + ("" if conv.is_file() else "  (missing: run /fleet:onboard)"))
+    return 0
+
+
+def cmd_conventions(args: argparse.Namespace) -> int:
+    path = conventions_path()
+    if args.path:
+        print(path)
+        return 0
+    remuda = remuda_path()
+    if remuda:
+        print("mode: remuda (account switching on)")
+    else:
+        print("mode: plain (no remuda: every lane uses the agent's own login; ignore any account rules below)")
+    print(f"conventions file: {path}")
+    if path.is_file():
+        print("source: the user's file\n")
+        text = path.read_text(errors="replace")
+    else:
+        print("source: plugin defaults (no user file yet: suggest /fleet:onboard)\n")
+        text = (PLUGIN_ROOT / "defaults" / "conventions.md").read_text()
+    sys.stdout.write(text if text.endswith("\n") else text + "\n")
+    return 0
+
+
+def cmd_accounts(args: argparse.Namespace) -> int:
+    remuda = remuda_path()
+    if not remuda:
+        print("plain mode: remuda is not installed (or FLEET_NO_REMUDA=1).")
+        print("Every lane uses the agent's own login. There is no account switching.")
+        return 0
+    for cmd in ([remuda, "list"], [remuda, "usage", *(["--live"] if args.live else [])]):
+        cp = run(cmd, timeout=60)
+        sys.stdout.write(cp.stdout)
+        if cp.returncode != 0:
+            sys.stderr.write(cp.stderr)
+            return cp.returncode
+        print()
+    return 0
+
+
+# --------------------------------------------------------------------------
+# hook session-start
+
+
+def latest_review_request(d: Path) -> Path | None:
+    def number(p: Path) -> int:
+        m = re.search(r"(\d+)", p.stem)
+        return int(m.group(1)) if m else -1
+    found = sorted(d.glob("REVIEW-REQUEST*.md"), key=number)
+    return found[-1] if found else None
+
+
+def session_start_context(data: dict, env: dict | None = None) -> str | None:
+    """Text for a session that was just cleared or compacted in a fleet checkout.
+
+    The pane's role comes from .fleet/panes.json (written by `fleet spawn
+    --role`), so a critic or an unrelated session in the same checkout is not
+    told that it implements the lane.
+    """
+    env = os.environ if env is None else env
+    source = data.get("source")
+    if source not in ("clear", "compact"):
+        return None
+    cwd = data.get("cwd") or os.getcwd()
+    top = git_toplevel(cwd) or cwd
+    d = Path(top) / FLEET_DIR
+    if not d.is_dir():
+        return None
+    present = [f for f in LANE_FILES if (d / f).is_file()]
+    pane = env.get("HERDR_PANE_ID") or ""
+    panes = load_panes(d)
+    role = (panes.get(pane) or {}).get("role") if pane else None
+    what = "cleared" if source == "clear" else "compacted"
+    parts = []
+    if present:
+        files = ", ".join(str(d / f) for f in present)
+        other_impl = any((r or {}).get("role") == "impl" for p, r in panes.items() if p != pane)
+        if role == "impl":
+            parts.append(
+                f"Fleet lane: your context was just {what}. You implement this lane (pane {pane}). Before you act, "
+                f"read {files}, then run `git status` and `git log --oneline -15`. Continue from the next step in "
+                "STATUS.md; HANDOFF.md, when present, is newer than STATUS.md. Keep STATUS.md current: the next "
+                "session resumes from it."
+            )
+        elif role == "critic":
+            request = latest_review_request(d)
+            task = (f"re-read your review request {request} and {d / 'BRIEF.md'}, then continue that review"
+                    if request else f"re-read {d / 'BRIEF.md'} and wait for a review request")
+            parts.append(
+                f"Fleet lane: your context was just {what}. You review this lane (pane {pane}); you do not "
+                f"implement it. Before you act, {task}. Write findings only to the review file the request "
+                "names, and do not edit code."
+            )
+        elif role:
+            parts.append(f"Fleet lane: your context was just {what}. You are this lane's {role} (pane {pane}). "
+                         f"Its files are {files}; re-read the ones your task needs before you act.")
+        elif not other_impl:
+            parts.append(
+                f"Fleet lane: your context was just {what}. This worktree has fleet lane files: {files}. If you "
+                "implement this lane, read them, run `git status` and `git log --oneline -15`, and continue from "
+                "the next step in STATUS.md. If you have another role here, re-read the file that defines your "
+                "task before you act."
+            )
+    fleet_md = d / ORCHESTRATOR_FILE
+    if fleet_md.is_file():
+        try:
+            m = ORCHESTRATOR_LINE.search(fleet_md.read_text(errors="replace"))
+        except OSError:
+            m = None
+        named = m.group(1) if m else None
+        if role == "orchestrator" or (named and named == pane):
+            parts.append(
+                f"Fleet orchestrator: your context was just {what}. Before you act, read {fleet_md} for the lane "
+                "table, decisions and next actions. Load the fleet:fleet skill, check the lanes with its status "
+                "command, and keep FLEET.md current."
+            )
+        elif not named:
+            parts.append(
+                f"This checkout has a fleet record at {fleet_md}. If you orchestrate that fleet, read it before "
+                "you act and load the fleet:fleet skill."
+            )
+    return "\n\n".join(parts) or None
+
+
+def cmd_hook(args: argparse.Namespace) -> int:
+    if args.event != "session-start":
+        return 0
+    try:
+        raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+        data = json.loads(raw) if raw.strip() else {}
+        context = session_start_context(data)
+    except Exception:
+        return 0
+    if context:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# CLI
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="fleet", description="Herdr fleet helper (remuda optional).")
+    p.add_argument("--version", action="version", version=f"fleet {VERSION}")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    d = sub.add_parser("doctor", help="check the environment")
+    d.add_argument("--json", action="store_true")
+    d.set_defaults(func=cmd_doctor)
+
+    c = sub.add_parser("conventions", help="print the user's fleet conventions (or the plugin defaults)")
+    c.add_argument("--path", action="store_true", help="print only the conventions file path")
+    c.set_defaults(func=cmd_conventions)
+
+    a = sub.add_parser("accounts", help="remuda accounts and usage")
+    a.add_argument("--live", action="store_true", help="query usage live instead of the cache")
+    a.set_defaults(func=cmd_accounts)
+
+    pr = sub.add_parser("prep", help="create <git top>/.fleet and keep it out of git")
+    pr.add_argument("dir", nargs="?")
+    pr.add_argument("--handoff", action="store_true", help="also return the path for a new handoff file")
+    pr.set_defaults(func=cmd_prep)
+
+    wa = sub.add_parser("watch", help="wait for a marker in a lane file, or for the agent to stop or block",
+                        description="Exit codes: 0 marker found, 4 blocked on a dialog, 5 agent exited or pane gone, "
+                                    "6 stopped without the marker, 7 timeout.")
+    wa.add_argument("pane")
+    wa.add_argument("--marker", help="text to wait for, e.g. 'READY FOR REVIEW: round 2'")
+    wa.add_argument("--file", help="file to search, relative to the pane's worktree (default .fleet/STATUS.md)")
+    wa.add_argument("--interval", type=float, default=15, help="seconds between checks (default 15)")
+    wa.add_argument("--idle-grace", type=float, default=180,
+                    help="seconds the agent may sit idle or done without the marker (default 180)")
+    wa.add_argument("--blocked-grace", type=float, default=30, help="seconds blocked before reporting (default 30)")
+    wa.add_argument("--timeout", type=float, default=14400, help="give up after this many seconds (default 4 h)")
+    wa.set_defaults(func=cmd_watch)
+
+    w = sub.add_parser("worktree", help="herdr worktree + workspace for a lane, with .fleet/ ready")
+    w.add_argument("branch")
+    w.add_argument("--base", help="base ref, e.g. origin/main")
+    w.add_argument("--repo", help="repository (default: git top of cwd)")
+    w.add_argument("--name", help="workspace label")
+    w.set_defaults(func=cmd_worktree)
+
+    rs = sub.add_parser("reset", help="/clear (or /compact) a claude lane, then make it resume from .fleet/")
+    rs.add_argument("pane")
+    rs.add_argument("--compact", nargs="?", const="", metavar="FOCUS", help="/compact [FOCUS] instead of /clear")
+    rs.add_argument("--message", help="resume prompt (default: read .fleet/ files and continue)")
+    rs.add_argument("--no-resume", action="store_true", help="do not send a resume prompt")
+    rs.add_argument("--timeout", type=float, default=600, help="seconds to wait for the agent (default 600)")
+    rs.set_defaults(func=cmd_reset)
+
+    s = sub.add_parser("spawn", help="open a pane and start an agent in it")
+    s.add_argument("--agent", choices=AGENTS, help="default: claude, or the account's provider")
+    s.add_argument("--account", help="remuda account (name or provider:name); needs remuda")
+    s.add_argument("--model")
+    s.add_argument("--permission-mode", help="claude --permission-mode")
+    s.add_argument("--name", help="pane label, and the claude session name")
+    s.add_argument("--role", choices=ROLES, help="record the pane's role in .fleet/panes.json (the hook reads it)")
+    s.add_argument("--resume", metavar="SESSION_ID",
+                   help="claude only: resume (fork) this session, e.g. on another account that can see it")
+    s.add_argument("--prompt", help=f"one-line first prompt (max {PROMPT_MAX} chars), passed as argv")
+    where = s.add_mutually_exclusive_group()
+    where.add_argument("--split", choices=("auto", "right", "down"), default="auto", help="split a pane (default)")
+    where.add_argument("--tab", action="store_true", help="new tab in the workspace")
+    where.add_argument("--new-workspace", action="store_true", help="new workspace")
+    where.add_argument("--worktree", metavar="BRANCH", help="herdr worktree create for BRANCH (own workspace)")
+    where.add_argument("--pane", help="start in this existing shell pane")
+    s.add_argument("--from", dest="from_pane", help="pane to split (default: the calling pane)")
+    s.add_argument("--workspace", help="workspace for --tab (default: the calling pane's)")
+    s.add_argument("--repo", help="repository for --worktree (default: git top of cwd)")
+    s.add_argument("--base", help="base ref for --worktree, e.g. origin/main")
+    s.add_argument("--cwd", help="working directory for split/tab/workspace "
+                                 "(default: the split pane's directory, else the current one)")
+    s.add_argument("--accept-trust", action="store_true", help="accept the agent's folder trust dialog")
+    s.add_argument("--no-wait", action="store_true", help="return right after launching")
+    s.add_argument("--timeout", type=float, default=120, help="seconds to wait for the agent (default 120)")
+    s.add_argument("--dry-run", action="store_true", help="print the launch command only")
+    s.add_argument("agent_args", nargs="*", help="arguments after -- go to the agent")
+    s.set_defaults(func=cmd_spawn)
+
+    se = sub.add_parser("send", help="submit a prompt to an agent pane and verify it")
+    se.add_argument("pane")
+    what = se.add_mutually_exclusive_group(required=True)
+    what.add_argument("--text", help=f"prompt text; longer than {PROMPT_MAX} chars or multi-line goes via a file")
+    what.add_argument("--file", help="send 'Read <file> and follow it.'")
+    se.add_argument("--queue", action="store_true", help="send even while the agent works")
+    se.add_argument("--timeout", type=float, default=600, help="seconds to wait for a busy agent (default 600)")
+    se.set_defaults(func=cmd_send)
+
+    st = sub.add_parser("status", help="agent panes with branch, account and lane files")
+    st.add_argument("--workspace")
+    st.add_argument("--json", action="store_true")
+    st.set_defaults(func=cmd_status)
+
+    r = sub.add_parser("retire", help="exit the agent in a pane")
+    r.add_argument("pane")
+    r.add_argument("--close", action="store_true", help="close the pane after the agent exits")
+    r.add_argument("--force", action="store_true", help="interrupt a working agent before exiting it")
+    r.add_argument("--timeout", type=float, default=30)
+    r.set_defaults(func=cmd_retire)
+
+    h = sub.add_parser("hook", help="hook handlers")
+    h.add_argument("event", choices=("session-start",))
+    h.set_defaults(func=cmd_hook)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    extra: list[str] = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, extra = argv[:i], argv[i + 1:]
+    args = build_parser().parse_args(argv)
+    if hasattr(args, "agent_args"):
+        args.agent_args = list(args.agent_args or []) + extra
+    try:
+        return args.func(args)
+    except FleetError as e:
+        print(f"fleet: {e}", file=sys.stderr)
+        return e.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
