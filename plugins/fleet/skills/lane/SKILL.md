@@ -83,7 +83,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --pane <pane_id> --role impl
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" retire <pane_id>
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --pane <pane_id> --role impl --name <label> \
-     --agent <agent> [--model <model>] [--effort <effort>] [--permission-mode <mode>] [--account <account>] \
+     --agent <agent> [--model <model>] [--effort <effort>] [--permission-mode <mode>] [--account <account>] --accept-trust \
      --prompt "Read .fleet/BRIEF.md and .fleet/PLAN.md and execute them."
    ```
    The implementer's STATUS.md Plan section points to PLAN.md and lists only deviations from it. Go on with step 5.

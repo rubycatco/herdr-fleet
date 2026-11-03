@@ -1029,13 +1029,19 @@ class FilesTests(unittest.TestCase):
                        "w1:p7": {"role": "impl", "task": "/home/x/ignored.md"}})
         d = Path(os.path.realpath(d))
 
-        def text(pane, cwd=None):
-            return fleet.session_start_context({"source": "compact", "cwd": str(cwd or self.repo)},
+        def text(pane, source="compact"):
+            return fleet.session_start_context({"source": source, "cwd": str(self.repo)},
                                                env={"HERDR_PANE_ID": pane})
-        self.assertEqual(text("w1:p4"), (
-            "Fleet lane: your context was just compacted. You plan this lane (pane w1:p4); you do not implement it. "
-            f"Re-read {d / 'BRIEF.md'} and your {d / 'PLAN.md'}, change no file except PLAN.md, and continue the "
-            "plan. When it is done, end PLAN.md with the next PLAN READY line and stop."))
+        for source, what in (("clear", "cleared"), ("compact", "compacted")):
+            self.assertEqual(text("w1:p4", source), (
+                f"Fleet lane: your context was just {what}. You plan this lane (pane w1:p4); you do not implement "
+                f"it. Re-read {d / 'BRIEF.md'} and your {d / 'PLAN.md'}, change no file except PLAN.md, and "
+                "continue the plan. When it is done, end PLAN.md with the next PLAN READY line and stop."))
+            self.assertIn(f"just {what}. You research one question (pane w1:p5)", text("w1:p5", source))
+            self.assertIn(f"just {what}. You are a helper (pane w1:p6)", text("w1:p6", source))
+        for source in ("startup", "resume"):
+            self.assertIsNone(text("w1:p4", source))
+            self.assertIsNone(text("w1:p5", source))
         research = text("w1:p5")
         self.assertIn("Re-read your task file /home/x/research/q.md", research)
         self.assertIn("RESEARCH DONE", research)
