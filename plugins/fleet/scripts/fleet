@@ -44,6 +44,7 @@ import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -1222,7 +1223,7 @@ def record(event: str, where: str | None, by: bool = True, home: Path | None = N
     try:
         ensure_home()
         home = home or project_for(where)
-        entry = {"ts": now_iso(), "event": event}
+        entry = {"event": event}
         if home:
             entry["project"] = home.name
         entry.update((k, v) for k, v in fields.items() if v is not None and v != [])
@@ -1241,6 +1242,8 @@ def record(event: str, where: str | None, by: bool = True, home: Path | None = N
                     time.sleep(0.05)
             else:
                 return None
+            # The time is taken under the lock, so that the order of the lines is the order of their times.
+            entry = {"ts": now_iso(), **entry}
             os.write(fd, (json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n").encode())
         finally:
             os.close(fd)
@@ -2128,15 +2131,20 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
 # One orchestrator (orch) per project, known by its Herdr pane in <home>/orch.json. The helper derives the
 # lane table (`board`) and what changed since the orch last looked (`digest`); the orch writes only
 # decisions, follow-ups and rules, in <home>/PROJECT.md. board.json caches the newest board for the
-# SessionStart re-brief and never consumes a change. digest.json holds the digest's cursor and the phase of
-# each lane at that time; only digest moves it.
+# SessionStart re-brief and never consumes a change. digest.json holds the digest's baseline: its cursor (a
+# time), the byte offset that it read each monthly log up to, and the phase of each lane; only digest moves
+# it. <home>/.lock serializes claim, release, a digest that consumes, and board.json writes. --peek and the
+# SessionStart hook never take it.
 
 ORCH_FILE = "orch.json"
 BOARD_FILE = "board.json"
 DIGEST_FILE = "digest.json"
 PROJECT_MD = "PROJECT.md"
+LOCK_FILE = ".lock"
+LOCK_WAIT = 30  # seconds to wait for the project lock
 DIGEST_EVENTS_MAX = 30
 REBRIEF_LINES_MAX = 60
+REBRIEF_READ_BUDGET = 1_000_000  # bytes of unread log that the SessionStart re-brief reads at most
 PROJECT_TEMPLATE = """\
 # Project: {name}
 
@@ -2217,7 +2225,8 @@ def review_rounds(d: Path) -> tuple[dict[int, Path], dict[int, list[Path]]]:
 
 
 def review_verdict(path: Path) -> str | None:
-    """`APPROVE`, `CHANGES REQUESTED` (or the text that follows) on the last `VERDICT:` line; None without one."""
+    """`APPROVE`, `CHANGES REQUESTED` (or the text that follows) on the last `VERDICT:` line; None without one
+    (also for a missing file)."""
     hits = VERDICT_LINE.findall(read_text(path))
     if not hits:
         return None
@@ -2227,6 +2236,17 @@ def review_verdict(path: Path) -> str | None:
     if "APPROVE" in text:
         return "APPROVE"
     return text or "?"
+
+
+def round_files(d: Path, n: int, requests: dict[int, Path], reviews: dict[int, list[Path]]) -> list[Path]:
+    """The review files that round n expects: the ones its request names (REVIEW-<n>.md, REVIEW-<n>-<name>.md),
+    else the ones that exist. A named file can be missing: its critic has not written yet."""
+    names: list[str] = []
+    if n in requests:
+        for name in re.findall(rf"\bREVIEW-{n}(?:-[A-Za-z0-9._-]+?)?\.md\b", read_text(requests[n])):
+            if name not in names:
+                names.append(name)
+    return [Path(d) / name for name in names] if names else reviews.get(n) or []
 
 
 def implementer_pane(panes: list[dict]) -> dict | None:
@@ -2252,15 +2272,13 @@ def lane_phase(f: dict, fleet_dir: Path, removed: bool = False) -> str:
         return "blocked"
     requests, reviews = review_rounds(Path(fleet_dir))
     ready = max((int(n) for n in READY_LINE.findall(status_md)), default=None)
-    if requests:
-        n = max(requests)
-        files = reviews.get(n) or []
-        if not files or any(review_verdict(p) is None for p in files):
+    if requests or reviews:
+        n = max(requests) if requests else max(reviews)
+        files = round_files(Path(fleet_dir), n, requests, reviews)
+        verdicts = [review_verdict(p) for p in files]
+        if n in requests and (not files or not all(verdicts)):
             return f"review {n}"
-    if reviews:
-        n = max(reviews)
-        verdicts = [review_verdict(p) for p in reviews[n]]
-        if all(verdicts) and not (ready is not None and ready > n):
+        if files and all(verdicts) and not (ready is not None and ready > n):
             verdict = "CHANGES REQUESTED" if "CHANGES REQUESTED" in verdicts else (
                 "APPROVE" if all(v == "APPROVE" for v in verdicts) else verdicts[-1])
             return f"reviewed {n}: {verdict}"
@@ -2350,10 +2368,40 @@ def make_board(home: Path, since: float | None, names: dict[str, str]) -> list[d
     return sorted(records, key=lambda r: (r["phase"] == "removed", r["lane"], r["path"]))
 
 
-def save_board(home: Path, records: list[dict]) -> str:
+def precise_now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="microseconds")
+
+
+def save_board(home: Path, records: list[dict], made: str) -> bool:
+    """Write board.json unless it already holds a board made later. `made` is when the board collection began.
+    The caller holds the project lock."""
     path = home / BOARD_FILE
-    write_json(path, {"made": now_iso(), "project": home.name, "lanes": records})
-    return str(path)
+    if event_time({"ts": read_json(path).get("made")}) > event_time({"ts": made}):
+        return False
+    write_json(path, {"made": made, "project": home.name, "lanes": records})
+    return True
+
+
+@contextmanager
+def project_lock(home: Path, wait: float | None = None):
+    """The project's lock, <home>/.lock. Waits up to LOCK_WAIT seconds for it."""
+    wait = LOCK_WAIT if wait is None else wait
+    path = home / LOCK_FILE
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise FleetError(f"project {home.name} is busy: another fleet command has held {path} for "
+                                     f"{wait:g}s; try again")
+                time.sleep(0.1)
+        yield
+    finally:
+        os.close(fd)
 
 
 def clip(text: str, width: int) -> str:
@@ -2369,20 +2417,33 @@ def age_text(seconds: float) -> str:
     return f"{seconds}s"
 
 
-def board_lines(records: list[dict]) -> list[str]:
-    """The board as a compact text table: one line per lane."""
+def as_text(value) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def as_dict(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def board_lines(records: list) -> list[str]:
+    """The board as a compact text table: one line per lane. A damaged record in board.json shows as blanks."""
+    records = [r for r in records if isinstance(r, dict)] if isinstance(records, list) else []
     if not records:
         return ["no lanes"]
     table = [["LANE", "PHASE", "PR", "PANES", "LAST", "NOTE"]]
     for r in records:
-        pr = r.get("pr")
-        panes = " ".join(f"{p.get('role') or p.get('agent')}:{p.get('status') or '-'}"
-                         for p in r.get("panes") or [] if p.get("agent"))
-        last = r.get("last_event")
-        note = (f"blocked: {r['blocked']}" if r.get("blocked") else f"next: {r['next']}" if r.get("next") else "")
-        table.append([clip(r.get("lane") or "?", 28), r.get("phase") or "?",
-                      f"#{pr.get('number')} {str(pr.get('state') or '').lower()}" if pr else "-", panes or "-",
-                      f"{clock(last)} {last.get('event')}" if last else "-", clip(note, 60)])
+        pr = as_dict(r.get("pr"))
+        panes = r.get("panes") if isinstance(r.get("panes"), list) else []
+        panes = " ".join(f"{as_text(p.get('role')) or as_text(p.get('agent'))}:{as_text(p.get('status')) or '-'}"
+                         for p in panes if isinstance(p, dict) and p.get("agent"))
+        last = as_dict(r.get("last_event"))
+        blocked, nxt = as_text(r.get("blocked")), as_text(r.get("next"))
+        note = f"blocked: {blocked}" if blocked else f"next: {nxt}" if nxt else ""
+        number = pr.get("number")
+        table.append([clip(as_text(r.get("lane")) or "?", 28), as_text(r.get("phase")) or "?",
+                      f"#{number} {as_text(pr.get('state')).lower()}".strip() if isinstance(number, int) else "-",
+                      panes or "-", f"{clock(last)} {as_text(last.get('event'))}".strip() if last else "-",
+                      clip(note, 60)])
     widths = [max(len(row[i]) for row in table) for i in range(len(table[0]) - 1)]
     return ["  ".join([c.ljust(widths[i]) for i, c in enumerate(row[:-1])] + [row[-1]]).rstrip() for row in table]
 
@@ -2401,14 +2462,27 @@ def project_home(args: argparse.Namespace, create: bool = True) -> Path:
     return d
 
 
-def pane_alive(pane: str | None) -> bool:
-    """`herdr pane get` succeeds and the pane runs an agent. False when herdr cannot tell."""
+def pane_state(pane: str | None) -> str:
+    """`alive` (the pane runs an agent), `dead` (herdr says that the pane is gone or runs no agent), or
+    `unknown` (no herdr, a timeout, an error or an answer that it cannot read)."""
     if not pane or not shutil.which("herdr"):
-        return False
+        return "unknown"
     try:
-        return bool(pane_info(pane).get("agent"))
-    except (FleetError, KeyError, TypeError, AttributeError):
-        return False
+        cp = run(["herdr", "pane", "get", pane], timeout=10)
+    except FleetError:
+        return "unknown"
+    try:
+        data = json.loads((cp.stdout or "").strip() or (cp.stderr or "").strip())
+    except ValueError:
+        return "unknown"
+    if not isinstance(data, dict):
+        return "unknown"
+    if data.get("error") is not None:
+        return "dead" if as_dict(data.get("error")).get("code") == "pane_not_found" else "unknown"
+    info = as_dict(as_dict(data.get("result")).get("pane"))
+    if cp.returncode != 0 or not info:
+        return "unknown"
+    return "alive" if info.get("agent") else "dead"
 
 
 def project_checkouts(home: Path) -> list[str]:
@@ -2428,13 +2502,18 @@ def project_checkouts(home: Path) -> list[str]:
 
 
 def fleet_md_warnings(home: Path, pane: str) -> list[str]:
-    """A FLEET.md in a checkout of the project whose `Orchestrator:` line names a live pane other than `pane`."""
+    """A FLEET.md in a checkout of the project whose `Orchestrator:` line names a pane other than `pane` that is
+    alive, or of which herdr cannot tell."""
     warnings = []
     for checkout in project_checkouts(home):
         path = Path(checkout) / FLEET_DIR / ORCHESTRATOR_FILE
         m = ORCHESTRATOR_LINE.search(read_text(path)) if path.is_file() else None
-        if m and m.group(1) != pane and pane_alive(m.group(1)):
-            warnings.append(f"{path} names pane {m.group(1)}, which is alive: another orchestrator still uses "
+        if not m or m.group(1) == pane:
+            continue
+        state = pane_state(m.group(1))
+        if state != "dead":
+            what = "is alive" if state == "alive" else "may be alive (herdr cannot tell)"
+            warnings.append(f"{path} names pane {m.group(1)}, which {what}: another orchestrator may still use "
                             "FLEET.md for this project")
     return warnings
 
@@ -2444,13 +2523,19 @@ def orch_out(home: Path) -> dict:
             "board": str(home / BOARD_FILE)}
 
 
+def refuse(**fields) -> int:
+    print(json.dumps({"ok": False, "changed": "nothing", **fields}, indent=2, ensure_ascii=False))
+    return 2
+
+
 def cmd_orch(args: argparse.Namespace) -> int:
     action = args.action or "show"
     me = os.environ.get("HERDR_PANE_ID") or None
     if action == "show":
         home = project_home(args, create=False)
         rec = read_json(home / ORCH_FILE) or None
-        alive = pane_alive(rec.get("pane")) if rec else None
+        state = pane_state(rec.get("pane")) if rec else None
+        alive = {"alive": True, "dead": False}.get(state) if state else None
         out = {**orch_out(home), "orch": rec, "alive": alive, "self": bool(rec and me and rec.get("pane") == me)}
         board = read_json(home / BOARD_FILE)
         out["board_made"] = board.get("made")
@@ -2459,8 +2544,8 @@ def cmd_orch(args: argparse.Namespace) -> int:
             return 0
         print(f"project     {home.name}  {short_path(str(home))}")
         if rec:
-            state = "alive" if alive else "not alive (or herdr cannot tell)"
-            print(f"orch        pane {rec.get('pane')}" + (" (this pane)" if out["self"] else "") + f", {state}")
+            words = {"alive": "alive", "dead": "not alive", "unknown": "alive or not: herdr cannot tell"}[state]
+            print(f"orch        pane {rec.get('pane')}" + (" (this pane)" if out["self"] else "") + f", {words}")
             print(f"            claimed {rec.get('claimed_at') or '-'}, workspace {rec.get('workspace') or '-'}, "
                   f"session {short_id(rec.get('session'))}, checkout {short_path(rec.get('checkout') or '-')}")
         else:
@@ -2475,15 +2560,7 @@ def cmd_orch(args: argparse.Namespace) -> int:
         pane = args.pane or me
         if not pane:
             raise FleetError("no pane to register: pass --pane P or run inside Herdr")
-        current = read_json(home / ORCH_FILE)
-        old = current.get("pane") if isinstance(current.get("pane"), str) else None
-        if old and old != pane and pane_alive(old) and not (args.replace and me == old):
-            why = ("--replace works only from the registered pane" if args.replace else
-                   "from that pane, `fleet orch claim --pane <new pane> --replace` hands it over")
-            print(json.dumps({"ok": False, "changed": "nothing", "orch": current,
-                              "refused": f"pane {old} is the orch of project {home.name} and is alive; {why}"},
-                             indent=2, ensure_ascii=False))
-            return 2
+        # Slow lookups first; the check and the write run under the lock.
         warnings = fleet_md_warnings(home, pane)
         workspace = os.environ.get("HERDR_WORKSPACE_ID") if pane == me else None
         if pane != me:
@@ -2491,69 +2568,102 @@ def cmd_orch(args: argparse.Namespace) -> int:
                 workspace = pane_info(pane).get("workspace_id")
             except (FleetError, KeyError, TypeError, AttributeError):
                 workspace = None
-        rec = {"pane": pane, "workspace": workspace, "checkout": git_toplevel(os.getcwd()) or os.getcwd(),
-               "session": os.environ.get("CLAUDE_CODE_SESSION_ID") if pane == me else None, "claimed_at": now_iso()}
-        rec = {k: v for k, v in rec.items() if v}
-        write_json(home / ORCH_FILE, rec)
-        project_md = home / PROJECT_MD
-        created = not project_md.exists()
-        if created:
-            project_md.write_text(PROJECT_TEMPLATE.format(name=home.name))
-        record("orch_claim", None, home=home, pane=pane, old=old, workspace=rec.get("workspace"),
-               checkout=rec.get("checkout"), replace=True if args.replace else None)
+        with project_lock(home):
+            current = read_json(home / ORCH_FILE)
+            old = current.get("pane") if isinstance(current.get("pane"), str) else None
+            handoff = bool(args.replace and me and me == old)
+            if old and old != pane and not handoff:
+                if args.replace:
+                    return refuse(orch=current, refused=f"pane {old} is the orch of project {home.name}; --replace "
+                                                         "works only from that pane")
+                state = pane_state(old)
+                if state == "alive":
+                    return refuse(orch=current, refused=f"pane {old} is the orch of project {home.name} and is "
+                                                         "alive; from that pane, `fleet orch claim --pane <new pane> "
+                                                         "--replace` hands it over")
+                if state == "unknown" and not args.force:
+                    return refuse(orch=current, refused=f"pane {old} is the orch of project {home.name}, and herdr "
+                                                         "cannot tell whether it is alive; check that pane, then "
+                                                         "`fleet orch claim --force` takes over")
+            rec = {"pane": pane, "workspace": workspace, "checkout": git_toplevel(os.getcwd()) or os.getcwd(),
+                   "session": os.environ.get("CLAUDE_CODE_SESSION_ID") if pane == me else None,
+                   "claimed_at": now_iso()}
+            rec = {k: v for k, v in rec.items() if v}
+            write_json(home / ORCH_FILE, rec)
+            project_md = home / PROJECT_MD
+            created = not project_md.exists()
+            if created:
+                project_md.write_text(PROJECT_TEMPLATE.format(name=home.name))
+            record("orch_claim", None, home=home, pane=pane, old=old, workspace=rec.get("workspace"),
+                   checkout=rec.get("checkout"), replace=True if args.replace else None,
+                   force=True if args.force else None)
         print(json.dumps({"ok": True, **orch_out(home), "orch": rec, "previous": old, "project_md_created": created,
                           "warnings": warnings}, indent=2, ensure_ascii=False))
         return 0
     home = project_home(args, create=False)
-    current = read_json(home / ORCH_FILE)
-    if not current:
-        print(json.dumps({"ok": True, "changed": "nothing", "note": f"project {home.name} has no orch"}, indent=2))
-        return 0
-    if current.get("pane") != me and not args.force:
-        print(json.dumps({"ok": False, "changed": "nothing", "orch": current,
-                          "refused": f"pane {current.get('pane')} is the orch, not this pane; --force releases it"},
-                         indent=2, ensure_ascii=False))
-        return 2
-    try:
-        (home / ORCH_FILE).unlink()
-    except FileNotFoundError:
-        pass
-    record("orch_release", None, home=home, pane=current.get("pane"), force=True if args.force else None)
+    with project_lock(home):
+        current = read_json(home / ORCH_FILE)
+        if not current:
+            print(json.dumps({"ok": True, "changed": "nothing", "note": f"project {home.name} has no orch"},
+                             indent=2))
+            return 0
+        if current.get("pane") != me and not args.force:
+            return refuse(orch=current, refused=f"pane {current.get('pane')} is the orch, not this pane; --force "
+                                                "releases it")
+        try:
+            (home / ORCH_FILE).unlink()
+        except FileNotFoundError:
+            pass
+        record("orch_release", None, home=home, pane=current.get("pane"), force=True if args.force else None)
     print(json.dumps({"ok": True, "project": home.name, "released": current}, indent=2, ensure_ascii=False))
     return 0
 
 
-def digest_base(home: Path) -> tuple[float | None, dict[str, dict], dict]:
-    """The digest's cursor (a timestamp, or None), the lanes it saw then by path, and the newest event it saw."""
+def digest_base(home: Path) -> tuple[float | None, dict[str, dict], dict[str, int]]:
+    """The digest's cursor (a timestamp, or None), the lanes it saw then by path, and how far it read each log."""
     data = read_json(home / DIGEST_FILE)
     cursor = event_time({"ts": data.get("cursor")}) or None
-    lanes = data.get("lanes") if isinstance(data.get("lanes"), dict) else {}
-    seen = data.get("seen") if isinstance(data.get("seen"), dict) else {}
-    return cursor, {k: v for k, v in lanes.items() if isinstance(k, str) and isinstance(v, dict)}, seen
+    lanes = as_dict(data.get("lanes"))
+    read = {k: v for k, v in as_dict(data.get("read")).items()
+            if isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool) and v >= 0}
+    return cursor, {k: v for k, v in lanes.items() if isinstance(k, str) and isinstance(v, dict)}, read
 
 
-def seen_mark(events: list[dict]) -> dict | None:
-    """The newest event in the log, and how many events share its second: the log keeps whole seconds only."""
-    if not events:
-        return None
-    newest = event_time(events[-1])
-    return {"ts": events[-1].get("ts"), "count": sum(1 for e in events if event_time(e) == newest)}
-
-
-def unseen_events(events: list[dict], cursor: float | None, seen: dict) -> list[dict]:
-    """The events after the previous digest (all of them without one); none twice, none lost in its second."""
-    newest = event_time({"ts": seen.get("ts")}) if seen else 0.0
-    count = seen.get("count") if isinstance(seen.get("count"), int) else 0
-    if newest:
-        out, same = [], 0
-        for e in events:
-            t = event_time(e)
-            if t == newest:
-                same += 1
-            if t > newest or (t == newest and same > count):
-                out.append(e)
-        return out
-    return [e for e in events if cursor is None or event_time(e) >= cursor]
+def read_new_events(home: Path, read: dict[str, int],
+                    budget: int | None = None) -> tuple[list[dict], dict[str, int], bool]:
+    """The complete lines of each monthly log after the offset in `read` (a file not in it from 0; a file
+    shorter than its offset was rewritten, so from 0 too), the offsets after them, and whether `budget` (bytes
+    in all) cut the read short. File order is time order: `record` takes the time while it holds the lock."""
+    events: list[dict] = []
+    offsets: dict[str, int] = {}
+    left = budget
+    for f in sorted((home / EVENTS_DIR).glob("*.jsonl")):
+        start = read.get(f.name, 0)
+        try:
+            size = f.stat().st_size
+            if start > size:
+                start = 0
+            want = size - start if left is None else min(size - start, left)
+            with open(f, "rb") as fh:
+                fh.seek(start)
+                data = fh.read(want)
+        except OSError:
+            offsets[f.name] = start
+            continue
+        end = data.rfind(b"\n") + 1  # a partial last line waits for the next read
+        offsets[f.name] = start + end
+        for line in data[:end].decode("utf-8", errors="replace").splitlines():
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(e, dict):
+                events.append(clean_event(e))
+        if left is not None:
+            left -= len(data)
+            if len(data) < size - start:
+                return events, offsets, True
+    return events, offsets, False
 
 
 def digest_events(events: list[dict], orch_pane: str | None, lane_paths: list[str]) -> list[dict]:
@@ -2599,39 +2709,51 @@ def event_line(e: dict) -> str:
 
 def cmd_board(args: argparse.Namespace) -> int:
     home = project_home(args)
+    made = precise_now()
     cursor, base, _ = digest_base(home)
     records = make_board(home, cursor, {p: b.get("lane") for p, b in base.items() if b.get("lane")})
-    path = save_board(home, records)
+    with project_lock(home):
+        saved = save_board(home, records, made)
     if args.json:
-        print(json.dumps({"project": home.name, "board": path, "lanes": records}, indent=2, ensure_ascii=False))
+        print(json.dumps({"project": home.name, "board": str(home / BOARD_FILE), "saved": saved, "lanes": records},
+                         indent=2, ensure_ascii=False))
         return 0
-    print(f"project {home.name}: {plural(len(records), 'lane')}")
+    print(f"project {home.name}: {plural(len(records), 'lane')}" + ("" if saved else " (board.json holds a newer board)"))
     print("\n".join(board_lines(records)))
     return 0
 
 
 def cmd_digest(args: argparse.Namespace) -> int:
+    """A digest that consumes holds the project lock from its permission check through its commit, so the
+    check still holds when it commits, and two digests run one after the other."""
     home = project_home(args)
     me = os.environ.get("HERDR_PANE_ID") or None
-    orch_pane = read_json(home / ORCH_FILE).get("pane") or None
-    read_only = "--peek" if args.peek else None
-    if not read_only and orch_pane and orch_pane != me and pane_alive(orch_pane):
-        read_only = f"pane {orch_pane} is the orch of this project"
-    cursor, base, seen = digest_base(home)
-    records = make_board(home, cursor, {p: b.get("lane") for p, b in base.items() if b.get("lane")})
-    changes = phase_changes(records, base)
-    events = read_events([home])
-    shown = digest_events(unseen_events(events, cursor, seen), orch_pane, [r["path"] for r in records])
-    omitted = max(0, len(shown) - DIGEST_EVENTS_MAX)
-    shown = shown[-DIGEST_EVENTS_MAX:]
-    if not read_only:
-        for c in changes:
-            record("phase", None, home=home, lane=c["path"], name=c["lane"], branch=c.get("branch"), old=c["old"],
-                   new=c["new"])
-        save_board(home, records)
-        mark = seen_mark(events) or (seen or None)
-        write_json(home / DIGEST_FILE, {"cursor": now_iso(), **({"seen": mark} if mark else {}), "lanes": {
-            r["path"]: {"lane": r["lane"], "branch": r.get("branch"), "phase": r["phase"]} for r in records}})
+    with ExitStack() as lock:
+        read_only = "--peek" if args.peek else None
+        if not read_only:
+            lock.enter_context(project_lock(home))
+        orch_pane = read_json(home / ORCH_FILE).get("pane") or None
+        if not read_only and orch_pane and orch_pane != me:
+            state = pane_state(orch_pane)
+            if state != "dead":
+                read_only = f"pane {orch_pane} is the orch of this project" + (
+                    "; herdr cannot tell whether it is alive" if state == "unknown" else "")
+                lock.close()
+        made = precise_now()
+        cursor, base, read = digest_base(home)
+        records = make_board(home, cursor, {p: b.get("lane") for p, b in base.items() if b.get("lane")})
+        changes = phase_changes(records, base)
+        events, offsets, _ = read_new_events(home, read)
+        shown = digest_events(events, orch_pane, [r["path"] for r in records])
+        omitted = max(0, len(shown) - DIGEST_EVENTS_MAX)
+        shown = shown[-DIGEST_EVENTS_MAX:]
+        if not read_only:
+            for c in changes:
+                record("phase", None, home=home, lane=c["path"], name=c["lane"], branch=c.get("branch"),
+                       old=c["old"], new=c["new"])
+            save_board(home, records, made)
+            write_json(home / DIGEST_FILE, {"cursor": now_iso(), "read": offsets, "lanes": {
+                r["path"]: {"lane": r["lane"], "branch": r.get("branch"), "phase": r["phase"]} for r in records}})
     since = datetime.fromtimestamp(cursor).astimezone().isoformat(timespec="seconds") if cursor else None
     if args.json:
         print(json.dumps({"project": home.name, "since": since, "read_only": bool(read_only), "why": read_only,
@@ -2652,9 +2774,18 @@ def cmd_digest(args: argparse.Namespace) -> int:
     return 0
 
 
-def orch_rebrief(data: dict, env) -> str | None:
-    """The re-brief for a session in the registered orch pane of its project. Reads files only, and runs git
-    once with HOOK_GIT_TIMEOUT, and only when an orch.json names this pane."""
+def helper_command(env) -> str:
+    """The helper as the orch runs it from its Bash tool: an absolute path in double quotes. Hooks get
+    CLAUDE_PLUGIN_ROOT, the Bash tool does not, so the value is filled in here."""
+    root = text_or_none(env.get("CLAUDE_PLUGIN_ROOT"))
+    base = root.rstrip("/") if root else str(PLUGIN_ROOT)
+    return f'python3 "{base}/scripts/fleet"'
+
+
+def orch_match(data: dict, env) -> tuple[Path, str] | None:
+    """(project home, pane) when the session runs in the registered orch pane of the project that holds its
+    directory. Reads files only, and runs git once with HOOK_GIT_TIMEOUT, and only when an orch.json names
+    this pane."""
     pane = text_or_none(env.get("HERDR_PANE_ID"))
     if not pane:
         return None
@@ -2664,12 +2795,22 @@ def orch_rebrief(data: dict, env) -> str | None:
     home = project_for(text_or_none(data.get("cwd")) or os.getcwd(), create=False, timeout=HOOK_GIT_TIMEOUT)
     if not home or all(os.path.realpath(home) != os.path.realpath(h) for h in homes):
         return None
+    return home, pane
+
+
+def orch_fallback(home: Path, pane: str, env) -> str:
+    """The short re-brief when the full one fails: never the lane or FLEET.md text."""
+    return (f"Fleet orchestrator: you orchestrate project {home.name} (pane {pane}). The re-brief from the "
+            f"project home failed. Run `{helper_command(env)} digest` first, then read {home / PROJECT_MD} and "
+            "load the fleet:fleet skill.")
+
+
+def orch_rebrief(home: Path, pane: str, data: dict, env) -> str:
+    """The re-brief for the registered orch pane, from the project home. Reads files only, and at most
+    REBRIEF_READ_BUDGET bytes of unread log: never the history that a digest consumed."""
     source = data.get("source")
     what = {"clear": "Your context was just cleared.", "compact": "Your context was just compacted.",
             "resume": "This session was resumed.", "startup": "This session just started."}.get(source, "")
-    # The skills allow `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" ...`; the hook runs with that variable set.
-    script = ('"${CLAUDE_PLUGIN_ROOT}/scripts/fleet"' if text_or_none(env.get("CLAUDE_PLUGIN_ROOT"))
-              else shlex.quote(str(Path(__file__).resolve())))
     project_md = home / PROJECT_MD
     text = read_text(project_md)
     head = [f"Fleet orchestrator: you orchestrate project {home.name} (pane {pane}). {what}".rstrip(),
@@ -2683,34 +2824,22 @@ def orch_rebrief(data: dict, env) -> str | None:
         if len(lines) > 15:
             body.append(f"- ... {len(lines) - 15} more in PROJECT.md")
     board = read_json(home / BOARD_FILE)
-    records = [r for r in board.get("lanes") or [] if isinstance(r, dict)]
+    records = [r for r in board.get("lanes") or [] if isinstance(r, dict)] if isinstance(board.get("lanes"), list) else []
     if board.get("made"):
         body.append(f"Board from {age_text(time.time() - event_time({'ts': board['made']}))} ago "
                     "(cached; `board` refreshes it):")
         body += ["  " + line for line in board_lines(records)[:16]]
     else:
         body.append("No board yet.")
-    cursor, _, seen = digest_base(home)
+    cursor, _, read = digest_base(home)
     if cursor is None:
         tail = ["No digest yet."]
     else:
-        since = min(cursor, event_time({"ts": seen.get("ts")}) or cursor)
-        month = datetime.fromtimestamp(since).strftime("%Y-%m")
-        events = []
-        for f in sorted((home / EVENTS_DIR).glob("*.jsonl")):
-            if f.stem >= month:
-                for line in read_text(f).splitlines():
-                    try:
-                        e = json.loads(line)
-                    except ValueError:
-                        continue
-                    if isinstance(e, dict):
-                        events.append(clean_event(e))
+        events, _, cut = read_new_events(home, read, REBRIEF_READ_BUDGET)
         paths = [r["path"] for r in records if isinstance(r.get("path"), str)]
-        events.sort(key=event_time)
-        count = len(digest_events(unseen_events(events, cursor, seen), pane, paths))
-        tail = [f"{plural(count, 'event')} since the last digest."]
-    tail.append(f"Run `python3 {script} digest` first, then load the fleet:fleet skill.")
+        count = len(digest_events(events, pane, paths))
+        tail = [("More than " if cut else "") + f"{plural(count, 'event')} since the last digest."]
+    tail.append(f"Run `{helper_command(env)} digest` first, then load the fleet:fleet skill.")
     room = REBRIEF_LINES_MAX - len(head) - len(tail)
     if len(body) > room:
         body = body[:room - 1] + ["... (cut; read PROJECT.md and run `board`)"]
@@ -3098,11 +3227,14 @@ def session_start_context(data: dict, env: dict | None = None) -> str | None:
     """
     env = os.environ if env is None else env
     try:
-        orch = orch_rebrief(data, env)
+        match = orch_match(data, env)
     except Exception:
-        orch = None
-    if orch:
-        return orch
+        match = None  # an error before the pane is known as the orch: behave as for any other pane
+    if match:
+        try:
+            return orch_rebrief(*match, data, env)
+        except Exception:
+            return orch_fallback(*match, env)
     source = data.get("source")
     if source not in ("clear", "compact"):
         return None
@@ -3329,7 +3461,9 @@ def build_parser() -> argparse.ArgumentParser:
     o.add_argument("--pane", help="claim: the pane to register (default: the calling pane)")
     o.add_argument("--replace", action="store_true",
                    help="claim: hand the orch over from the registered pane, which must be the caller")
-    o.add_argument("--force", action="store_true", help="release: remove the record of another pane")
+    o.add_argument("--force", action="store_true",
+                   help="claim: take over when herdr cannot tell whether the registered pane is alive; "
+                        "release: remove the record of another pane")
     o.add_argument("--json", action="store_true", help="show: print JSON")
     o.set_defaults(func=cmd_orch)
 

@@ -1030,8 +1030,9 @@ class OrchTests(unittest.TestCase):
         git("remote", "add", "origin", "git@github.com:acme/app.git", cwd=self.repo)
         git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init", cwd=self.repo)
         self.project = fleet.project_for(str(self.repo))
-        self.alive = set()
-        self.alive_patch = mock.patch.object(fleet, "pane_alive", side_effect=lambda p: p in self.alive)
+        self.alive, self.unknown = set(), set()
+        self.alive_patch = mock.patch.object(fleet, "pane_state", side_effect=lambda p: (
+            "alive" if p in self.alive else "unknown" if p in self.unknown else "dead"))
         self.alive_patch.start()
 
     def tearDown(self):
@@ -1091,7 +1092,7 @@ class OrchTests(unittest.TestCase):
             code, out = self.main(*argv, pane="w2:p1")
             self.assertEqual((code, json.loads(out)["ok"]), (2, False), argv)
             self.assertEqual(fleet.read_json(self.project / "orch.json")["pane"], "w1:p1")
-        self.assertIn("--replace works only from the registered pane",
+        self.assertIn("--replace works only from that pane",
                       json.loads(self.main("orch", "claim", "--replace", pane="w2:p1")[1])["refused"])
         # The registered pane hands over to a successor; the session is not the caller's.
         with mock.patch.object(fleet, "pane_info", return_value={"workspace_id": "w3"}):
@@ -1311,7 +1312,8 @@ class OrchTests(unittest.TestCase):
         self.assertEqual((data["read_only"], data["since"]), (False, None))
         self.assertEqual([(c["lane"], c["old"], c["new"]) for c in data["changes"]], [("lane-a", None, "working")])
         base = fleet.read_json(self.project / "digest.json")
-        self.assertEqual(base["seen"]["count"], 1)  # the spawn event
+        log = self.project / "events" / f"{time.strftime('%Y-%m')}.jsonl"
+        self.assertEqual(base["read"], {log.name: log.stat().st_size - len(log.read_bytes().splitlines(True)[-1])})
         self.assertEqual(base["lanes"], {str(a): {"lane": "lane-a", "branch": "feat/a", "phase": "working"}})
         self.assertTrue((self.project / "board.json").exists())
         phases = self.events("phase")
@@ -1334,20 +1336,6 @@ class OrchTests(unittest.TestCase):
         out = self.board([], "digest", pane="w1:p1")[1]
         self.assertIn("lane-a: ready 1 -> gone", out)
         self.assertEqual(fleet.read_json(self.project / "digest.json")["lanes"], {})
-
-    def test_unseen_events_in_the_cursor_second(self):
-        def ev(ts, text):
-            return {"ts": ts, "event": "send", "text": text}
-        log = [ev("2026-11-03T10:00:00+00:00", "a"), ev("2026-11-03T10:00:05+00:00", "b"),
-               ev("2026-11-03T10:00:05+00:00", "c")]
-        seen = fleet.seen_mark(log[:2])
-        self.assertEqual(seen, {"ts": "2026-11-03T10:00:05+00:00", "count": 1})
-        # c was written in the same second as b, after the digest read the log: it is new, b is not.
-        self.assertEqual([e["text"] for e in fleet.unseen_events(log, None, seen)], ["c"])
-        self.assertEqual(fleet.unseen_events(log, None, fleet.seen_mark(log)), [])
-        self.assertEqual(len(fleet.unseen_events(log, None, {})), 3)
-        cursor = fleet.event_time(log[1])
-        self.assertEqual([e["text"] for e in fleet.unseen_events(log, cursor, {})], ["b", "c"])
 
     def test_digest_only_reads_for_another_pane_than_a_live_orch(self):
         a = self.add_lane("a")
@@ -1392,6 +1380,247 @@ class OrchTests(unittest.TestCase):
         out = self.board(lanes, "digest", "--peek", pane="w1:p1")[1]
         self.assertIn("12 earlier not shown", out)
 
+    # round 2: liveness, the lock, log offsets, the re-brief's failure path -----------
+
+    def herdr_answers(self, answers):
+        """fleet.run for `herdr pane get`: each pane maps to (exit code, stdout) or an exception. git runs."""
+        real = fleet.run
+
+        def run(cmd, *args, **kwargs):
+            if cmd[:3] != ["herdr", "pane", "get"]:
+                return real(cmd, *args, **kwargs)
+            answer = answers[cmd[3]]
+            if isinstance(answer, Exception):
+                raise answer
+            return subprocess.CompletedProcess(cmd, answer[0], answer[1], "")
+        return mock.patch.object(fleet, "run", run)
+
+    def test_pane_state_from_herdr(self):
+        self.alive_patch.stop()
+        try:
+            answers = {
+                "w1:p1": (0, json.dumps({"result": {"pane": {"pane_id": "w1:p1", "agent": "claude"}}})),
+                "w1:p2": (0, json.dumps({"result": {"pane": {"pane_id": "w1:p2", "agent": None}}})),
+                "w1:p3": (1, json.dumps({"error": {"code": "pane_not_found", "message": "pane w1:p3 not found"}})),
+                "w1:p4": fleet.FleetError("timed out after 10s: herdr pane get w1:p4"),
+                "w1:p5": (1, json.dumps({"error": {"code": "server_unreachable", "message": "no server"}})),
+                "w1:p6": (0, "not json"),
+                "w1:p7": (0, json.dumps({"result": {}})),
+            }
+            with self.herdr_answers(answers), mock.patch.object(fleet.shutil, "which", return_value="/usr/bin/herdr"):
+                self.assertEqual([fleet.pane_state(f"w1:p{i}") for i in range(1, 8)],
+                                 ["alive", "dead", "dead", "unknown", "unknown", "unknown", "unknown"])
+                # Claim and digest on the real lookup: a timeout never authorizes a takeover or a foreign digest.
+                self.main("orch", "claim", pane="w1:p4")
+                code, out = self.main("orch", "claim", pane="w9:p9")
+                self.assertEqual(code, 2)
+                self.assertIn("`fleet orch claim --force` takes over", json.loads(out)["refused"])
+                self.assertEqual(fleet.read_json(self.project / "orch.json")["pane"], "w1:p4")
+                with mock.patch.object(fleet, "collect_lanes", return_value=([], [], [])):
+                    for pane in ("w9:p9", None):
+                        data = json.loads(self.main("digest", "--json", pane=pane)[1])
+                        self.assertTrue(data["read_only"])
+                        self.assertIn("cannot tell", data["why"])
+                    self.assertFalse((self.project / "digest.json").exists())
+                self.assertIsNone(json.loads(self.main("orch", "show", "--json")[1])["alive"])
+                self.assertIn("herdr cannot tell", self.main("orch", "show")[1])
+                # --force takes over an unknown pane, but never a live one.
+                self.assertEqual(self.main("orch", "claim", "--force", pane="w9:p9")[0], 0)
+                self.assertEqual(self.events("orch_claim")[-1].get("force"), True)
+                answers["w9:p9"] = answers["w1:p1"]
+                self.assertEqual(self.main("orch", "claim", "--force", pane="w8:p8")[0], 2)
+                # The registered pane hands over even when herdr cannot see the successor.
+                answers["w7:p7"] = fleet.FleetError("timed out")
+                self.assertEqual(self.main("orch", "claim", "--pane", "w7:p7", "--replace", pane="w9:p9")[0], 0)
+                self.assertIs(json.loads(self.main("orch", "show", "--json")[1])["alive"], None)
+                answers["w7:p7"] = answers["w1:p3"]
+                self.assertIs(json.loads(self.main("orch", "show", "--json")[1])["alive"], False)
+        finally:
+            self.alive_patch.start()
+
+    def test_the_project_lock(self):
+        with mock.patch.object(fleet, "LOCK_WAIT", 0.3), mock.patch.object(sys, "stderr", io.StringIO()) as err:
+            with fleet.project_lock(self.project):
+                # claim and release wait for the lock, then fail with a clear message, and change nothing.
+                self.assertEqual(self.main("orch", "claim", pane="w1:p1")[0], 1)
+                self.assertIn("project app is busy", err.getvalue())
+                self.assertFalse((self.project / "orch.json").exists())
+                fleet.write_json(self.project / "orch.json", {"pane": "w1:p1"})
+                self.assertEqual(self.main("orch", "release", pane="w1:p1")[0], 1)
+                self.assertTrue((self.project / "orch.json").exists())
+                # A consuming digest waits too; --peek and the re-brief never take the lock.
+                with mock.patch.object(fleet, "collect_lanes", return_value=([], [], [])), \
+                        mock.patch.object(fleet.shutil, "which", return_value="/usr/bin/herdr"):
+                    self.assertEqual(self.main("digest", pane="w1:p1")[0], 1)
+                    self.assertEqual(self.main("digest", "--peek", pane="w1:p1")[0], 0)
+                fleet.write_json(self.project / "digest.json", {"cursor": fleet.now_iso()})
+                self.assertIn("you orchestrate project app", fleet.session_start_context(
+                    {"source": "clear", "cwd": str(self.repo)}, env={"HERDR_PANE_ID": "w1:p1"}))
+
+    def test_a_digest_holds_the_lock_through_its_commit(self):
+        """While a digest collects its board, no claim and no second digest can run; the check holds at commit."""
+        a = self.add_lane("a")
+        results = []
+
+        def slow_board(*args, **kwargs):
+            with mock.patch.object(fleet, "LOCK_WAIT", 0.2), mock.patch.object(sys, "stderr", io.StringIO()):
+                results.append(("claim", fleet.main(["orch", "claim", "--pane", "w2:p1"])))
+                results.append(("digest", fleet.main(["digest"])))
+            return ([self.facts(a, label="lane-a")], [], [])
+        with mock.patch.object(fleet, "collect_lanes", side_effect=slow_board), \
+                mock.patch.object(fleet.shutil, "which", return_value="/usr/bin/herdr"):
+            data = json.loads(self.main("digest", "--json")[1])  # outside Herdr, no orch registered
+        self.assertEqual(results, [("claim", 1), ("digest", 1)])
+        self.assertFalse(data["read_only"])
+        self.assertFalse((self.project / "orch.json").exists())
+        self.assertEqual(len(self.events("phase")), 1)
+
+    def test_board_json_never_goes_back_in_time(self):
+        older, newer = fleet.precise_now(), None
+        time.sleep(0.01)
+        newer = fleet.precise_now()
+        self.assertTrue(fleet.save_board(self.project, [{"lane": "new"}], newer))
+        self.assertFalse(fleet.save_board(self.project, [{"lane": "old"}], older))
+        self.assertEqual(fleet.read_json(self.project / "board.json")["lanes"], [{"lane": "new"}])
+        # `board` stamps the board with the time its collection began, and says when it keeps a newer one.
+        made = []
+
+        def collect(*args, **kwargs):
+            made.append(fleet.precise_now())
+            fleet.save_board(self.project, [{"lane": "newer"}], fleet.precise_now())
+            return ([], [], [])
+        with mock.patch.object(fleet, "collect_lanes", side_effect=collect), \
+                mock.patch.object(fleet.shutil, "which", return_value="/usr/bin/herdr"):
+            self.assertIn("board.json holds a newer board", self.main("board")[1])
+        self.assertEqual(fleet.read_json(self.project / "board.json")["lanes"], [{"lane": "newer"}])
+
+    def log_file(self, month=None):
+        return self.project / "events" / f"{month or time.strftime('%Y-%m')}.jsonl"
+
+    def raw_event(self, text, ts="2026-11-03T10:00:00+00:00", month=None, end="\n"):
+        path = self.log_file(month)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as fh:
+            fh.write(json.dumps({"ts": ts, "event": "send", "pane": "w2:p1", "text": text}) + end)
+
+    def digest(self, *argv):
+        with mock.patch.object(fleet, "collect_lanes", return_value=([], [], [])), \
+                mock.patch.object(fleet.shutil, "which", return_value="/usr/bin/herdr"):
+            data = json.loads(self.main("digest", "--json", *argv)[1])
+        return [e.get("text") for e in data["events"]]
+
+    def test_digest_reads_the_log_by_offset(self):
+        # An empty log, and an event appended while the digest runs, after it read the log.
+        real = fleet.read_new_events
+
+        def read_then_append(*args, **kwargs):
+            out = real(*args, **kwargs)
+            self.raw_event("during", ts="2026-11-03T09:00:00+00:00")
+            return out
+        with mock.patch.object(fleet, "read_new_events", side_effect=read_then_append):
+            self.assertEqual(self.digest(), [])
+        self.assertEqual(self.digest(), ["during"])
+        self.assertEqual(self.digest(), [])
+        # A late append with an older time than the events already read.
+        self.raw_event("new", ts="2026-11-03T12:00:00+00:00")
+        self.assertEqual(self.digest(), ["new"])
+        self.raw_event("late", ts="2026-11-03T11:00:00+00:00")
+        self.assertEqual(self.digest(), ["late"])
+        # A partial last line waits until it is complete.
+        self.raw_event("partial", end="")
+        self.assertEqual(self.digest(), [])
+        with open(self.log_file(), "a") as fh:
+            fh.write("\n")
+        self.raw_event("after")
+        self.assertEqual(self.digest("--peek"), ["partial", "after"])
+        self.assertEqual(self.digest(), ["partial", "after"])
+        # A new month is read from its start; a file that shrank was rewritten and is read again.
+        self.raw_event("next month", month="2099-01")
+        self.assertEqual(self.digest(), ["next month"])
+        self.log_file("2099-01").write_text(json.dumps({"ts": "2099-01-01T00:00:00+00:00", "event": "send",
+                                                        "text": "x"}) + "\n")
+        self.assertEqual(self.digest(), ["x"])
+        self.assertEqual(set(fleet.read_json(self.project / "digest.json")["read"]),
+                         {self.log_file().name, "2099-01.jsonl"})
+
+    def test_record_takes_its_time_under_the_lock(self):
+        order = []
+        real_flock = fleet.fcntl.flock
+        real_now = fleet.now_iso
+
+        def flock(fd, op):
+            order.append("lock")
+            return real_flock(fd, op)
+
+        def now():
+            order.append("time")
+            return real_now()
+        with mock.patch.object(fleet.fcntl, "flock", flock), mock.patch.object(fleet, "now_iso", now):
+            fleet.record("send", None, home=self.project, pane="w2:p1")
+        self.assertEqual(order[-2:], ["lock", "time"])
+
+    def test_rebrief_reads_only_the_unread_log_within_a_budget(self):
+        self.orch_setup()
+        with mock.patch.object(fleet, "collect_lanes", return_value=([], [], [])), \
+                mock.patch.object(fleet.shutil, "which", return_value="/usr/bin/herdr"):
+            for i in range(2000):
+                self.raw_event(f"old {i}")
+            self.main("digest", pane="w1:p1")
+        self.raw_event("one")
+        self.raw_event("two")
+
+        def brief():
+            return fleet.session_start_context({"source": "clear", "cwd": str(self.repo)},
+                                               env={"HERDR_PANE_ID": "w1:p1"})
+        with mock.patch.object(fleet, "REBRIEF_READ_BUDGET", 1000):  # the consumed history is far larger
+            self.assertIn("\n2 events since the last digest.", brief())
+            for i in range(50):
+                self.raw_event(f"backlog {i}")
+            self.assertRegex(brief(), r"More than \d+ events since the last digest\.")
+
+    def test_a_failed_rebrief_never_gives_the_lane_text(self):
+        d = self.repo / ".fleet"
+        d.mkdir()
+        (d / "BRIEF.md").write_text("brief")
+        (d / "STATUS.md").write_text("status")
+        fleet.save_panes(d, {"w1:p1": {"role": "impl"}})
+        before = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)}, env={"HERDR_PANE_ID": "w1:p1"})
+        self.assertIn("You implement this lane", before)
+        self.orch_setup()
+        # A damaged cached board renders as blanks.
+        fleet.write_json(self.project / "board.json", {"made": fleet.now_iso(), "lanes": [
+            {"lane": "x", "pr": "#4", "panes": "w2:p1", "last_event": 7, "phase": None, "blocked": ["?"]}, "bad"]})
+        payload = json.dumps({"source": "clear", "cwd": str(self.repo)})
+        cp = subprocess.run([sys.executable, str(SCRIPT), "hook", "session-start"], input=payload, cwd=self.repo,
+                            capture_output=True, text=True, timeout=20, env={**os.environ, "HERDR_PANE_ID": "w1:p1"})
+        context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("you orchestrate project app", context)
+        self.assertNotIn("You implement this lane", context)
+        # Any other failure once the pane is known as the orch: the short fixed re-brief.
+        with mock.patch.object(fleet, "orch_rebrief", side_effect=RuntimeError("boom")):
+            text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)},
+                                               env={"HERDR_PANE_ID": "w1:p1", "CLAUDE_PLUGIN_ROOT": "/plugins/fleet"})
+        self.assertIn("you orchestrate project app (pane w1:p1). The re-brief from the project home failed.", text)
+        self.assertIn('`python3 "/plugins/fleet/scripts/fleet" digest`', text)
+        self.assertNotIn("You implement", text)
+        # A failure before that point behaves as on main.
+        with mock.patch.object(fleet, "orch_match", side_effect=RuntimeError("boom")):
+            self.assertEqual(fleet.session_start_context({"source": "clear", "cwd": str(self.repo)},
+                                                         env={"HERDR_PANE_ID": "w1:p1"}), before)
+
+    def test_round_expects_the_review_files_its_request_names(self):
+        two = ("Write findings to .fleet/REVIEW-3-codex.md (codex) and .fleet/REVIEW-3-claude.md (claude). "
+               "Re-check the fixes for REVIEW-2.md.")
+        files = {"REVIEW-REQUEST-3.md": two, "REVIEW-3-codex.md": "VERDICT: APPROVE", "REVIEW-2.md": "VERDICT: APPROVE"}
+        self.assertEqual(self.phase(files=files), "review 3")  # the claude critic has not written yet
+        self.assertEqual(self.phase(files={**files, "REVIEW-3-claude.md": "VERDICT: APPROVE"}), "reviewed 3: APPROVE")
+        # A request that names no file: the files that exist decide.
+        self.assertEqual(self.phase(files={"REVIEW-REQUEST-1.md": "see the template",
+                                           "REVIEW-1-x.md": "VERDICT: APPROVE"}), "reviewed 1: APPROVE")
+        # REVIEW-10.md does not count for round 1.
+        self.assertEqual(self.phase(files={"REVIEW-REQUEST-1.md": "Write .fleet/REVIEW-1.md",
+                                           "REVIEW-10.md": "VERDICT: APPROVE"}), "review 1")
+
     # re-brief ---------------------------------------------------------
 
     def orch_setup(self, rules=("- Never push to main.",), follow_ups=("- Add a CHANGELOG entry.",)):
@@ -1401,7 +1630,7 @@ class OrchTests(unittest.TestCase):
             "## Follow-ups\n" + "\n".join(follow_ups) + "\n\n## Notes\n- none\n")
         fleet.save_board(self.project, [{"lane": "lane-a", "path": str(self.root / "a"), "phase": "review 1",
                                          "panes": [], "pr": None, "last_event": None, "blocked": None,
-                                         "next": "Fix it."}])
+                                         "next": "Fix it."}], fleet.precise_now())
         fleet.write_json(self.project / "digest.json", {"cursor": fleet.now_iso(), "lanes": {}})
         for text in ("one", "two"):
             fleet.record("send", str(self.repo), by=False, pane="w2:p1", text=text)
@@ -1426,8 +1655,8 @@ class OrchTests(unittest.TestCase):
         # The command matches the skills' allowed-tools when the hook knows the plugin root.
         text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)},
                                            env={"HERDR_PANE_ID": "w1:p1", "CLAUDE_PLUGIN_ROOT": "/plugins/fleet"})
-        self.assertIn('Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" digest` first', text)
-        self.assertIn(f"Run `python3 {SCRIPT.resolve()} digest` first", fleet.session_start_context(
+        self.assertIn('Run `python3 "/plugins/fleet/scripts/fleet" digest` first', text)
+        self.assertIn(f'Run `python3 "{SCRIPT.resolve().parent.parent}/scripts/fleet" digest` first', fleet.session_start_context(
             {"source": "clear", "cwd": str(self.repo)}, env={"HERDR_PANE_ID": "w1:p1"}))
         # In a checkout of another project, the orch pane is not briefed as this project's orch.
         other = self.root / "other"
@@ -1445,7 +1674,7 @@ class OrchTests(unittest.TestCase):
     def test_rebrief_is_capped(self):
         self.orch_setup(rules=[f"- rule {i}" for i in range(40)], follow_ups=[f"- follow-up {i}" for i in range(40)])
         fleet.save_board(self.project, [{"lane": f"lane-{i}", "path": str(self.root / str(i)), "phase": "idle",
-                                         "panes": []} for i in range(30)])
+                                         "panes": []} for i in range(30)], fleet.precise_now())
         text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)}, env={"HERDR_PANE_ID": "w1:p1"})
         self.assertLessEqual(len(text.splitlines()), fleet.REBRIEF_LINES_MAX)
         self.assertIn("25 more in PROJECT.md", text)

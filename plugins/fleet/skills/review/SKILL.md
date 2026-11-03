@@ -29,7 +29,7 @@ Write `<worktree>/.fleet/REVIEW-REQUEST-<n>.md` from the template in `${CLAUDE_P
 - Base, branch and diff range. From round 2, give the commits since the last review and point at the dispositions in STATUS.md.
 - Focus: the acceptance criteria in BRIEF.md, plus the risks you see in the diff.
 - The round rule. Apply the stop rule from the conventions here.
-- The output file: `.fleet/REVIEW-<n>.md`. With two critics, give each its own file (`REVIEW-<n>-codex.md`, `REVIEW-<n>-claude.md`).
+- The output file: `.fleet/REVIEW-<n>.md`. With two critics, give each its own file (`REVIEW-<n>-codex.md`, `REVIEW-<n>-claude.md`). Name every output file in the request by its exact name: `fleet board` counts the round as reviewed only when each named file has a `VERDICT:` line.
 
 ## 3. Start the critics
 
