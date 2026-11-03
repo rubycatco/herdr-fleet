@@ -1131,6 +1131,24 @@ class FilesTests(unittest.TestCase):
             "the next step in STATUS.md. If you have another role here, re-read the file that defines your "
             "task before you act."))
 
+    def test_session_start_ignores_the_risk_files(self):
+        """RISK.md and a plan with high-risk paths change no re-brief, and the hook runs no extra git for them."""
+        d = Path(os.path.realpath(self.lane({"w1:p1": {"role": "impl"}, "w1:p2": {"role": "critic"},
+                                             "w1:p4": {"role": "planner"}})))
+        (d / "PLAN.md").write_text("Risk: none\n## Files\n- db/migrate/1.sql\nPLAN READY: 1\n")
+
+        def texts():
+            return [fleet.session_start_context({"source": source, "cwd": str(self.repo)}, env={"HERDR_PANE_ID": pane})
+                    for pane in ("w1:p1", "w1:p2", "w1:p4", "w9:p9") for source in ("clear", "compact")]
+        before = texts()
+        (d / "RISK.md").write_text("# Risk approvals: main\n\nRISK APPROVED: migration db/migrate/1.sql by user x\n")
+        (self.repo / "db" / "migrate").mkdir(parents=True)
+        (self.repo / "db" / "migrate" / "1.sql").write_text("")
+        with mock.patch.object(fleet, "risk_state", side_effect=AssertionError("the hook checks no diff")), \
+                mock.patch.object(fleet, "lane_changed_paths", side_effect=AssertionError("no git log")):
+            self.assertEqual(texts(), before)
+        self.assertNotIn("RISK.md", fleet.LANE_FILES)
+
     def test_session_start_planner_researcher_and_helper(self):
         d = self.lane({"w1:p1": {"role": "impl"}, "w1:p4": {"role": "planner"},
                        "w1:p5": {"role": "researcher", "task": "/home/x/research/q.md"},
@@ -2265,6 +2283,64 @@ class OrchTests(unittest.TestCase):
         text = self.board(lanes, "board")[1]
         self.assertNotIn("approve-plan refuses", text)
         self.assertNotIn("Open research", text)
+
+    def test_board_risk(self):
+        def commit(path, name, message):
+            (path / name).parent.mkdir(parents=True, exist_ok=True)
+            (path / name).write_text("x\n")
+            git("add", name, cwd=path)
+            git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", message, cwd=path)
+        (self.project / "PROJECT.md").write_text("# Project: app\n\n## High-risk paths\n- auth-payments: app/auth/\n")
+        a = self.add_lane("a", STATUS_md="## Blocked\n- Which API?\n")
+        commit(a, "db/migrations/0002.py", "a migration")
+        (a / "app" / "auth").mkdir(parents=True)
+        (a / "app" / "auth" / "token.py").write_text("")  # uncommitted, from the project's own pattern
+        b = self.add_lane("b", STATUS_md="## Next step\nMerge.\n",
+                          RISK_md="RISK APPROVED: migration db/migrate/1.sql by user 2026\n")
+        commit(b, "db/migrate/1.sql", "covered by RISK.md")
+        c = self.add_lane("c", STATUS_md="## Next step\nGo.\n")
+        git("checkout", "-q", "--detach", cwd=c)
+        d = self.add_lane("d", STATUS_md="## Next step\nGo.\n")
+        commit(d, "app.py", "no risky path")
+        e = self.add_lane("e", PLAN_md="Risk: none\nPLAN READY: 1\n")
+        (e / "db" / "migrate").mkdir(parents=True)
+        (e / "db" / "migrate" / "x.sql").write_text("")  # at plan ready: the plan warning, not the diff
+        lanes = [self.facts(p, panes=[{"pane": f"w{i}:p1", "agent": "claude", "status": "idle"}])
+                 for i, p in enumerate((a, b, c, d), start=2)] + [self.facts(e)]
+        lanes[2]["branch"] = None
+        recs = {r["path"]: r for r in json.loads(self.board(lanes, "board", "--json")[1])["lanes"]}
+        self.assertEqual(recs[str(a)]["risk"], {
+            "matches": [{"category": "auth-payments", "path": "app/auth/token.py"},
+                        {"category": "migration", "path": "db/migrations/0002.py"}],
+            "needs_user": [{"category": "auth-payments", "path": "app/auth/token.py"},
+                           {"category": "migration", "path": "db/migrations/0002.py"}]})
+        self.assertEqual(recs[str(b)]["risk"], {"matches": [{"category": "migration", "path": "db/migrate/1.sql"}],
+                                                "needs_user": []})
+        self.assertEqual(recs[str(c)]["risk"]["needs_user"],
+                         "cannot be told: HEAD is detached, so the lane's changes cannot be told; pass --base <ref>")
+        self.assertIsNone(recs[str(d)]["risk"])
+        self.assertEqual((recs[str(e)]["phase"], recs[str(e)]["risk"]), ("plan ready 1", None))
+        saved = {r["path"]: r for r in fleet.read_json(self.project / "board.json")["lanes"]}
+        self.assertEqual(saved[str(a)]["risk"], recs[str(a)]["risk"])
+        lines = {l.split()[0]: l for l in self.board(lanes, "board")[1].splitlines()[2:]}
+        # NOTE order: the plan warning, then the risk, then blocked, then next.
+        self.assertRegex(lines["feat/a"], r"blocked .* risky diff needs the user \(2\): auth-payments app/auth/to\S*$")
+        self.assertTrue(lines["feat/b"].endswith("next: Merge."))
+        self.assertIn("risky diff cannot be told: HEAD is detached", lines["c"])  # no branch: the lane is its folder
+        self.assertTrue(lines["feat/d"].endswith("next: Go."))
+        self.assertTrue(lines["feat/e"].endswith("1 changed path outside .fleet/: approve-plan refuses"))
+
+    def test_board_lines_of_a_record_without_risk(self):
+        record = {"lane": "feat/x", "phase": "working", "pr": None, "panes": [{"role": "impl", "agent": "claude",
+                  "status": "working"}], "last_event": None, "blocked": None, "next": "Write the tests."}
+        before = ["LANE    PHASE    PR  PANES         LAST  NOTE", "feat/x  working  -   impl:working  -     next: Write the tests."]
+        self.assertEqual(fleet.board_lines([record]), before)  # a 0.6.0 record
+        self.assertEqual(fleet.board_lines([{**record, "risk": None}]), before)
+        self.assertEqual(fleet.board_lines([{**record, "risk": {"matches": [], "needs_user": []}}]), before)
+        for damaged in ("x", {"needs_user": 3}, {"needs_user": [3, None]}):
+            self.assertEqual(fleet.board_lines([{**record, "risk": damaged}]), before)
+        self.assertTrue(fleet.board_lines([{**record, "risk": {"needs_user": [{"path": "a"}]}}])[1]
+                        .endswith("risky diff needs the user (1): ? a"))
 
     def test_status_notes(self):
         md = ("# Status: x\n\n## Plan\n1. a\n\n## Blocked\n- none\n\n## Next steps\n\n- Run the tests.\n- More.\n\n"

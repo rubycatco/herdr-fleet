@@ -2427,7 +2427,42 @@ def newest_lane_event(events: list[dict], path: str, branch: str | None) -> dict
     return None
 
 
-def board_record(f: dict, events: list[dict]) -> dict:
+RISK_SKIP_PHASES = ("removed", "merged", "planning")  # and `plan ready <n>`, `plan approved <n>`: no code yet
+
+
+def board_risk(path: str, phase: str, home: Path | None) -> dict | None:
+    """The board's view of `risk_state` for a lane: `{matches, needs_user}`, with `needs_user` the text
+    `cannot be told: <why>` when the changes cannot be told; None without a match, and for a lane that is not
+    a git checkout or whose phase has no code to check."""
+    if phase in RISK_SKIP_PHASES or phase.startswith("plan "):
+        return None
+    top = git_toplevel(path) if os.path.isdir(path) else None
+    if not top:
+        return None
+    state = risk_state(top, home)
+
+    def pair(m: dict) -> dict:
+        return {"category": m["category"], "path": m["path"]}
+    if state["error"]:
+        return {"matches": [], "needs_user": f"cannot be told: {state['error']}"}
+    if not state["matches"]:
+        return None
+    return {"matches": [pair(m) for m in state["matches"]], "needs_user": [pair(m) for m in state["needs_user"]]}
+
+
+def risk_note(risk) -> str:
+    """The NOTE of a lane whose changes need the user's yes, or ''."""
+    need = as_dict(risk).get("needs_user")
+    if isinstance(need, str) and need:
+        return f"risky diff {need}"
+    items = [m for m in need if isinstance(m, dict)] if isinstance(need, list) else []
+    if not items:
+        return ""
+    first = f"{as_text(items[0].get('category')) or '?'} {as_text(items[0].get('path')) or '?'}"
+    return f"risky diff needs the user ({len(items)}): {first}"
+
+
+def board_record(f: dict, events: list[dict], home: Path | None = None) -> dict:
     d = Path(f["path"]) / FLEET_DIR
     roles = load_panes(d)
     panes = [{"pane": p.get("pane"), "role": (roles.get(p.get("pane") or "") or {}).get("role"),
@@ -2438,7 +2473,8 @@ def board_record(f: dict, events: list[dict]) -> dict:
     out = {"lane": lane_name(f), "path": f["path"], "branch": f.get("branch"), "workspace": f.get("workspace"),
            "panes": panes, "pr": {"number": pr.get("number"), "state": pr.get("state")} if pr else None,
            "phase": phase, "last_event": newest_lane_event(events, f["path"], f.get("branch")),
-           "blocked": first_note(status_md, "Blocked"), "next": first_note(status_md, r"Next steps?")}
+           "blocked": first_note(status_md, "Blocked"), "next": first_note(status_md, r"Next steps?"),
+           "risk": board_risk(f["path"], phase, home)}
     if phase.startswith("plan ready"):
         warning = plan_gate_note(f["path"])
         if warning:
@@ -2491,7 +2527,7 @@ def removed_records(events: list[dict], since: float | None, on_board: set[str],
         found[path] = {"lane": names.get(path) or e.get("branch") or os.path.basename(path), "path": path,
                        "branch": e.get("branch"), "workspace": e.get("workspace"), "panes": [], "pr": None,
                        "phase": "removed", "last_event": {"ts": e.get("ts"), "event": "cleanup"},
-                       "blocked": None, "next": None}
+                       "blocked": None, "next": None, "risk": None}
     return list(found.values())
 
 
@@ -2519,7 +2555,7 @@ def make_board(home: Path, since: float | None, names: dict[str, str]) -> list[d
         raise FleetError("herdr not found in PATH")
     lanes, _, _ = collect_lanes(select=lane_selector(home))
     events = read_events([home])
-    records = [board_record(f, events) for f in lanes]
+    records = [board_record(f, events, home) for f in lanes]
     records += removed_records(events, since, {os.path.realpath(r["path"]) for r in records}, names)
     return sorted(records, key=lambda r: (r["phase"] == "removed", r["lane"], r["path"]))
 
@@ -2594,7 +2630,9 @@ def board_lines(records: list) -> list[str]:
                          for p in panes if isinstance(p, dict) and p.get("agent"))
         last = as_dict(r.get("last_event"))
         blocked, nxt, warning = as_text(r.get("blocked")), as_text(r.get("next")), as_text(r.get("warning"))
-        note = warning if warning else f"blocked: {blocked}" if blocked else f"next: {nxt}" if nxt else ""
+        risky = risk_note(r.get("risk"))
+        note = (warning if warning else risky if risky else f"blocked: {blocked}" if blocked
+                else f"next: {nxt}" if nxt else "")
         number = pr.get("number")
         table.append([clip(as_text(r.get("lane")) or "?", 28), as_text(r.get("phase")) or "?",
                       f"#{number} {as_text(pr.get('state')).lower()}".strip() if isinstance(number, int) else "-",
