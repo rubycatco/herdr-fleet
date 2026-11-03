@@ -1033,6 +1033,54 @@ def chdir(path):
         os.chdir(old)
 
 
+class MarkerTests(unittest.TestCase):
+    """Markers are lines: a marker counts at the start of a line, after list or bold marks, not in a sentence."""
+
+    SENTENCE = "## Plan\n5. Verify, then add READY FOR REVIEW: round 1 and stop.\nSee `READY FOR REVIEW: round 1`.\n"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(os.path.realpath(self.tmp.name)) / "repo"
+        self.repo.mkdir()
+        git("init", "-q", "-b", "main", cwd=self.repo)
+        (self.repo / ".fleet").mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def watch(self, text, marker="READY FOR REVIEW: round 1"):
+        (self.repo / ".fleet" / "STATUS.md").write_text(text)
+        info = {"pane_id": "w2:p1", "cwd": str(self.repo), "agent": "claude", "agent_status": "idle"}
+        buf = io.StringIO()
+        with mock.patch.object(fleet, "require_herdr"), mock.patch.object(fleet, "pane_info", return_value=info), \
+                mock.patch.object(fleet, "screen_tail", return_value=[]), mock.patch.object(fleet.time, "sleep"), \
+                redirect_stdout(buf):
+            code = fleet.main(["watch", "w2:p1", "--marker", marker, "--idle-grace", "0", "--interval", "0"])
+        return code, json.loads(buf.getvalue())["event"]
+
+    def test_watch_matches_a_line_not_a_sentence(self):
+        self.assertEqual(self.watch(self.SENTENCE), (6, "stopped"))
+        for line in ("READY FOR REVIEW: round 1", "- READY FOR REVIEW: round 1", "**READY FOR REVIEW: round 1**",
+                     "`READY FOR REVIEW: round 1`", "> READY FOR REVIEW: round 1", "  READY FOR REVIEW: round 1  "):
+            self.assertEqual(self.watch(self.SENTENCE + line + "\n"), (0, "marker"), line)
+        # Round 1 is not round 10, and the marker's own regex characters are literal.
+        self.assertEqual(self.watch("READY FOR REVIEW: round 10\n"), (6, "stopped"))
+        self.assertEqual(self.watch("a.b (x)\n", marker="a.b (x)"), (0, "marker"))
+        self.assertEqual(self.watch("axb (x)\n", marker="a.b (x)"), (6, "stopped"))
+
+    def test_board_ready_line(self):
+        d = self.repo / ".fleet"
+        idle = [{"pane": "w2:p1", "agent": "claude", "status": "idle", "role": "impl"}]
+        (d / "STATUS.md").write_text(self.SENTENCE)
+        self.assertEqual(fleet.lane_phase({"panes": idle, "pr": None}, d), "idle")
+        (d / "STATUS.md").write_text(self.SENTENCE + "**READY FOR REVIEW: round 2**\n")
+        self.assertEqual(fleet.lane_phase({"panes": idle, "pr": None}, d), "ready 2")
+        # A sentence under Next step is a note now; the marker line is not.
+        md = "## Next step\nAdd READY FOR REVIEW: round 1 when done.\n"
+        self.assertEqual(fleet.first_note(md, r"Next steps?"), "Add READY FOR REVIEW: round 1 when done.")
+        self.assertIsNone(fleet.first_note("## Next step\nREADY FOR REVIEW: round 1\n", r"Next steps?"))
+
+
 class OrchTests(unittest.TestCase):
     """orch, board, digest and the orch re-brief, in a temporary FLEET_HOME. herdr and gh never run."""
 

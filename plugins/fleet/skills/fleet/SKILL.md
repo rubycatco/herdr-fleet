@@ -41,7 +41,7 @@ Run every command as `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" <command> ..
 | `worktree BRANCH --base REF --name LABEL` | A Herdr worktree in its own workspace, with a shell pane and `.fleet/` ready. |
 | `spawn ...` | Start an agent in a pane and confirm that it works. See below. |
 | `send PANE --text T` or `--file F` | Submit a prompt and confirm that it landed. Long or multi-line text goes to `.fleet/inbox/` and is sent as a one-line pointer. |
-| `watch PANE [--marker M] [--file F]` | Wait until a marker shows in a lane file (default `.fleet/STATUS.md`), or the agent stops, blocks or exits. Run it in the background. |
+| `watch PANE [--marker M] [--file F]` | Wait until a line of a lane file (default `.fleet/STATUS.md`) starts with the marker, or the agent stops, blocks or exits. A mention inside a sentence does not count. Run it in the background. |
 | `reset PANE [--compact [FOCUS]]` | `/clear` (or `/compact`) a Claude lane at a boundary, confirm it, and send a resume prompt. PANE comes first. |
 | `retire PANE [--close]` | Exit the agent, and close the pane if asked. |
 | `sweep` | Every lane on this machine with a verdict, ready, waiting or keep, and the reason (text; `--json`). It only reads. |

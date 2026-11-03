@@ -2174,7 +2174,15 @@ what nothing else knows. Keep each entry to one line.
 REVIEW_REQUEST_FILE = re.compile(r"^REVIEW-REQUEST-(\d+)\.md$")
 REVIEW_FILE = re.compile(r"^REVIEW-(\d+)(?:-[^/]+)?\.md$")  # REVIEW-<n>.md, or REVIEW-<n>-<critic>.md
 VERDICT_LINE = re.compile(r"^[^\w\n]*VERDICT:[ \t]*(.*)$", re.M)
-READY_LINE = re.compile(r"READY FOR REVIEW: round (\d+)")
+
+
+def marker_line(marker: str) -> str:
+    """A regex for a marker at the start of a line, after optional non-word characters (a list dash, `**`, a
+    backtick, `>`). A mention inside a sentence does not count. Compile it with re.M."""
+    return r"^[^\w\n]*" + marker + r"(?!\w)"
+
+
+READY_LINE = re.compile(marker_line(r"READY FOR REVIEW: round (\d+)"), re.M)
 EMPTY_NOTE = re.compile(r"^(?:[-*]\s*)?(?:none\.?|<[^>]*>)?$", re.I)  # "-", "none", "- none", a template "<...>"
 HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 
@@ -2929,7 +2937,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     if args.marker:
         f = Path(args.file or f"{FLEET_DIR}/STATUS.md").expanduser()
         path = f if f.is_absolute() else Path(top) / f
-        pattern = re.compile(re.escape(args.marker) + r"(?!\w)")
+        pattern = re.compile(marker_line(re.escape(args.marker)), re.M)
     start = time.time()
     stopped_since: float | None = None
     blocked_since: float | None = None
@@ -3359,7 +3367,8 @@ def build_parser() -> argparse.ArgumentParser:
                         description="Exit codes: 0 marker found, 4 blocked on a dialog, 5 agent exited or pane gone, "
                                     "6 stopped without the marker, 7 timeout.")
     wa.add_argument("pane")
-    wa.add_argument("--marker", help="text to wait for, e.g. 'READY FOR REVIEW: round 2'")
+    wa.add_argument("--marker", help="text to wait for at the start of a line (after list or bold marks), "
+                                     "e.g. 'READY FOR REVIEW: round 2'; a mention inside a sentence does not count")
     wa.add_argument("--file", help="file to search, relative to the pane's worktree (default .fleet/STATUS.md)")
     wa.add_argument("--interval", type=float, default=15, help="seconds between checks (default 15)")
     wa.add_argument("--idle-grace", type=float, default=180,

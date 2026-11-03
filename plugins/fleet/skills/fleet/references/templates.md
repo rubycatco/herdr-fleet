@@ -63,7 +63,7 @@ The orchestrator's own file, PROJECT.md, lives in the project home (`~/.fleet/pr
 READY FOR REVIEW: round <n>
 ```
 
-The `READY FOR REVIEW: round <n>` line is the marker watchers look for. Move it to the end with a new round number each time; never reuse an old number.
+The `READY FOR REVIEW: round <n>` line is the marker watchers look for. A marker counts only at the start of a line (after a list dash, `**`, a backtick or `>`); a mention inside a sentence does not. Move it to the end with a new round number each time; never reuse an old number.
 
 ## REVIEW-REQUEST-<n>.md (the orchestrator writes it for the critic)
 
