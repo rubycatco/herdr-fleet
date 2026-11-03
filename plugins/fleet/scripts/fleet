@@ -498,9 +498,18 @@ def plan_gate(cwd: str | None) -> tuple[str | None, Path | None, int | None]:
     """(why an implementer may not start in `cwd` yet, the PLAN.md, its newest ready round). The reason is None
     when the checkout has no .fleet/PLAN.md, or when the newest `PLAN READY: <n>` round has its
     `PLAN APPROVED: <n>` line."""
-    top = git_toplevel(cwd) if cwd and os.path.isdir(cwd) else None
-    plan = Path(top) / FLEET_DIR / PLAN_FILE if top else None
-    if plan is None or not plan.is_file():
+    if not cwd or not os.path.isdir(cwd):
+        return None, None, None
+    top = git_toplevel(cwd)
+    if not top:
+        # Not a git checkout, or git failed. A PLAN.md at or above cwd means a lane: fail closed.
+        for d in (Path(cwd), *Path(cwd).parents):
+            if (d / FLEET_DIR / PLAN_FILE).is_file():
+                return (f"git cannot tell the checkout of {cwd}, and {d / FLEET_DIR / PLAN_FILE} exists, so the plan "
+                        "gate cannot be checked"), d / FLEET_DIR / PLAN_FILE, None
+        return None, None, None
+    plan = Path(top) / FLEET_DIR / PLAN_FILE
+    if not plan.is_file():
         return None, None, None
     ready, approved = plan_rounds(read_text(plan))
     if not ready:
@@ -3612,7 +3621,8 @@ def lane_changed_paths(path: str, base: str | None = None) -> tuple[list[str] | 
     revs, why = lane_revs(path, base)
     if revs is None:
         return None, why.replace("own commits", "changes")
-    out = git_text(path, "log", "--format=", "--name-only", "-z", "--no-renames", "--no-show-signature", *revs, "--")
+    out = git_text(path, "log", "--format=", "--name-only", "-z", "--no-renames", "--no-show-signature",
+                   "--ignore-submodules=none", *revs, "--")
     if out is None:
         return None, "git log failed, so the lane's changes cannot be told"
     status = status_paths(path)
@@ -3845,8 +3855,9 @@ def risk_lines(state: dict) -> list[str]:
     widths = [max(len(r[i]) for r in rows) for i in range(3)] if rows else []
     lines += ["  " + "  ".join(r[i].ljust(widths[i]) for i in range(3)) + "  " + r[3] for r in rows]
     if state["needs_user"]:
-        lines.append(f"{plural(len(state['needs_user']), 'path')} need the user: show the user the diff and ask; "
-                     "after the yes, run approve-risk --by user")
+        count = len(state["needs_user"])
+        lines.append(f"{plural(count, 'path')} {'needs' if count == 1 else 'need'} the user: show the user the diff "
+                     "and ask; after the yes, run approve-risk --by user")
     else:
         lines.append("Nothing needs the user.")
     return lines

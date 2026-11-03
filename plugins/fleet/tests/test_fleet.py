@@ -359,6 +359,14 @@ class SpawnGateTests(unittest.TestCase):
         self.assertEqual(self.spawn("--role", "impl")[0], 0)
         self.assertEqual(self.spawn("--role", "impl", pane_cwd=str(self.root))[0], 0)  # not a git checkout
 
+    def test_git_failure_with_a_plan_fails_closed(self):
+        # When git cannot tell the checkout but a PLAN.md lies at or above the directory, the gate refuses.
+        self.plan.write_text("PLAN READY: 1\nPLAN APPROVED: 1 by orch\n")
+        with mock.patch.object(fleet, "git_toplevel", return_value=None):
+            out = self.refused("--role", "impl", "--cwd", str(self.fleet_dir), reason="git cannot tell the checkout")
+            self.assertEqual(out["plan"], str(self.plan))
+            self.assertEqual(self.spawn("--role", "impl", "--cwd", str(self.root))[0], 0)  # no PLAN.md above
+
     def test_dry_run_and_a_pane_herdr_cannot_place(self):
         self.plan.write_text("PLAN READY: 1\n")
         buf = io.StringIO()
@@ -1787,6 +1795,19 @@ class RiskDiffTests(RiskLaneCase):
         self.assertIn("main_only.py", self.changed("main@{1}")[0])
         self.assertEqual(self.changed("no-such-ref"), (None, "--base no-such-ref does not name a commit"))
 
+    def test_git_settings_cannot_hide_a_submodule_change(self):
+        sub = self.root / "sub"
+        sub.mkdir()
+        git("init", "-q", "-b", "main", cwd=sub)
+        self.commit(sub, "a", "a\n", "sub")
+        git("-c", "protocol.file.allow=always", "submodule", "-q", "add", str(sub), "db/migrate", cwd=self.lane)
+        git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "add the submodule", cwd=self.lane)
+        self.commit(self.lane / "db" / "migrate", "b", "b\n", "move the submodule")
+        git("add", "db/migrate", cwd=self.lane)
+        git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "bump", cwd=self.lane)
+        git("config", "diff.ignoreSubmodules", "all", cwd=self.lane)
+        self.assertIn("db/migrate", self.changed()[0])
+
     def test_a_staged_rename_out_of_fleet(self):
         (self.repo / ".fleet").mkdir(exist_ok=True)
         (self.repo / ".fleet" / "draft.sql").write_text("drop\n")
@@ -1898,7 +1919,7 @@ class RiskCommandTests(RiskLaneCase):
         self.assertEqual(lines[0], f"lane {fleet.short_path(str(self.lane))} (feat/lane): 2 changed paths, 2 high-risk")
         self.assertRegex(lines[1], r"^  auth-payments  app/auth/x\.py\s+PROJECT\.md app/auth/\s+covered by RISK\.md$")
         self.assertRegex(lines[2], r"^  migration\s+db/migrate/001\.sql\s+builtin \*\*/migrate/\*\*\s+needs the user$")
-        self.assertIn("1 path need the user", lines[3])
+        self.assertIn("1 path needs the user", lines[3])
         self.assertIn("approve-risk --by user", lines[3])
         code, text = self.run_cmd("risk", "--json")
         out = json.loads(text)
