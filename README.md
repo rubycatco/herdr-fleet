@@ -11,14 +11,16 @@ A Claude Code plugin for running fleets of coding-agent lanes in [Herdr](https:/
 
 ## Install
 
+From GitHub (you need read access to `rubycatco/herdr-fleet`):
+
 ```bash
-claude plugin marketplace add /path/to/herdr-fleet
+claude plugin marketplace add rubycatco/herdr-fleet
 claude plugin install fleet@herdr-fleet
 ```
 
-Then run `/reload-plugins` in open sessions, and `/fleet:onboard` once.
+To work on the plugin, add your local checkout instead (`claude plugin marketplace add /path/to/herdr-fleet`). Claude Code then reads the folder in place, and edits take effect after `/reload-plugins`.
 
-A folder marketplace is read in place: edits to this checkout take effect after `/reload-plugins`.
+After installing, run `/reload-plugins` in open sessions, and `/fleet:onboard` once.
 
 ## Skills
 
