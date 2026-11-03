@@ -95,6 +95,13 @@ class AccountTests(unittest.TestCase):
         with self.assertRaisesRegex(fleet.FleetError, "no remuda account"):
             fleet.resolve_account("nope", "claude", self.accounts)
 
+    def test_default_agent(self):
+        self.assertEqual(fleet.default_agent("default", self.accounts), "claude")
+        self.assertEqual(fleet.default_agent("v0", self.accounts), "codex")
+        self.assertEqual(fleet.default_agent("codex:default", self.accounts), "codex")
+        self.assertEqual(fleet.default_agent(None, self.accounts), "claude")
+        self.assertEqual(fleet.default_agent("max", None), "claude")
+
     def test_caller_account(self):
         env = {"CLAUDE_CONFIG_DIR": "/home/u/.profiles/max"}
         self.assertEqual(fleet.caller_account("claude", self.accounts, env)["account"], "claude:max")
@@ -204,6 +211,11 @@ class ScreenTests(unittest.TestCase):
 
     def test_clean_lines_drops_padding_and_rules(self):
         self.assertEqual(fleet.clean_lines("\n\n────────\n  text  \n\n"), ["  text"])
+
+    def test_compact_line(self):
+        self.assertEqual(fleet.compact_line(" " * 300 + "52277 tokens"), "52277 tokens")
+        self.assertEqual(fleet.compact_line("─" * 150 + " fleet-hook " + "─" * 3), "── fleet-hook ──")
+        self.assertEqual(len(fleet.compact_line("x" * 500)), 200)
 
     def test_auto_direction(self):
         self.assertEqual(fleet.auto_direction({"width": 172, "height": 105}), "down")
@@ -319,6 +331,24 @@ class FilesTests(unittest.TestCase):
         self.assertTrue(fleet.unregister_pane(str(self.repo), "w1:p4"))
         self.assertFalse(fleet.unregister_pane(str(self.repo), "w1:p4"))
         self.assertEqual(fleet.load_panes(self.repo / ".fleet"), {})
+
+    def test_session_account_codex_and_claude(self):
+        tmp = Path(self.tmp.name)
+        codex_a, codex_b, claude_c = tmp / "codex-a", tmp / "codex-b", tmp / "claude-c"
+        (codex_a / "sessions" / "2026" / "11" / "03").mkdir(parents=True)
+        (codex_b / "sessions").mkdir(parents=True)
+        (codex_a / "sessions" / "2026" / "11" / "03" / "rollout-2026-11-03T11-40-34-01a19f7e-8f94.jsonl").write_text("")
+        (claude_c / "sessions").mkdir(parents=True)
+        (claude_c / "sessions" / "4242.json").write_text(json.dumps({"pid": 4242, "sessionId": "abc12345-1"}))
+        accounts = [
+            {"account": "codex:a", "provider": "codex", "name": "a", "home": str(codex_a)},
+            {"account": "codex:b", "provider": "codex", "name": "b", "home": str(codex_b)},
+            {"account": "claude:c", "provider": "claude", "name": "c", "home": str(claude_c)},
+        ]
+        self.assertEqual(fleet.session_account("codex", "01a19f7e-8f94", accounts), "codex:a")
+        self.assertIsNone(fleet.session_account("codex", "ffffffff-0000", accounts))
+        self.assertEqual(fleet.session_account("claude", "abc12345-1", accounts), "claude:c")
+        self.assertIsNone(fleet.session_account("claude", "../../etc", accounts))
 
     def test_transcript_visible(self):
         home = Path(self.tmp.name) / "home"

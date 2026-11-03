@@ -260,6 +260,15 @@ def account_home(agent: str, row: dict | None) -> str:
     return os.path.expanduser(DEFAULT_HOME[agent])
 
 
+def default_agent(account: str | None, accounts: list[dict] | None) -> str:
+    """The agent an account name implies: its provider when only one has it, else claude."""
+    if account and accounts:
+        providers = {a["provider"] for a in accounts if account in (a["account"], a["name"])}
+        if len(providers) == 1:
+            return providers.pop()
+    return "claude"
+
+
 def home_matches(home: str, env_dir: str | None) -> bool:
     if home == "default":
         return not env_dir
@@ -421,7 +430,7 @@ def cmd_worktree(args: argparse.Namespace) -> int:
     require_herdr()
     target = create_worktree(args.branch, args.base, args.repo, args.name)
     prep = prep_dir(target["cwd"])
-    print(json.dumps({"ok": True, **target, **prep}, indent=2))
+    print(json.dumps({"ok": True, **target, **prep}, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -540,10 +549,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         raise FleetError(f"--prompt must be one line of at most {PROMPT_MAX} characters; write the task to a file and pass a pointer such as 'Read .fleet/BRIEF.md and execute it.'")
     remuda = remuda_path()
     accounts = remuda_accounts(remuda) if remuda else None
-    agent = args.agent
-    if not agent and args.account and accounts is not None:
-        agent = resolve_account(args.account, None, accounts)["provider"]
-    agent = agent or "claude"
+    agent = args.agent or default_agent(args.account, accounts)
     extra = list(args.agent_args)
     if args.resume:
         if agent != "claude":
@@ -560,7 +566,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         raise FleetError(f"{who} cannot see session {args.resume} (no transcript under {launch['home']}/projects); "
                          "hand off with a handoff file instead")
     if args.dry_run:
-        print(json.dumps({"dry_run": True, **launch}, indent=2))
+        print(json.dumps({"dry_run": True, **launch}, indent=2, ensure_ascii=False))
         return 0
     require_herdr()
     target = create_pane(args)
@@ -578,7 +584,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     else:
         result = wait_for_start(pane, agent, prompt, args.accept_trust, args.timeout)
     out = {**result, **target, **launch, "label": args.name, "role": args.role}
-    print(json.dumps(out, indent=2))
+    print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0 if result["ok"] else 2
 
 
@@ -665,11 +671,11 @@ def cmd_send(args: argparse.Namespace) -> int:
             sent_file = spill_to_file(text, info.get("cwd") or os.getcwd())
             text = f"Read {sent_file} and follow it."
     if not args.queue and not wait_not_working(pane, args.timeout):
-        print(json.dumps({"ok": False, "pane_id": pane, "status": "working", "reason": "agent still busy; rerun later or pass --queue"}, indent=2))
+        print(json.dumps({"ok": False, "pane_id": pane, "status": "working", "reason": "agent still busy; rerun later or pass --queue"}, indent=2, ensure_ascii=False))
         return 3
     out = submit_prompt(pane, info["agent"], text)
     out["file"] = str(sent_file) if sent_file else None
-    print(json.dumps(out, indent=2))
+    print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0 if out["ok"] else 2
 
 
@@ -710,9 +716,15 @@ def session_id_of(info: dict) -> str | None:
     return (info.get("agent_session") or {}).get("value")
 
 
+def compact_line(line: str, width: int = 200) -> str:
+    """Shorten a screen line for a report: TUIs pad with long rules and right-aligned text."""
+    s = re.sub(r"[─━═]{3,}", "──", line.strip())
+    return re.sub(r"\s{3,}", "  ", s)[:width]
+
+
 def screen_tail(pane: str, n: int = 15) -> list[str]:
     try:
-        return [l[:200] for l in pane_lines(pane)[-n:]]
+        return [compact_line(l) for l in pane_lines(pane)[-n:]]
     except FleetError:
         return []
 
@@ -800,7 +812,7 @@ def cmd_reset(args: argparse.Namespace) -> int:
         time.sleep(1.0)
         out["resume"] = submit_prompt(pane, "claude", message)
         out["ok"] = ok = out["resume"]["ok"]
-    print(json.dumps(out, indent=2))
+    print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0 if ok else 2
 
 
@@ -829,7 +841,7 @@ def cmd_retire(args: argparse.Namespace) -> int:
         while time.time() < deadline and pane_info(pane).get("agent"):
             time.sleep(1)
         if pane_info(pane).get("agent"):
-            print(json.dumps({"ok": False, "pane_id": pane, "reason": f"{agent} still running after {command}"}, indent=2))
+            print(json.dumps({"ok": False, "pane_id": pane, "reason": f"{agent} still running after {command}"}, indent=2, ensure_ascii=False))
             return 2
     unregistered = bool(info.get("cwd")) and unregister_pane(info["cwd"], pane)
     closed = False
@@ -837,7 +849,7 @@ def cmd_retire(args: argparse.Namespace) -> int:
         herdr("pane", "close", pane)
         closed = True
     print(json.dumps({"ok": True, "pane_id": pane, "exited": agent, "closed": closed,
-                      "unregistered": unregistered}, indent=2))
+                      "unregistered": unregistered}, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -871,21 +883,29 @@ def claude_home(account: dict) -> str:
     return account_home("claude", account)
 
 
-def session_account(session_id: str, accounts: list[dict]) -> str | None:
-    """The claude account whose config dir lists this running session.
+def session_account(agent: str, session_id: str, accounts: list[dict]) -> str | None:
+    """The account whose config dir holds this session.
 
-    Homes often share projects/ through symlinks, so a transcript's location
-    says nothing about the account. Each home keeps its own sessions/<pid>.json
-    for running sessions; a sessions/ dir shared by several homes is skipped.
+    Claude homes often share projects/ through symlinks, so a transcript's
+    location says nothing about the account; each home keeps its own
+    sessions/<pid>.json for running sessions. Codex keeps rollouts under
+    sessions/YYYY/MM/DD/. A sessions/ dir shared by several homes is skipped.
     """
+    if agent not in AGENTS or not SESSION_ID.fullmatch(session_id or ""):
+        return None
     homes: dict[str, list[dict]] = {}
     for a in accounts:
-        if a["provider"] == "claude":
-            sdir = os.path.join(claude_home(a), "sessions")
+        if a["provider"] == agent:
+            sdir = os.path.join(account_home(agent, a), "sessions")
             if os.path.isdir(sdir):
                 homes.setdefault(os.path.realpath(sdir), []).append(a)
     for sdir, owners in homes.items():
         if len(owners) != 1:
+            continue
+        if agent == "codex":
+            pattern = os.path.join(glob.escape(sdir), "*", "*", "*", f"rollout-*{glob.escape(session_id)}.jsonl")
+            if glob.glob(pattern):
+                return owners[0]["account"]
             continue
         for f in glob.glob(os.path.join(glob.escape(sdir), "*.json")):
             try:
@@ -910,7 +930,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         cwd = a.get("cwd") or ""
         pane = a.get("pane_id")
         session = (a.get("agent_session") or {}).get("value")
-        account = session_account(session, accounts) if (accounts and session and a.get("agent") == "claude") else None
+        account = session_account(a.get("agent") or "", session, accounts) if (accounts and session) else None
         top = (git_toplevel(cwd) or cwd) if cwd else ""
         if top and top not in registries:
             registries[top] = load_panes(Path(top) / FLEET_DIR)
@@ -922,7 +942,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             "title": a.get("terminal_title_stripped") or "", "cwd": cwd, "self": pane == os.environ.get("HERDR_PANE_ID"),
         })
     if args.json:
-        print(json.dumps(rows, indent=2))
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
         return 0
     header = ["PANE", "AGENT", "STATUS", "ROLE"] + (["ACCOUNT"] if remuda else []) + ["BRANCH", "LANE", "TITLE"]
     table = [header]
@@ -991,7 +1011,7 @@ def cmd_prep(args: argparse.Namespace) -> int:
     out["pane_role"] = (load_panes(fleet_dir).get(os.environ.get("HERDR_PANE_ID") or "") or {}).get("role")
     if args.handoff:
         out["handoff_path"] = str(handoff_path(fleet_dir))
-    print(json.dumps(out, indent=2))
+    print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -1022,7 +1042,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         out = {"event": event, "pane_id": pane, "elapsed_s": int(time.time() - start), **extra}
         if path is not None:
             out.setdefault("file", str(path))
-        print(json.dumps(out, indent=2))
+        print(json.dumps(out, indent=2, ensure_ascii=False))
         return code
 
     while True:
@@ -1089,7 +1109,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "conventions": {"path": str(conv), "exists": conv.is_file()},
     }
     if args.json:
-        print(json.dumps(report, indent=2))
+        print(json.dumps(report, indent=2, ensure_ascii=False))
         return 0
     def show(label: str, value: str) -> None:
         print(f"{label:<12} {value}")
