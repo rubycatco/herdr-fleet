@@ -375,6 +375,41 @@ class SpawnGateTests(unittest.TestCase):
         self.plan.unlink()
         self.refused("--role", "impl", "--pane", "w1:p5", pane_cwd="", reason="herdr reports no directory")
 
+    def test_one_checked_directory_drives_an_existing_pane_spawn(self):
+        # The pane's shell changes directory between the gate's read and the launch: the launch still uses the
+        # directory that the gate checked, and cds there first.
+        other = self.root / "elsewhere"
+        other.mkdir()
+        self.plan.write_text("PLAN READY: 1\n")  # the lane's plan is not approved
+        snapshots = iter([{"cwd": str(other)}, {"cwd": str(self.lane)}])
+        runs = []
+
+        def run(cmd, *a, **k):
+            if cmd[0] == "herdr":
+                runs.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0, "{}", "")
+            return _guarded_run(cmd, *a, **k)
+        buf = io.StringIO()
+        with mock.patch.object(fleet, "require_herdr"), mock.patch.object(fleet, "run", run), \
+                mock.patch.object(fleet, "pane_info", side_effect=lambda p: next(snapshots, {"cwd": str(self.lane)})), \
+                mock.patch.object(fleet, "herdr_ok", return_value=True), chdir(self.root), redirect_stdout(buf):
+            code = fleet.main(["spawn", "--no-wait", "--pane", "w1:p5", "--role", "impl"])
+        out = json.loads(buf.getvalue())
+        self.assertEqual((code, out["cwd"]), (0, str(other)))
+        self.assertEqual(fleet.load_panes(self.fleet_dir), {})  # nothing registered in the unapproved lane
+        self.assertEqual(fleet.load_panes(other / ".fleet")["w1:p5"]["role"], "impl")
+        [launch] = [c for c in runs if c[:3] == ["herdr", "pane", "run"]]
+        self.assertTrue(launch[4].startswith(f"cd {fleet.shlex.quote(str(other))} && "), launch)
+        # Other roles launch as before, without the cd.
+        runs.clear()
+        snapshots = iter([{"cwd": str(self.lane)}] * 3)
+        with mock.patch.object(fleet, "require_herdr"), mock.patch.object(fleet, "run", run), \
+                mock.patch.object(fleet, "pane_info", side_effect=lambda p: next(snapshots)), \
+                mock.patch.object(fleet, "herdr_ok", return_value=True), chdir(self.root), redirect_stdout(io.StringIO()):
+            self.assertEqual(fleet.main(["spawn", "--no-wait", "--pane", "w1:p6", "--role", "critic"]), 0)
+        [launch] = [c for c in runs if c[:3] == ["herdr", "pane", "run"]]
+        self.assertFalse(launch[4].startswith("cd "))
+
     def test_target_cwd_mirrors_create_pane(self):
         parse = lambda *argv: fleet.build_parser().parse_args(["spawn", *argv])
         with mock.patch.object(fleet, "pane_info", return_value={"cwd": "/src/pane"}) as info, chdir(self.root):
@@ -1367,8 +1402,8 @@ class ApprovePlanTests(unittest.TestCase):
         return code, json.loads(buf.getvalue())
 
     def approvals(self):
-        home = fleet.project_for(str(self.repo))
-        return [e for e in fleet.read_events([home]) if e["event"] == "plan_approved"]
+        self.project_home = getattr(self, "project_home", None) or fleet.project_for(str(self.repo))
+        return [e for e in fleet.read_events([self.project_home]) if e["event"] == "plan_approved"]
 
     def logs(self):
         """The bytes of every event file under FLEET_HOME."""
@@ -1384,12 +1419,13 @@ class ApprovePlanTests(unittest.TestCase):
         before = plan.read_bytes() if plan.is_file() else None
         fleet.record("send", str(self.repo), by=False, pane="w9:p9", text="an earlier event")
         logs = self.logs()
+        approvals = self.approvals()
         code, out = self.approve(*argv, cwd=cwd)
         self.assertEqual((code, out["ok"], out["changed"]), (2, False, "nothing"), out)
         self.assertIn(reason, out["reason"])
         self.assertEqual(plan.read_bytes() if plan.is_file() else None, before)
         self.assertEqual(self.logs(), logs)
-        self.assertEqual(self.approvals(), [])
+        self.assertEqual(self.approvals(), approvals)
         return out
 
     def test_refuses_without_a_plan_or_a_ready_round(self):
@@ -1588,6 +1624,41 @@ class ApprovePlanTests(unittest.TestCase):
             self.refused("--by", by, reason="the project's high-risk paths cannot be read")
         (home / "PROJECT.md").write_text("## High-risk paths\n- deletion: [z-a]\n")
         self.refused("--by", "user", reason="is not valid")
+
+    def test_a_failed_project_lookup_refuses_both_approvers(self):
+        home = fleet.project_for(str(self.repo))
+        (home / "PROJECT.md").write_text("# Project\n\n## High-risk paths\n- auth-payments: app/auth/\n")
+        self.plan.write_text("Risk: none\n## Files\n- app/auth/session.py: shorter tokens\nPLAN READY: 1\n")
+        real = fleet.git_out
+
+        def failing(path, *args, **kw):
+            return None if args[:2] == ("rev-parse", "--git-common-dir") else real(path, *args, **kw)
+        self.approvals()  # finds the project home before the lookup fails
+        with mock.patch.object(fleet, "git_out", failing):
+            for by in ("orch", "user"):
+                self.refused("--by", by, reason="git cannot tell the project of")
+        real_run = fleet.run_git
+
+        def config_fails(path, *args, **kw):  # git config failing (not "no remote") is a failed lookup too
+            if args[:2] == ("config", "--get-regexp"):
+                return subprocess.CompletedProcess(args, 3, "", "bad config")
+            return real_run(path, *args, **kw)
+        with mock.patch.object(fleet, "run_git", config_fails):
+            self.assertEqual(fleet.project_lookup(str(self.lane)), (None, f"git cannot tell the project of {self.lane}"))
+            self.assertIsNotNone(fleet.repo_identity(str(self.lane)))  # the hook's lookup keeps its behaviour
+        self.assertEqual(fleet.project_lookup(str(self.lane)), (home, None))
+        self.refused("--by", "orch", reason="auth-payments app/auth/session.py")
+
+    def test_a_later_files_section_counts(self):
+        self.plan.write_text(self.PLAN)
+        self.assertEqual(self.approve("--by", "orch")[0], 0)
+        with self.plan.open("a") as fh:
+            fh.write("\n## Approach (round 2)\nAlso migrate.\n\n## Files\n- db/migrate/002.sql: the new index\n\n"
+                     "PLAN READY: 2\n")
+        self.assertEqual(fleet.plan_files(self.plan.read_text()), ["app.py", "db/migrate/002.sql"])
+        out = self.refused("--by", "orch", reason="migration db/migrate/002.sql")
+        self.assertEqual((out["round"], out["files"]), (2, 2))
+        self.assertEqual(fleet.plan_categories(self.plan.read_text(), fleet.risk_patterns(None)[0]), {"migration"})
 
     def test_a_plan_without_files_needs_the_user(self):
         for files in ("", "## Files\n\n", "## Files\n- <path>: <what changes>\n", "## Files\n- none\n"):
@@ -1808,6 +1879,16 @@ class RiskDiffTests(RiskLaneCase):
         git("config", "diff.ignoreSubmodules", "all", cwd=self.lane)
         self.assertIn("db/migrate", self.changed()[0])
 
+    def test_a_root_commit_counts_whatever_log_showroot_says(self):
+        solo = self.root / "solo"
+        solo.mkdir()
+        git("init", "-q", "-b", "feat/solo", cwd=solo)  # the only branch: its root commit is the lane's own
+        self.commit(solo, "db/migrate/initial.sql", "create\n", "root")
+        git("config", "log.showRoot", "false", cwd=solo)
+        self.assertEqual(len(fleet.lane_commits(str(solo))[0]), 1)
+        self.assertEqual(self.changed(lane=solo), (["db/migrate/initial.sql"], None))
+        self.assertTrue(fleet.needs_user(fleet.risk_state(str(solo), None)))
+
     def test_a_staged_rename_out_of_fleet(self):
         (self.repo / ".fleet").mkdir(exist_ok=True)
         (self.repo / ".fleet" / "draft.sql").write_text("drop\n")
@@ -1929,6 +2010,55 @@ class RiskCommandTests(RiskLaneCase):
         text = self.run_cmd("risk")[1]
         self.assertIn("the changes cannot be told: HEAD is detached", text)
         self.assertTrue(json.loads(self.run_cmd("risk", "--json")[1])["needs_the_user"])
+
+    def test_a_failed_project_lookup_needs_the_user(self):
+        (self.home / "PROJECT.md").write_text("## High-risk paths\n- auth-payments: app/auth/\n")
+        self.commit(self.lane, "app/auth/x.py", "", "auth")
+        self.assertTrue(json.loads(self.run_cmd("risk", "--json")[1])["needs_the_user"])
+        real = fleet.git_out
+
+        def failing(path, *args, **kw):
+            return None if args[:2] == ("rev-parse", "--git-common-dir") else real(path, *args, **kw)
+        with mock.patch.object(fleet, "git_out", failing):
+            out = json.loads(self.run_cmd("risk", "--json")[1])
+            self.assertEqual((out["needs_the_user"], out["matches"]), (True, []))
+            self.assertIn("git cannot tell the project of", out["error"])
+            self.refused("--by", "user", reason="git cannot tell the project of")
+
+    def test_a_path_that_is_not_utf8_is_never_covered_by_risk_md(self):
+        (self.home / "PROJECT.md").write_text("## High-risk paths\n- auth-payments: app/auth/\n")
+
+        def commit_bytes(name: bytes):
+            blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=self.lane, input=b"x\n",
+                                  capture_output=True, check=True).stdout.strip().decode()
+            subprocess.run(["git", "update-index", "--add", "--cacheinfo", f"100644,{blob}".encode() + b"," + name],
+                           cwd=self.lane, check=True, capture_output=True)
+            git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "bytes", cwd=self.lane)
+        commit_bytes(b"app/auth/\xff.py")
+        [match] = self.state()["needs_user"]
+        self.assertEqual(match["path"], "app/auth/\ufffd.py")
+        out = self.refused("--by", "user", reason="bytes that are not UTF-8 cannot be told exactly")
+        self.assertIn("rename the file", out["reason"])
+        # Even a hand-written line for the decoded name covers nothing, so a second name that decodes alike
+        # still needs the user.
+        (self.fleet_dir / "RISK.md").write_text("RISK APPROVED: auth-payments app/auth/\ufffd.py by user x\n")
+        commit_bytes(b"app/auth/\xfe.py")
+        self.assertEqual([m["path"] for m in self.state()["needs_user"]], ["app/auth/\ufffd.py"])
+        self.assertTrue(fleet.needs_user(self.state()))
+        # A plan that the user approved still covers the category, whatever the exact name.
+        (self.fleet_dir / "PLAN.md").write_text("Risk: auth-payments\nPLAN READY: 1\nPLAN APPROVED: 1 by user x\n")
+        self.assertFalse(fleet.needs_user(self.state()))
+
+    def test_approve_risk_needs_head_before_it_writes(self):
+        self.commit(self.lane, "db/migrate/001.sql", "create\n", "a migration")
+        real = fleet.git_text
+
+        def failing(path, *args, **kw):
+            return None if args == ("rev-parse", "--verify", "--quiet", "HEAD") else real(path, *args, **kw)
+        with mock.patch.object(fleet, "git_text", failing):
+            self.refused("--by", "user", reason="git cannot resolve HEAD")
+        self.assertFalse((self.fleet_dir / "RISK.md").exists())
+        self.assertEqual(self.run_cmd("approve-risk", "--by", "user")[0], 0)
 
     def test_approve_risk(self):
         self.refused("--by", "user", reason="not in a git worktree", cwd=self.root)
@@ -2380,6 +2510,52 @@ class OrchTests(unittest.TestCase):
         self.assertIn("risky diff cannot be told: HEAD is detached", lines["c"])  # no branch: the lane is its folder
         self.assertTrue(lines["feat/d"].endswith("next: Go."))
         self.assertTrue(lines["feat/e"].endswith("1 changed path outside .fleet/: approve-plan refuses"))
+
+    def test_board_cannot_tell_a_git_lane_whose_top_lookup_fails(self):
+        a = self.add_lane("a", STATUS_md="## Next step\nMerge.\n")
+        (a / "db" / "migrate").mkdir(parents=True)
+        (a / "db" / "migrate" / "1.sql").write_text("")
+        plain = self.root / "plain"
+        plain.mkdir()
+        lanes = [self.facts(a), {**self.facts(plain), "git": False}]
+        real = fleet.git_toplevel
+        failing = lambda path: None if os.path.realpath(path) == os.path.realpath(a) else real(path)
+        with mock.patch.object(fleet, "git_toplevel", failing):
+            recs = {r["path"]: r for r in json.loads(self.board(lanes, "board", "--json")[1])["lanes"]}
+            text = self.board(lanes, "board")[1]
+            peek = {r["path"]: r for r in json.loads(self.board(lanes, "digest", "--peek", "--json")[1])["lanes"]}
+        want = "cannot be told: git cannot find the top of the lane's checkout"
+        self.assertEqual((peek[str(a)]["risk"]["needs_user"], peek[str(plain)]["risk"]), (want, None))
+        self.assertEqual(recs[str(a)]["risk"], {"matches": [], "needs_user": want})
+        self.assertIsNone(recs[str(plain)]["risk"])  # not a git checkout: nothing to check
+        self.assertIn("risky diff cannot be told: git cannot find the top", text)
+        saved = {r["path"]: r for r in fleet.read_json(self.project / "board.json")["lanes"]}
+        self.assertEqual(saved[str(a)]["risk"]["needs_user"], want)
+
+    def test_rebrief_shows_the_risk_note_only_for_a_lane_that_needs_the_user(self):
+        self.orch_setup()
+        board = fleet.read_json(self.project / "board.json")
+        quiet = dict(board, lanes=[dict(board["lanes"][0], risk=None)])
+        covered = dict(board, lanes=[dict(board["lanes"][0], risk={
+            "matches": [{"category": "migration", "path": "db/migrate/1.sql"}], "needs_user": []})])
+        risky = dict(board, lanes=[dict(board["lanes"][0], risk={
+            "matches": [{"category": "migration", "path": "db/migrate/1.sql"}],
+            "needs_user": [{"category": "migration", "path": "db/migrate/1.sql"}]})])
+
+        def rebriefs(data):
+            fleet.write_json(self.project / "board.json", data)  # the same `made`: the same age text
+            return [fleet.session_start_context({"source": s, "cwd": str(self.repo)}, env={"HERDR_PANE_ID": "w1:p1"})
+                    for s in ("startup", "resume", "clear", "compact")]
+        before = rebriefs(board)  # records as 0.6.0 wrote them, without `risk`
+        self.assertEqual(rebriefs(quiet), before)
+        self.assertEqual(rebriefs(covered), before)
+        for old, new in zip(before, rebriefs(risky)):
+            diff = [(a, b) for a, b in zip(old.splitlines(), new.splitlines()) if a != b]
+            self.assertEqual(len(old.splitlines()), len(new.splitlines()))
+            [(a, b)] = diff
+            self.assertTrue(a.endswith("next: Fix it."), a)
+            self.assertEqual(b[:len(a) - len("next: Fix it.")], a[:len(a) - len("next: Fix it.")])
+            self.assertTrue(b.endswith("risky diff needs the user (1): migration db/migrate/1.sql"), b)
 
     def test_board_lines_of_a_record_without_risk(self):
         record = {"lane": "feat/x", "phase": "working", "pr": None, "panes": [{"role": "impl", "agent": "claude",

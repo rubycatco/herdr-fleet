@@ -43,7 +43,7 @@ The orchestrator's own files, PROJECT.md and the research files, live in the pro
 
 The orchestrator copies this template to `.fleet/PLAN.md` with the title filled in and the `Risk:` line still open, then starts a planner. The planner keeps one value on the `Risk:` line, writes the sections, ends the file with `PLAN READY: <n>` on its own line and stops. Each revision ends with a new line and the next number. Only `fleet approve-plan` writes the `PLAN APPROVED: <n> by <who> <date>` lines; never write one by hand.
 
-The `Risk:` line is the planner's reading, not the decision. The paths under `## Files` decide, with the project's high-risk patterns (see PROJECT.md below): when one of them matches, the plan is high risk with that category, whatever `Risk:` says. So `## Files` lists every file the plan changes, one list item each: the path is the first word after the dash and optional backticks, up to the first colon or space (`- db/migrate/<new>.sql: the new table`). Name a file that does not exist yet by its directory. A plan whose `## Files` lists no path is not complete: the orchestrator cannot approve it.
+The `Risk:` line is the planner's reading, not the decision. The paths under `## Files` decide, with the project's high-risk patterns (see PROJECT.md below): when one of them matches, the plan is high risk with that category, whatever `Risk:` says. So `## Files` lists every file the plan changes, one list item each (a revision may add another `## Files` section; every one counts): the path is the first word after the dash and optional backticks, up to the first colon or space (`- db/migrate/<new>.sql: the new table`). Name a file that does not exist yet by its directory. A plan whose `## Files` lists no path is not complete: the orchestrator cannot approve it.
 
 ```markdown
 # Plan: <lane name>
@@ -157,7 +157,7 @@ The record of the user's yes for a risky diff. `fleet risk` matches the lane's r
 RISK APPROVED: migration db/migrate/20261103_add_index.sql by user 2026-11-03T10:00:00+00:00
 ```
 
-A later commit that touches no new risky path keeps the yes; a new risky path needs a new yes. Never write these lines by hand. When `fleet risk` cannot tell the lane's changes (a detached HEAD without `--base`, git fails, or PROJECT.md's patterns cannot be read), the lane needs the user, and `approve-risk` refuses until the cause is fixed. Known gaps: an edit made while resolving a conflict inside a merge commit is not listed; with `--base <ref>`, a lane that merged (not rebased) the default branch lists that branch's files too.
+A later commit that touches no new risky path keeps the yes; a new risky path needs a new yes. Never write these lines by hand. A path whose name is not valid UTF-8 cannot be told exactly, so no line covers it and `approve-risk` refuses it: rename the file, or cover its category with a plan that the user approved. When `fleet risk` cannot tell the lane's changes (a detached HEAD without `--base`, git fails, git cannot tell the project, or PROJECT.md's patterns cannot be read), the lane needs the user, and `approve-risk` refuses until the cause is fixed. `approve-risk` also refuses when git cannot resolve HEAD. Known gaps: an edit made while resolving a conflict inside a merge commit is not listed; with `--base <ref>`, a lane that merged (not rebased) the default branch lists that branch's files too.
 
 ## HANDOFF.md (the outgoing session writes it; the successor reads it first)
 

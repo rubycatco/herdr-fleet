@@ -524,13 +524,13 @@ def plan_gate(cwd: str | None) -> tuple[str | None, Path | None, int | None]:
 
 def create_pane(args: argparse.Namespace, cwd: str | None = None) -> dict:
     """Create the pane the agent will run in. Returns ids and cwd. `cwd` is the directory that `target_cwd`
-    found for a split, tab or workspace."""
+    found (and the plan gate checked): the returned cwd, also for an existing pane."""
     if args.pane:
         info = pane_info(args.pane)
         if info.get("agent"):
             raise FleetError(f"pane {args.pane} already runs {info['agent']}; pick a shell pane")
         return {"pane_id": args.pane, "tab_id": info.get("tab_id"), "workspace_id": info.get("workspace_id"),
-                "cwd": info.get("cwd"), "placement": "existing pane"}
+                "cwd": cwd or info.get("cwd"), "placement": "existing pane"}
     if args.worktree:
         return create_worktree(args.worktree, args.base, args.repo, args.name)
     cwd = cwd or os.path.abspath(os.path.expanduser(args.cwd or os.getcwd()))
@@ -668,7 +668,8 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         return 0
     require_herdr()
     cwd = target_cwd(args)
-    if args.role in GATED_ROLES:
+    gated = args.role in GATED_ROLES
+    if gated:
         if args.pane and not cwd:
             return refuse(reason=f"herdr reports no directory for pane {args.pane}, so the plan gate cannot be "
                                  "checked; pass a pane that herdr knows, or another placement", role=args.role)
@@ -685,7 +686,11 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         if task:
             entry["task"] = task
         target["registry"] = register_pane(target["cwd"], pane, entry)
-    run(["herdr", "pane", "run", pane, launch["command"]])
+    command = launch["command"]
+    if gated and cwd:
+        # The checked directory is the launch's: the pane's shell may have changed directory since.
+        command = f"cd {shlex.quote(cwd)} && {command}"
+    run(["herdr", "pane", "run", pane, command])
     # Record the launch now: the wait can take minutes, and the caller can stop the command during it.
     cwd = target.get("cwd")
     where = {"pane": pane, "workspace": target.get("workspace_id"), "cwd": cwd,
@@ -1179,11 +1184,13 @@ def normalize_remote(url: str) -> str | None:
     return f"{m.group(1)}/{path}".lower() if path else None
 
 
-def repo_identity(path: str, timeout: float = 15) -> dict | None:
+def repo_identity(path: str, timeout: float = 15, strict: bool = False) -> dict | None:
     """The repository at `path`: its keys, main checkout and top.
 
     `key` is the normalized URL of origin (else of the first remote), or local:<main checkout> without a
     remote. `keys` also holds the local key, so that a project keeps its clones when a remote is added later.
+    With `strict`, a failed remote query (git config exits with another code than 1, "no remote") gives None
+    instead of the local key alone.
     """
     lines = (git_out(path, "rev-parse", "--git-common-dir", "--show-toplevel", timeout=timeout) or "").splitlines()
     if len(lines) < 2:
@@ -1191,7 +1198,14 @@ def repo_identity(path: str, timeout: float = 15) -> dict | None:
     common = os.path.realpath(os.path.join(path, lines[0]))
     main_root = os.path.dirname(common) if os.path.basename(common) == ".git" else common
     urls: dict[str, str] = {}
-    for line in (git_out(path, "config", "--get-regexp", r"^remote\..*\.url$", timeout=timeout) or "").splitlines():
+    if strict:
+        cp = run_git(path, "config", "--get-regexp", r"^remote\..*\.url$", timeout=timeout)
+        if cp is None or cp.returncode not in (0, 1):
+            return None
+        remote_lines = cp.stdout if cp.returncode == 0 else ""
+    else:
+        remote_lines = git_out(path, "config", "--get-regexp", r"^remote\..*\.url$", timeout=timeout) or ""
+    for line in remote_lines.splitlines():
         name, _, url = line.partition(" ")
         urls.setdefault(name[len("remote."):-len(".url")], url.strip())
     remote = normalize_remote(urls.get("origin") or next(iter(urls.values()), ""))
@@ -1274,6 +1288,15 @@ def project_for(path: str | None, create: bool = True, timeout: float = 15) -> P
     if not ident:
         return None
     return ensure_project(ident["keys"]) if create else find_project(ident["keys"])
+
+
+def project_lookup(path: str) -> tuple[Path | None, str | None]:
+    """(the home of the project that holds the git checkout `path`, why it cannot be told). None with no error:
+    the repository has no project home yet. The gates use this strict form; a failed lookup is not "no project"."""
+    ident = repo_identity(path, strict=True)
+    if not ident:
+        return None, f"git cannot tell the project of {path}"
+    return find_project(ident["keys"]), None
 
 
 def caller() -> dict:
@@ -2287,14 +2310,15 @@ EMPTY_NOTE = re.compile(r"^(?:[-*]\s*)?(?:none\.?|<[^>]*>)?$", re.I)  # "-", "no
 HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 
 
-def section_lines(text: str, title: str) -> list[str]:
-    """The lines under a `## <title>` heading (the title is a regex), up to the next heading of level 1 or 2."""
+def section_lines(text: str, title: str, every: bool = False) -> list[str]:
+    """The lines under a `## <title>` heading (the title is a regex), up to the next heading of level 1 or 2.
+    With `every`, the lines of every section with that title, in order; else of the first one."""
     lines: list[str] = []
     inside_section = False
     for line in (text or "").splitlines():
         m = HEADING.match(line)
         if m and len(m.group(1)) <= 2:
-            if inside_section:
+            if inside_section and not every:
                 break
             inside_section = len(m.group(1)) == 2 and re.fullmatch(title, m.group(2), re.I) is not None
             continue
@@ -2443,15 +2467,17 @@ def newest_lane_event(events: list[dict], path: str, branch: str | None) -> dict
 RISK_SKIP_PHASES = ("removed", "merged", "planning")  # and `plan ready <n>`, `plan approved <n>`: no code yet
 
 
-def board_risk(path: str, phase: str, home: Path | None) -> dict | None:
+def board_risk(path: str, phase: str, home: Path | None, is_git: bool = False) -> dict | None:
     """The board's view of `risk_state` for a lane: `{matches, needs_user}`, with `needs_user` the text
     `cannot be told: <why>` when the changes cannot be told; None without a match, and for a lane that is not
-    a git checkout or whose phase has no code to check."""
+    a git checkout or whose phase has no code to check. `is_git`: the lane's facts say it is a git checkout,
+    so a failed top-level lookup cannot be told, not "no git"."""
     if phase in RISK_SKIP_PHASES or phase.startswith("plan "):
         return None
     top = git_toplevel(path) if os.path.isdir(path) else None
     if not top:
-        return None
+        return {"matches": [], "needs_user": "cannot be told: git cannot find the top of the lane's checkout"} \
+            if is_git else None
     state = risk_state(top, home)
 
     def pair(m: dict) -> dict:
@@ -2487,7 +2513,7 @@ def board_record(f: dict, events: list[dict], home: Path | None = None) -> dict:
            "panes": panes, "pr": {"number": pr.get("number"), "state": pr.get("state")} if pr else None,
            "phase": phase, "last_event": newest_lane_event(events, f["path"], f.get("branch")),
            "blocked": first_note(status_md, "Blocked"), "next": first_note(status_md, r"Next steps?"),
-           "risk": board_risk(f["path"], phase, home)}
+           "risk": board_risk(f["path"], phase, home, bool(f.get("git")))}
     if phase.startswith("plan ready"):
         warning = plan_gate_note(f["path"])
         if warning:
@@ -3622,7 +3648,7 @@ def lane_changed_paths(path: str, base: str | None = None) -> tuple[list[str] | 
     if revs is None:
         return None, why.replace("own commits", "changes")
     out = git_text(path, "log", "--format=", "--name-only", "-z", "--no-renames", "--no-show-signature",
-                   "--ignore-submodules=none", *revs, "--")
+                   "--ignore-submodules=none", "--root", *revs, "--")
     if out is None:
         return None, "git log failed, so the lane's changes cannot be told"
     status = status_paths(path)
@@ -3658,7 +3684,7 @@ def plan_files(text: str, every_line: bool = False) -> list[str]:
     path. With `every_line`, the first token of a line that is no list item counts too (the high-risk match
     reads those, to fail closed); a marker line such as `PLAN READY: 1` never counts."""
     found: list[str] = []
-    for line in section_lines(text, "Files"):
+    for line in section_lines(text, "Files", every=True):
         if PLAN_READY_LINE.search(line) or PLAN_APPROVED_LINE.search(line) or READY_LINE.search(line):
             continue
         item = LIST_MARK.match(line + " ")
@@ -3749,7 +3775,8 @@ def cmd_approve_plan(args: argparse.Namespace) -> int:
                                     "nothing. When a commit predates the plan, or no branch, remote or tag holds the "
                                     "lane's base, name the base with --base <ref>",
                       lane_commits=len(commits), commits=commits[:5])
-    patterns, error = risk_patterns(project_for(top, create=False))
+    home, error = project_lookup(top)
+    patterns, error = (risk_patterns(home) if not error else ([], error))
     if error:
         return refuse(**out, reason=f"the project's high-risk paths cannot be read ({error}); fix {PROJECT_MD} "
                                     "in the project home")
@@ -3783,6 +3810,7 @@ def cmd_approve_plan(args: argparse.Namespace) -> int:
 # risk: the lane's real changes against the high-risk patterns, and the user's yes for them
 
 RISK_FILE = "RISK.md"
+LOSSY_MARK = "\ufffd"  # what git_text puts for bytes that are not UTF-8: such a path is not told exactly
 RISK_APPROVED_LINE = re.compile(marker_line(rf"RISK APPROVED: ({'|'.join(RISK_CATEGORIES)}) (.+?) by user (\S+)")
                                 + r"[ \t]*$", re.M)
 
@@ -3792,17 +3820,18 @@ def risk_approvals(fleet_dir: Path) -> set[tuple[str, str]]:
     return {(c, p) for c, p, _ in RISK_APPROVED_LINE.findall(read_text(Path(fleet_dir) / RISK_FILE))}
 
 
-def risk_state(top: str, home: Path | None, base: str | None = None) -> dict:
+def risk_state(top: str, home: Path | None, base: str | None = None, home_error: str | None = None) -> dict:
     """The lane's changed paths matched against the project's high-risk patterns, and who covers each match.
 
     A match is covered by the newest plan round when the user approved it and the plan shows the match's
     category (`plan_categories`), else by a `RISK APPROVED` line in RISK.md for the same category and path. The
-    rest needs the user. `error` says why the changes or the patterns cannot be told; the lane then needs the
-    user as well (fail closed)."""
+    rest needs the user. A path that git's bytes do not decode to exactly (it holds U+FFFD) is never covered by
+    a RISK.md line: two such paths can decode alike. `error` says why the changes or the patterns cannot be told
+    (also `home_error`, a failed project lookup); the lane then needs the user as well (fail closed)."""
     d = Path(top) / FLEET_DIR
     out = {"lane": top, "base": base, "paths": None, "matches": [], "covered": [], "needs_user": [],
            "plan_round": None, "plan_approved_by": None, "plan_categories": [], "error": None}
-    patterns, error = risk_patterns(home)
+    patterns, error = risk_patterns(home) if not home_error else ([], home_error)
     if error:
         out["error"] = f"the project's high-risk paths cannot be read ({error})"
         return out
@@ -3822,7 +3851,7 @@ def risk_state(top: str, home: Path | None, base: str | None = None) -> dict:
     for m in match_risk(paths, patterns):
         if m["category"] in categories:
             m["covered_by"] = f"plan round {out['plan_round']}, approved by the user"
-        elif (m["category"], m["path"]) in approved:
+        elif (m["category"], m["path"]) in approved and LOSSY_MARK not in m["path"]:
             m["covered_by"] = RISK_FILE
         else:
             m["covered_by"] = None
@@ -3867,7 +3896,8 @@ def cmd_risk(args: argparse.Namespace) -> int:
     start, top = lane_top(args)
     if not top:
         raise FleetError(f"{start} is not in a git worktree")
-    state = risk_state(top, project_for(top, create=False), args.base)
+    home, home_error = project_lookup(top)
+    state = risk_state(top, home, args.base, home_error=home_error)
     state["branch"] = git_branch(top) or None
     if args.json:
         print(json.dumps({**state, "needs_the_user": needs_user(state)}, indent=2, ensure_ascii=False))
@@ -3883,7 +3913,8 @@ def cmd_approve_risk(args: argparse.Namespace) -> int:
     if not top:
         return refuse(reason=f"{start} is not in a git worktree")
     out = {"lane": top, "by": args.by, **({"base": args.base} if args.base is not None else {})}
-    state = risk_state(top, project_for(top, create=False), args.base)
+    home, home_error = project_lookup(top)
+    state = risk_state(top, home, args.base, home_error=home_error)
     if state["error"]:
         return refuse(**out, reason=f"the lane's changes cannot be told ({state['error']}), so there is no path "
                                     "to approve: fix that first (a detached HEAD needs --base <ref>)")
@@ -3895,6 +3926,14 @@ def cmd_approve_risk(args: argparse.Namespace) -> int:
     if odd:
         return refuse(**out, reason=f"{plural(len(odd), 'path')} with a control character cannot be written to "
                                     f"{RISK_FILE}", paths=odd[:5])
+    lossy = [m["path"] for m in todo if LOSSY_MARK in m["path"]]
+    if lossy:
+        return refuse(**out, reason=f"{plural(len(lossy), 'path')} with bytes that are not UTF-8 cannot be told "
+                                    f"exactly, so {RISK_FILE} cannot record them: rename the file, or cover its "
+                                    "category with a plan that the user approved", paths=lossy[:5])
+    head = git_text(top, "rev-parse", "--verify", "--quiet", "HEAD")
+    if not head or not head.strip():
+        return refuse(**out, reason="git cannot resolve HEAD, so the approval cannot name its commit")
     d = Path(prep_dir(top)["fleet_dir"])
     risk_md = d / RISK_FILE
     branch = git_branch(top) or None
@@ -3907,10 +3946,9 @@ def cmd_approve_risk(args: argparse.Namespace) -> int:
         head_text = f"# Risk approvals: {branch or 'detached HEAD'}\n\n"
     with risk_md.open("a") as fh:
         fh.write(head_text + "\n".join(lines) + "\n")
-    head = git_text(top, "rev-parse", "--verify", "--quiet", "HEAD")
     matches = [{"category": m["category"], "path": m["path"]} for m in todo]
     record("risk_approved", top, lane=top, cwd=top, branch=branch, workspace=os.environ.get("HERDR_WORKSPACE_ID"),
-           head=head.strip() if head else None, matches=matches, base=args.base)
+           head=head.strip(), matches=matches, base=args.base)
     print(json.dumps({"ok": True, **out, "branch": branch, "file": str(risk_md), "approved": matches,
                       "lines": lines}, indent=2, ensure_ascii=False))
     return 0
