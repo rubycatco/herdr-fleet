@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "fleet"
 _loader = importlib.machinery.SourceFileLoader("fleet_cli", str(SCRIPT))
@@ -312,6 +313,184 @@ class DoctorTests(unittest.TestCase):
         self.assertIs(fleet.codex_hook_trusted(str(self.home)), False)
         (self.home / "hooks.json").write_text(json.dumps({"hooks": {"SessionStart": [other_hook]}}))
         self.assertIsNone(fleet.codex_hook_trusted(str(self.home)))
+
+
+class SweepTests(unittest.TestCase):
+    def lane(self, **kw):
+        f = {"exists": True, "git": True, "linked": True, "self": False, "locked": False, "branch": "fix/x",
+             "default_branch": False, "head": "abc", "dirty": 0, "panes": [], "pr": None, "pr_error": None,
+             "merged_into": None, "ahead": 0, "ahead_of": "remotes", "workspace": "w1", "path": "/w/x"}
+        f.update(kw)
+        return f
+
+    def test_pick_pr(self):
+        prs = [{"number": 1, "state": "CLOSED"},
+               {"number": 2, "state": "MERGED", "mergedAt": "2026-01-01T00:00:00Z"},
+               {"number": 3, "state": "MERGED", "mergedAt": "2026-02-01T00:00:00Z"}]
+        self.assertEqual(fleet.pick_pr(prs)["number"], 3)
+        self.assertEqual(fleet.pick_pr(prs + [{"number": 4, "state": "OPEN"}])["number"], 4)
+        self.assertEqual(fleet.pick_pr(prs[:1])["number"], 1)
+        self.assertIsNone(fleet.pick_pr([]))
+
+    def test_merged_pull_request(self):
+        merged = {"number": 7, "state": "MERGED", "headRefOid": "abc"}
+        f = self.lane(pr=merged, ahead_of="PR #7", panes=[{"pane": "w1:p1", "agent": "claude", "status": "done"}])
+        self.assertEqual(fleet.classify(f), ("ready", ["PR #7 merged"]))
+        self.assertEqual(fleet.branch_plan(f), (True, "merged"))
+        # The PR's head commit is not in this clone: the worktree goes, the branch stays.
+        f = self.lane(pr=merged, ahead_of="remotes")
+        self.assertEqual(fleet.classify(f)[0], "ready")
+        self.assertFalse(fleet.branch_plan(f)[0])
+        # Commits that the merge lacks keep the lane.
+        self.assertEqual(fleet.classify(self.lane(pr=merged, ahead=2, ahead_of="PR #7")),
+                         ("keep", ["PR #7 merged", "2 commits not in it"]))
+        self.assertEqual(fleet.classify(self.lane(pr=merged, ahead=4, ahead_of="remotes")),
+                         ("keep", ["PR #7 merged", "4 commits not pushed"]))
+        self.assertEqual(fleet.classify(self.lane(pr=merged, ahead=None))[0], "keep")
+
+    def test_open_closed_missing_and_git_fallback(self):
+        self.assertEqual(fleet.classify(self.lane(pr={"number": 8, "state": "OPEN"}, ahead=1)),
+                         ("waiting", ["PR #8 open", "1 commit not pushed"]))
+        self.assertEqual(fleet.classify(self.lane(pr={"number": 9, "state": "CLOSED"})),
+                         ("keep", ["PR #9 closed without merging"]))
+        self.assertEqual(fleet.classify(self.lane(pr_error="no git remote")),
+                         ("keep", ["no pull request (gh: no git remote)"]))
+        f = self.lane(merged_into="origin/main", ahead_of="origin/main")
+        self.assertEqual(fleet.classify(f), ("ready", ["in origin/main"]))
+        self.assertEqual(fleet.branch_plan(f), (True, "merged"))
+        f = self.lane(merged_into="main", ahead_of="main", pr={"number": 9, "state": "CLOSED"})
+        self.assertEqual(fleet.classify(f), ("ready", ["in main", "PR #9 closed"]))
+
+    def test_blockers_keep_a_merged_lane(self):
+        f = self.lane(dirty=3, locked=True, pr={"number": 7, "state": "MERGED", "headRefOid": "abc"},
+                      ahead_of="PR #7", panes=[
+                          {"pane": "w1:p1", "agent": "claude", "status": "working"},
+                          {"pane": "w1:p2", "agent": "pi", "status": "idle"},
+                          {"pane": "w1:p3", "agent": None, "status": "unknown", "busy": "node"},
+                          {"pane": "w1:p4", "agent": None, "status": "unknown", "busy": None}])
+        f["self"] = True
+        self.assertEqual(fleet.classify(f), ("keep", [
+            "this session runs here", "worktree is locked", "claude working in w1:p1", "pi in w1:p2: exit it yourself",
+            "node running in w1:p3", "3 uncommitted changes", "PR #7 merged"]))
+        self.assertFalse(fleet.branch_plan(f)[0])
+        self.assertEqual(fleet.lane_blockers(self.lane(branch="main", default_branch=True)),
+                         ["on the default branch main"])
+        self.assertTrue(fleet.lane_blockers(self.lane(exists=False))[0].startswith("checkout missing"))
+        self.assertIn("repository may be gone", fleet.lane_blockers(self.lane(git=False))[0])
+        self.assertEqual(fleet.lane_blockers(self.lane(linked=False)), ["the repository's main checkout"])
+        self.assertEqual(fleet.lane_blockers(self.lane(dirty=None)), ["git status failed"])
+
+    def test_detached_review_checkout(self):
+        f = self.lane(branch=None, unreachable=0)
+        self.assertEqual(fleet.classify(f)[0], "ready")
+        self.assertEqual(fleet.branch_plan(f), (False, "detached HEAD"))
+        self.assertEqual(fleet.classify(self.lane(branch=None, unreachable=2)),
+                         ("keep", ["detached HEAD with 2 commits on no branch"]))
+        self.assertEqual(fleet.classify(self.lane(branch=None, unreachable=None))[0], "keep")
+
+    def test_lane_why_names_each_agent_once(self):
+        f = fleet.finish_lane(self.lane(pr={"number": 7, "state": "OPEN"}, panes=[
+            {"pane": "w1:p1", "agent": "claude", "status": "working"},
+            {"pane": "w1:p10", "agent": "codex", "status": "done"}]))
+        self.assertEqual(fleet.lane_why(f), "claude working in w1:p1; PR #7 open; p10 codex done")
+        self.assertEqual(f["target"], "w1")
+
+    def test_parse_worktree_porcelain(self):
+        text = ("worktree /r\nHEAD aaa\nbranch refs/heads/main\n\n"
+                "worktree /w/a\nHEAD bbb\nbranch refs/heads/fix/a\nlocked\n\n"
+                "worktree /w/b\nHEAD ccc\ndetached\nprunable gitdir file points to non-existent location\n")
+        entries = fleet.parse_worktree_porcelain(text)
+        self.assertEqual([e["path"] for e in entries], ["/r", "/w/a", "/w/b"])
+        self.assertEqual((entries[1]["branch"], entries[1]["locked"]), ("fix/a", True))
+        self.assertEqual((entries[2]["branch"], entries[2]["prunable"]), (None, True))
+        self.assertEqual(fleet.other_kind("/h/.codex/worktrees/11ea/repo"), "Codex app")
+        self.assertEqual(fleet.other_kind("/r/.claude/worktrees/agent-1"), "Claude Code agents")
+        self.assertEqual(fleet.other_kind("/h/src/repo-feature"), "other")
+
+    def test_config_status_and_process_parsing(self):
+        config = '[ui]\ndirectory = "x"\n\n[worktrees]\ndirectory = "~/wt"  # checkouts\n'
+        self.assertEqual(fleet.worktrees_dir_from_config(config), "~/wt")
+        self.assertIsNone(fleet.worktrees_dir_from_config("[ui]\ntheme = 'dark'\n"))
+        self.assertEqual(fleet.count_dirty(" M a.rb\n?? .fleet/\n?? new.txt\n"), 2)
+        self.assertEqual(fleet.count_dirty(""), 0)
+        self.assertIsNone(fleet.count_dirty(None))
+        shell = {"foreground_process_group_id": 5, "shell_pid": 5, "foreground_processes": [{"name": "zsh"}]}
+        self.assertIsNone(fleet.busy_from_process_info(shell))
+        job = {"foreground_process_group_id": 9, "shell_pid": 5, "foreground_processes": [{"name": "node"}]}
+        self.assertEqual(fleet.busy_from_process_info(job), "node")
+
+    def test_archive_lane_files(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"XDG_STATE_HOME": tmp + "/state"}):
+            lane = Path(tmp) / "lane"
+            (lane / ".fleet" / "inbox").mkdir(parents=True)
+            (lane / ".fleet" / "STATUS.md").write_text("log")
+            (lane / ".fleet" / "inbox" / "1.md").write_text("task")
+            (lane / ".fleet" / "panes.json").write_text("{}")
+            dest = Path(fleet.archive_lane_files(str(lane), "repo", "fix/a b"))
+            self.assertEqual(dest.parent, Path(tmp) / "state" / "fleet" / "archive" / "repo")
+            self.assertTrue(dest.name.startswith("fix-a-b-"))
+            self.assertEqual(sorted(p.relative_to(dest).as_posix() for p in dest.rglob("*") if p.is_file()),
+                             ["STATUS.md", "inbox/1.md"])
+            self.assertIsNone(fleet.archive_lane_files(str(Path(tmp) / "none"), "repo", "x"))
+
+
+class LaneGitTests(unittest.TestCase):
+    """lane_facts and the verdict on real git worktrees. gh is replaced by a stub."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.repo, self.lane_path = root / "repo", root / "lane"
+        self.env = {**os.environ, "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.com",
+                    "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.com"}
+        self.repo.mkdir()
+        self.git(self.repo, "init", "-q", "-b", "main")
+        self.git(self.repo, "commit", "-q", "--allow-empty", "-m", "init")
+        self.git(self.repo, "worktree", "add", "-q", "-b", "lane-a", str(self.lane_path))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def git(self, cwd, *args):
+        return subprocess.run(["git", *args], cwd=cwd, env=self.env, check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def facts(self, pr=None, caller_cwd=None):
+        stub = {"workspace": None, "label": None, "path": str(self.lane_path), "panes": []}
+        stub.update(fleet.repo_paths(stub["path"]))
+        return fleet.finish_lane(fleet.lane_facts(stub, None, caller_cwd or self.tmp.name,
+                                                  lambda path, branch: (pr, None)))
+
+    def test_lane_from_open_to_merged(self):
+        f = self.facts()
+        self.assertEqual((f["linked"], f["repo"], f["branch"]), (True, "repo", "lane-a"))
+        # A lane without commits of its own is in main.
+        self.assertEqual((f["verdict"], f["reasons"]), ("ready", ["in main"]))
+        self.assertEqual(self.facts(caller_cwd=str(self.lane_path))["reasons"][0], "this session runs here")
+        (self.lane_path / "a.txt").write_text("a")
+        (self.lane_path / ".fleet").mkdir()
+        (self.lane_path / ".fleet" / "STATUS.md").write_text("log")
+        self.assertEqual(self.facts()["reasons"], ["1 uncommitted change"])
+        self.git(self.lane_path, "add", "a.txt")
+        self.git(self.lane_path, "commit", "-q", "-m", "a")
+        self.assertEqual(self.facts()["reasons"], ["no pull request"])
+        head = self.git(self.lane_path, "rev-parse", "HEAD")
+        merged = {"number": 5, "state": "MERGED", "headRefOid": head}
+        f = self.facts(pr=merged)
+        self.assertEqual((f["verdict"], f["delete_branch"]), ("ready", True))
+        self.git(self.lane_path, "commit", "-q", "--allow-empty", "-m", "b")
+        self.assertEqual(self.facts(pr=merged)["reasons"], ["PR #5 merged", "1 commit not in it"])
+        self.git(self.repo, "merge", "-q", "--no-ff", "-m", "merge lane-a", "lane-a")
+        f = self.facts()
+        self.assertEqual((f["verdict"], f["reasons"], f["delete_branch"]), ("ready", ["in main"], True))
+        self.assertFalse(fleet.repo_paths(str(self.repo))["linked"])
+
+    def test_detached_checkout(self):
+        self.git(self.lane_path, "checkout", "-q", "--detach")
+        f = self.facts()
+        self.assertEqual((f["verdict"], f["delete_branch"]), ("ready", False))
+        self.git(self.lane_path, "commit", "-q", "--allow-empty", "-m", "only here")
+        self.assertEqual(self.facts()["reasons"], ["detached HEAD with 1 commit on no branch"])
 
 
 class FilesTests(unittest.TestCase):

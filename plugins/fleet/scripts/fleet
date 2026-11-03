@@ -17,6 +17,9 @@ Commands:
   fleet reset PANE [--compact [FOCUS]]    /clear (or /compact) a claude lane, then resume it
   fleet status [--workspace W] [--json]   agent panes with role, account, branch and lane files
   fleet retire PANE [--close]             exit the agent in PANE (never the calling pane)
+  fleet sweep [--json]                    every lane with a cleanup verdict: ready, waiting or keep (reads only)
+  fleet cleanup TARGET... [--unmerged]    remove lanes: exit agents, archive .fleet/, remove the worktree,
+                                          delete the local branch when its merge holds every commit
   fleet hook session-start                SessionStart hook: re-brief after /clear or compaction
 
 Python 3.8+, standard library only.
@@ -35,9 +38,10 @@ import subprocess
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 FLEET_DIR = ".fleet"
 LANE_FILES = ("BRIEF.md", "STATUS.md", "HANDOFF.md")
@@ -79,10 +83,13 @@ class FleetError(Exception):
 
 
 def run(cmd: list[str], timeout: float = 30, input_text: str | None = None,
-        env: dict | None = None) -> subprocess.CompletedProcess:
+        env: dict | None = None, cwd: str | None = None) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=input_text, env=env)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=input_text, env=env,
+                              cwd=cwd)
     except FileNotFoundError:
+        if cwd and not os.path.isdir(cwd):
+            raise FleetError(f"no such directory: {cwd}")
         raise FleetError(f"{cmd[0]}: command not found")
     except subprocess.TimeoutExpired:
         raise FleetError(f"timed out after {timeout:g}s: {shlex.join(cmd)}")
@@ -842,6 +849,20 @@ def cmd_reset(args: argparse.Namespace) -> int:
 # retire
 
 
+def exit_agent(pane: str, agent: str, timeout: float) -> bool:
+    """Type the agent's exit command into its pane, and wait until Herdr no longer sees an agent there."""
+    command = EXIT_COMMAND.get(agent)
+    if not command:
+        raise FleetError(f"don't know how to exit {agent}; exit it in the pane")
+    run(["herdr", "pane", "run", pane, command])
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not pane_info(pane).get("agent"):
+            return True
+        time.sleep(1)
+    return not pane_info(pane).get("agent")
+
+
 def cmd_retire(args: argparse.Namespace) -> int:
     require_herdr()
     pane = args.pane
@@ -850,20 +871,16 @@ def cmd_retire(args: argparse.Namespace) -> int:
     info = pane_info(pane)
     agent = info.get("agent")
     if agent:
-        command = EXIT_COMMAND.get(agent)
-        if not command:
+        if agent not in EXIT_COMMAND:
             raise FleetError(f"don't know how to exit {agent}; exit it in the pane")
         if info.get("agent_status") == "working":
             if not args.force:
                 raise FleetError(f"{agent} in {pane} is working; wait for it, or pass --force to interrupt it", code=3)
             send_keys(pane, "Escape")
             time.sleep(1.5)
-        run(["herdr", "pane", "run", pane, command])
-        deadline = time.time() + args.timeout
-        while time.time() < deadline and pane_info(pane).get("agent"):
-            time.sleep(1)
-        if pane_info(pane).get("agent"):
-            print(json.dumps({"ok": False, "pane_id": pane, "reason": f"{agent} still running after {command}"}, indent=2, ensure_ascii=False))
+        if not exit_agent(pane, agent, args.timeout):
+            print(json.dumps({"ok": False, "pane_id": pane, "reason": f"{agent} still running after {EXIT_COMMAND[agent]}"},
+                             indent=2, ensure_ascii=False))
             return 2
     unregistered = bool(info.get("cwd")) and unregister_pane(info["cwd"], pane)
     closed = False
@@ -979,6 +996,534 @@ def cmd_status(args: argparse.Namespace) -> int:
     for r in table:
         print("  ".join(str(c).ljust(widths[i]) for i, c in enumerate(r)).rstrip())
     return 0
+
+
+# --------------------------------------------------------------------------
+# sweep / cleanup
+#
+# A lane is a linked worktree that is open as a Herdr workspace, sits in Herdr's
+# worktrees directory, or has a .fleet/ folder. sweep only reads. cleanup acts
+# only on lanes that the user picked, and checks each of them again first.
+
+
+ACTIVE_STATUSES = ("working", "blocked")
+# Linked worktrees that other tools manage: sweep counts them, cleanup never touches them.
+OTHER_KINDS = (("/.codex/worktrees/", "Codex app"), ("/.claude/worktrees/", "Claude Code agents"))
+PR_FIELDS = "number,state,headRefOid,mergedAt,url"
+VERDICTS = (("ready", "READY: `fleet cleanup` removes these"),
+            ("waiting", "WAITING: pull request open; the worktree stays"),
+            ("keep", "KEEP"))
+
+
+def plural(n: int, word: str) -> str:
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def run_git(path: str, *args: str, timeout: float = 15) -> subprocess.CompletedProcess | None:
+    try:
+        return run(["git", "-C", path, *args], timeout=timeout)
+    except FleetError:
+        return None
+
+
+def git_out(path: str, *args: str) -> str | None:
+    """Stripped stdout of a git command, or None when it fails."""
+    cp = run_git(path, *args)
+    return cp.stdout.strip() if cp is not None and cp.returncode == 0 else None
+
+
+def git_ok(path: str, *args: str) -> bool:
+    cp = run_git(path, *args)
+    return cp is not None and cp.returncode == 0
+
+
+def count_out(text: str | None) -> int | None:
+    return int(text) if text is not None and text.isdigit() else None
+
+
+def inside(path: str, root: str) -> bool:
+    path, root = os.path.realpath(path), os.path.realpath(root)
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def short_path(path: str) -> str:
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path == home or path.startswith(home + os.sep) else path
+
+
+def worktrees_dir_from_config(text: str) -> str | None:
+    """`directory` in the [worktrees] table of Herdr's config.toml."""
+    table = None
+    for line in text.splitlines():
+        header = re.match(r"^\s*\[([^\[\]]+)\]\s*(?:#.*)?$", line)
+        if header:
+            table = header.group(1).strip()
+        elif table == "worktrees":
+            m = TOML_STRING_KEY.match(line)
+            if m and m.group(1) == "directory":
+                return m.group(2) if m.group(2) is not None else m.group(3)
+    return None
+
+
+def herdr_worktrees_dir() -> Path:
+    """Where `herdr worktree create` puts checkouts, as <directory>/<repo>/<branch-slug>."""
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or "~/.config").expanduser() / "herdr" / "config.toml"
+    try:
+        configured = worktrees_dir_from_config(config.read_text())
+    except OSError:
+        configured = None
+    return Path(configured or "~/.herdr/worktrees").expanduser()
+
+
+def parse_worktree_porcelain(text: str) -> list[dict]:
+    """`git worktree list --porcelain`: one dict per worktree, the main checkout first."""
+    entries: list[dict] = []
+    current: dict | None = None
+    for line in (text or "").splitlines():
+        if line.startswith("worktree "):
+            current = {"path": line[len("worktree "):], "branch": None, "locked": False, "prunable": False}
+            entries.append(current)
+        elif current is None:
+            continue
+        elif line.startswith("branch "):
+            ref = line[len("branch "):]
+            current["branch"] = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+        elif line.split(" ", 1)[0] in ("locked", "prunable"):
+            current[line.split(" ", 1)[0]] = True
+    return entries
+
+
+def other_kind(path: str) -> str:
+    return next((kind for marker, kind in OTHER_KINDS if marker in path), "other")
+
+
+def repo_paths(path: str) -> dict:
+    """Whether `path` is the top of a linked worktree, and the main checkout of its repository."""
+    if not os.path.isdir(path):
+        return {"exists": False, "git": False, "linked": False}
+    lines = (git_out(path, "rev-parse", "--git-dir", "--git-common-dir", "--show-toplevel") or "").splitlines()
+    if len(lines) < 3 or os.path.realpath(lines[2]) != os.path.realpath(path):
+        return {"exists": True, "git": False, "linked": False}
+    git_dir, common = (os.path.realpath(os.path.join(path, p)) for p in lines[:2])
+    main_root = os.path.dirname(common) if os.path.basename(common) == ".git" else common
+    return {"exists": True, "git": True, "linked": git_dir != common,
+            "main_root": main_root, "repo": os.path.basename(main_root)}
+
+
+def count_dirty(porcelain: str | None) -> int | None:
+    """Changed and untracked paths in `git status --porcelain`, not counting the lane's .fleet/."""
+    if porcelain is None:
+        return None
+    fleet_dir = FLEET_DIR + "/"
+    paths = [line[3:].strip('"') for line in porcelain.splitlines() if line.strip()]
+    return sum(1 for p in paths if not (p == fleet_dir or p.startswith(fleet_dir)))
+
+
+def base_refs(path: str) -> list[str]:
+    """The branches that a merged lane is in: the remote's default branch, and a local main or master."""
+    refs = []
+    remote = git_out(path, "rev-parse", "--abbrev-ref", "origin/HEAD")
+    if remote and remote != "origin/HEAD":
+        refs.append(remote)
+    local = next((name for name in ("main", "master")
+                  if git_ok(path, "rev-parse", "--verify", "--quiet", f"refs/heads/{name}")), None)
+    if local:
+        refs.append(local)
+    return refs
+
+
+def pick_pr(prs: list[dict]) -> dict | None:
+    """The pull request that decides a lane: an open one, else the newest merged one, else the newest closed one."""
+    for state in ("OPEN", "MERGED", "CLOSED"):
+        hits = [p for p in prs if p.get("state") == state]
+        if hits:
+            return max(hits, key=lambda p: (p.get("mergedAt") or "", p.get("number") or 0))
+    return None
+
+
+def pr_for_branch(path: str, branch: str) -> tuple[dict | None, str | None]:
+    """(pull request, error). gh runs in the lane, so it finds the repository from the lane's remote."""
+    if not shutil.which("gh"):
+        return None, "gh not installed"
+    try:
+        cp = run(["gh", "pr", "list", "--head", branch, "--state", "all", "--limit", "20", "--json", PR_FIELDS],
+                 timeout=30, cwd=path)
+    except FleetError as e:
+        return None, str(e)
+    if cp.returncode != 0:
+        return None, first_line(cp.stderr or cp.stdout) or "gh pr list failed"
+    try:
+        prs = json.loads(cp.stdout or "[]")
+    except ValueError:
+        return None, "gh pr list printed no JSON"
+    return pick_pr(prs if isinstance(prs, list) else []), None
+
+
+def commits_ahead(path: str, pr: dict | None, merged_into: str | None) -> tuple[int | None, str]:
+    """Commits on HEAD that the pull request's head lacks; without that head, the base or every remote."""
+    oid = (pr or {}).get("headRefOid")
+    if oid and git_ok(path, "cat-file", "-e", f"{oid}^{{commit}}"):
+        return count_out(git_out(path, "rev-list", "--count", f"{oid}..HEAD")), f"PR #{pr['number']}"
+    if merged_into:
+        return 0, merged_into
+    return count_out(git_out(path, "rev-list", "--count", "HEAD", "--not", "--remotes")), "remotes"
+
+
+def busy_from_process_info(info: dict) -> str | None:
+    """The program in the foreground of a shell pane, unless it is the shell itself."""
+    group, shell = info.get("foreground_process_group_id"), info.get("shell_pid")
+    if group is None or shell is None or group == shell:
+        return None
+    procs = info.get("foreground_processes") or [{}]
+    return procs[0].get("name") or procs[0].get("cmdline") or "a program"
+
+
+def foreground_program(pane: str) -> str | None:
+    try:
+        info = herdr("pane", "process-info", "--pane", pane).get("process_info") or {}
+    except FleetError:
+        return "an unknown program"
+    return busy_from_process_info(info)
+
+
+def lane_facts(stub: dict, caller_pane: str | None, caller_cwd: str, pr_lookup=None) -> dict:
+    """What sweep and cleanup decide on, for one lane. Reads only."""
+    f = dict(stub)
+    path = f["path"]
+    f["panes"] = [{"pane": p.get("pane_id"), "agent": p.get("agent"), "status": p.get("agent_status")}
+                  for p in stub.get("panes") or []]
+    f["self"] = inside(caller_cwd, path) or any(p["pane"] == caller_pane for p in f["panes"])
+    for p in f["panes"]:
+        if not p["agent"]:
+            p["busy"] = foreground_program(p["pane"])
+    if not (f.get("exists") and f.get("git") and f.get("linked")):
+        return f
+    f["branch"] = git_out(path, "symbolic-ref", "--quiet", "--short", "HEAD") or None
+    f["head"] = git_out(path, "rev-parse", "HEAD")
+    status = run_git(path, "status", "--porcelain")
+    f["dirty"] = count_dirty(status.stdout if status is not None and status.returncode == 0 else None)
+    if f["branch"] is None:
+        # A detached checkout (a review at one commit, say) loses nothing when a branch, remote or tag holds HEAD.
+        f["unreachable"] = count_out(git_out(path, "rev-list", "--count", "HEAD", "--not", "--branches",
+                                             "--remotes", "--tags"))
+        f.update(pr=None, pr_error=None, merged_into=None, ahead=f["unreachable"], ahead_of="branches")
+        return f
+    bases = base_refs(path)
+    f["default_branch"] = f["branch"] is not None and any(f["branch"] == b.split("/", 1)[-1] for b in bases)
+    f["merged_into"] = next((b for b in bases if git_ok(path, "merge-base", "--is-ancestor", "HEAD", b)), None)
+    f["pr"], f["pr_error"] = (pr_lookup or pr_for_branch)(path, f["branch"]) if f["branch"] else (None, None)
+    f["ahead"], f["ahead_of"] = commits_ahead(path, f["pr"], f["merged_into"])
+    return f
+
+
+def lane_blockers(f: dict) -> list[str]:
+    """Reasons that forbid removing the lane's worktree at all, merged or not."""
+    if not f.get("exists"):
+        return ["checkout missing; close its workspace with herdr workspace close" if f.get("workspace")
+                else "checkout missing"]
+    if not f.get("git"):
+        return ["not a git worktree; its repository may be gone. Remove the folder yourself"]
+    if not f.get("linked"):
+        return ["the repository's main checkout"]
+    out = []
+    if f.get("self"):
+        out.append("this session runs here")
+    if f.get("locked"):
+        out.append("worktree is locked")
+    if not f.get("branch"):
+        lost = f.get("unreachable")
+        if lost is None:
+            out.append("detached HEAD; cannot tell whether a branch holds its commits")
+        elif lost:
+            out.append(f"detached HEAD with {plural(lost, 'commit')} on no branch")
+    elif f.get("default_branch"):
+        out.append(f"on the default branch {f['branch']}")
+    for p in f.get("panes") or []:
+        agent, status = p.get("agent"), p.get("status")
+        if agent and status in ACTIVE_STATUSES:
+            out.append(f"{agent} {status} in {p['pane']}")
+        elif agent and agent not in EXIT_COMMAND:
+            out.append(f"{agent} in {p['pane']}: exit it yourself")
+        elif not agent and p.get("busy"):
+            out.append(f"{p['busy']} running in {p['pane']}")
+    dirty = f.get("dirty")
+    if dirty is None:
+        out.append("git status failed")
+    elif dirty:
+        out.append(plural(dirty, "uncommitted change"))
+    return out
+
+
+def classify(f: dict) -> tuple[str, list[str]]:
+    """'ready' (cleanup removes it), 'waiting' (its pull request is open) or 'keep', with the reasons."""
+    pr = f.get("pr") or None
+    state = pr.get("state") if pr else None
+    label = f"PR #{pr['number']}" if pr else ""
+    pr_note = [f"{label} {str(state).lower()}"] if pr else []
+    blockers = lane_blockers(f)
+    if blockers:
+        return "keep", blockers + pr_note
+    if not f.get("branch"):
+        return "ready", ["detached HEAD; a branch or remote holds its commit"]
+    ahead, ahead_of = f.get("ahead"), f.get("ahead_of") or ""
+    if state == "OPEN":
+        return "waiting", pr_note + ([f"{plural(ahead, 'commit')} not pushed"] if ahead else [])
+    if state == "MERGED" or f.get("merged_into"):
+        merge_note = [f"in {f['merged_into']}"] if f.get("merged_into") and state != "MERGED" else []
+        if ahead is None:
+            return "keep", pr_note + merge_note + ["cannot tell whether every commit is pushed"]
+        if ahead:
+            where = "not in it" if ahead_of.startswith("PR #") else "not pushed"
+            return "keep", pr_note + merge_note + [f"{plural(ahead, 'commit')} {where}"]
+        return "ready", merge_note + pr_note
+    if state == "CLOSED":
+        return "keep", [f"{label} closed without merging"]
+    return "keep", ["no pull request" + (f" (gh: {f['pr_error']})" if f.get("pr_error") else "")]
+
+
+def branch_plan(f: dict) -> tuple[bool, str]:
+    """Whether cleanup deletes the lane's local branch, and why."""
+    if not f.get("branch"):
+        return False, "detached HEAD"
+    verdict = f.get("verdict") or classify(f)[0]
+    if verdict != "ready":
+        return False, "not merged"
+    if (f.get("ahead_of") or "").startswith("PR #") or f.get("merged_into"):
+        return True, "merged"
+    return False, "the pull request's head commit is not in this clone"
+
+
+def finish_lane(f: dict) -> dict:
+    f["blockers"] = lane_blockers(f)
+    f["verdict"], f["reasons"] = classify(f)
+    f["delete_branch"], f["branch_note"] = branch_plan(f)
+    f["target"] = f.get("workspace") or short_path(f["path"])
+    return f
+
+
+def enumerate_lanes() -> tuple[list[dict], list[str]]:
+    """Lane stubs (worktree workspaces, then checkouts in Herdr's worktrees directory) and the main checkouts open in Herdr."""
+    workspaces = herdr("workspace", "list").get("workspaces", [])
+    by_workspace: dict[str, list[dict]] = {}
+    for p in herdr("pane", "list").get("panes", []):
+        by_workspace.setdefault(p.get("workspace_id"), []).append(p)
+    stubs: list[dict] = []
+    checkouts: list[str] = []
+    for w in workspaces:
+        tree = w.get("worktree") or {}
+        path = tree.get("checkout_path")
+        if not path:
+            continue
+        if tree.get("is_linked_worktree"):
+            stubs.append({"workspace": w.get("workspace_id"), "label": w.get("label"), "path": path,
+                          "panes": by_workspace.get(w.get("workspace_id"), [])})
+        else:
+            checkouts.append(path)
+    open_paths = {os.path.realpath(s["path"]) for s in stubs}
+    root = str(herdr_worktrees_dir())
+    for d in sorted(glob.glob(os.path.join(glob.escape(root), "*", "*"))):
+        if os.path.isdir(d) and os.path.realpath(d) not in open_paths:
+            stubs.append({"workspace": None, "label": None, "path": d, "panes": []})
+    return stubs, checkouts
+
+
+def match_target(target: str, stubs: list[dict]) -> dict | None:
+    for s in stubs:
+        if s.get("workspace") and s["workspace"] == target:
+            return s
+    path = os.path.realpath(os.path.expanduser(target))
+    return next((s for s in stubs if os.path.realpath(s["path"]) == path), None)
+
+
+def collect_lanes(targets: list[str] | None = None, pr_lookup=None) -> tuple[list[dict], list[dict], list[str]]:
+    """(lanes with their verdicts, other worktrees, targets that name no lane). Only `targets`, when given."""
+    stubs, checkouts = enumerate_lanes()
+    for s in stubs:
+        s.update(repo_paths(s["path"]))
+    repos: dict[str, str] = {}
+    for root in [s["main_root"] for s in stubs if s.get("main_root")] + checkouts:
+        repos.setdefault(os.path.realpath(root), root)
+    known = {os.path.realpath(s["path"]): s for s in stubs}
+    others: list[dict] = []
+    for _, root in sorted(repos.items()):
+        listing = run_git(root, "worktree", "list", "--porcelain")
+        entries = parse_worktree_porcelain(listing.stdout if listing is not None and listing.returncode == 0 else "")
+        for e in entries[1:]:
+            real = os.path.realpath(e["path"])
+            if real in known:
+                known[real]["locked"] = e["locked"]
+            elif os.path.isdir(os.path.join(e["path"], FLEET_DIR)):
+                s = {"workspace": None, "label": None, "path": e["path"], "panes": [], "locked": e["locked"]}
+                s.update(repo_paths(e["path"]))
+                stubs.append(s)
+                known[real] = s
+            else:
+                others.append({"repo": os.path.basename(root), "path": e["path"], "branch": e["branch"],
+                               "kind": other_kind(e["path"]), "prunable": e["prunable"]})
+    missing: list[str] = []
+    if targets is not None:
+        chosen: list[dict] = []
+        for t in targets:
+            s = match_target(t, stubs)
+            if s is None:
+                missing.append(t)
+            elif all(s is not c for c in chosen):
+                chosen.append(s)
+        stubs = chosen
+    caller_pane, caller_cwd = os.environ.get("HERDR_PANE_ID"), os.getcwd()
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        lanes = list(pool.map(lambda s: finish_lane(lane_facts(s, caller_pane, caller_cwd, pr_lookup)), stubs))
+    return lanes, others, missing
+
+
+def lane_why(f: dict) -> str:
+    named = " ".join(f["reasons"])
+    agents = [f"{p['pane'].rsplit(':', 1)[-1]} {p['agent']} {p['status']}" for p in f.get("panes") or []
+              if p.get("agent") and not re.search(re.escape(p["pane"]) + r"\b", named)]
+    return "; ".join(f["reasons"] + agents)
+
+
+def print_sweep(lanes: list[dict], others: list[dict]) -> None:
+    groups = [(title, sorted((l for l in lanes if l["verdict"] == verdict),
+                             key=lambda l: (l.get("repo") or "", l.get("branch") or l["path"])))
+              for verdict, title in VERDICTS]
+    rows = [[l["target"], l.get("repo") or "-", l.get("branch") or "-"] for _, group in groups for l in group]
+    widths = [max([len(r[i]) for r in rows] or [0]) for i in range(3)]
+    if not lanes:
+        print("No lanes: no worktree workspace is open in Herdr, and its worktrees directory is empty.\n")
+    for title, group in groups:
+        if not group:
+            continue
+        print(f"{title} ({len(group)})")
+        for l in group:
+            cells = [l["target"], l.get("repo") or "-", l.get("branch") or "-"]
+            print("  " + "  ".join(c.ljust(widths[i]) for i, c in enumerate(cells)) + "  " + lane_why(l))
+        print()
+    if others:
+        counts: dict[str, dict[str, int]] = {}
+        for o in others:
+            kinds = counts.setdefault(o["repo"], {})
+            kinds[o["kind"]] = kinds.get(o["kind"], 0) + 1
+        print("OTHER WORKTREES: not lanes; fleet never touches them")
+        for repo in sorted(counts):
+            print(f"  {repo}: " + ", ".join(f"{n} {kind}" for kind, n in sorted(counts[repo].items())))
+        prunable = sum(1 for o in others if o.get("prunable"))
+        if prunable:
+            print(f"  {prunable} of them have no folder any more (git worktree prune)")
+        print()
+    print("`fleet cleanup TARGET...` removes ready lanes. With --unmerged it also removes a clean lane without a merge,"
+          " and keeps its branch.")
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    require_herdr()
+    lanes, others, _ = collect_lanes()
+    if args.json:
+        print(json.dumps({"lanes": lanes, "others": others}, indent=2, ensure_ascii=False))
+    else:
+        print_sweep(lanes, others)
+    return 0
+
+
+def state_dir() -> Path:
+    return Path(os.environ.get("XDG_STATE_HOME") or "~/.local/state").expanduser() / "fleet"
+
+
+def archive_lane_files(path: str, repo: str | None, branch: str | None) -> str | None:
+    """Copy the lane's .fleet/ records (not panes.json): removing the worktree deletes them."""
+    src = Path(path) / FLEET_DIR
+    files = [p for p in sorted(src.rglob("*")) if p.is_file() and p.name != PANES_FILE] if src.is_dir() else []
+    if not files:
+        return None
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", branch or Path(path).name).strip("-.") or "lane"
+    dest = state_dir() / "archive" / (repo or "unknown") / f"{slug}-{time.strftime('%Y%m%d-%H%M%S')}"
+    for f in files:
+        target = dest / f.relative_to(src)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f, target)
+    return str(dest)
+
+
+def cleanup_plan(f: dict) -> dict:
+    return {"target": f["target"], "path": f["path"], "verdict": f["verdict"], "reasons": f["reasons"],
+            "exit": [f"{p['pane']} {p['agent']}" for p in f["panes"] if p.get("agent")],
+            "archive": (Path(f["path"]) / FLEET_DIR).is_dir(),
+            "remove": "herdr worktree remove" if f.get("workspace") else "git worktree remove",
+            "branch": (f"delete {f['branch']}" if f["delete_branch"] else
+                       f"keep {f['branch']}: {f['branch_note']}" if f.get("branch") else "none: detached HEAD")}
+
+
+def finish_branch(f: dict) -> str:
+    """Delete the lane's local branch when the plan says so and the branch has not moved since the facts."""
+    branch = f.get("branch")
+    if not branch:
+        return "none: detached HEAD"
+    if not f.get("delete_branch"):
+        return f"kept {branch}: {f.get('branch_note')}"
+    tip = git_out(f["main_root"], "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+    if tip != f.get("head"):
+        return f"kept {branch}: it moved after the check"
+    cp = run_git(f["main_root"], "branch", "-D", branch)
+    if cp is None or cp.returncode != 0:
+        return f"kept {branch}: " + (first_line(cp.stderr or cp.stdout) if cp is not None else "git branch -D failed")
+    return f"deleted {branch}"
+
+
+def clean_lane(f: dict, timeout: float) -> dict:
+    """Exit the lane's agents, archive its .fleet/, remove its worktree, then delete its branch when merged."""
+    out: dict = {"target": f["target"], "path": f["path"], "ok": False, "exited": []}
+    try:
+        for p in f["panes"]:
+            if not p.get("agent"):
+                continue
+            status = pane_info(p["pane"]).get("agent_status")
+            if status in ACTIVE_STATUSES:
+                out["error"] = f"{p['agent']} in {p['pane']} is {status} now; the worktree stays"
+                return out
+            if not exit_agent(p["pane"], p["agent"], timeout):
+                out["error"] = f"{p['agent']} in {p['pane']} did not exit; the worktree stays"
+                return out
+            out["exited"].append(p["pane"])
+        out["archive"] = archive_lane_files(f["path"], f.get("repo"), f.get("branch"))
+        if f.get("workspace"):
+            herdr("worktree", "remove", "--workspace", f["workspace"], "--json", timeout=120)
+        else:
+            cp = run(["git", "-C", f["main_root"], "worktree", "remove", f["path"]], timeout=120)
+            if cp.returncode != 0:
+                out["error"] = first_line(cp.stderr or cp.stdout) or "git worktree remove failed"
+                return out
+        out["removed"] = True
+        parent = os.path.dirname(os.path.realpath(f["path"]))
+        if os.path.dirname(parent) == os.path.realpath(herdr_worktrees_dir()):
+            try:
+                os.rmdir(parent)  # Herdr's <directory>/<repo>/ folder, only when this was its last checkout
+            except OSError:
+                pass
+        out["branch"] = finish_branch(f)
+        out["ok"] = True
+    except FleetError as e:
+        out["error"] = str(e)
+    return out
+
+
+def cmd_cleanup(args: argparse.Namespace) -> int:
+    require_herdr()
+    lanes, _, missing = collect_lanes(targets=args.targets)
+    if missing:
+        raise FleetError(f"not a lane: {', '.join(missing)}. `fleet sweep` lists the lanes")
+    refused = [{"target": f["target"], "verdict": f["verdict"], "reasons": f["reasons"]}
+               for f in lanes if not (f["verdict"] == "ready" or (args.unmerged and not f["blockers"]))]
+    if refused:
+        print(json.dumps({"ok": False, "changed": "nothing", "refused": refused}, indent=2, ensure_ascii=False))
+        return 2
+    if args.dry_run:
+        print(json.dumps({"ok": True, "dry_run": True, "plan": [cleanup_plan(f) for f in lanes]},
+                         indent=2, ensure_ascii=False))
+        return 0
+    results = [clean_lane(f, args.timeout) for f in lanes]
+    ok = all(r["ok"] for r in results)
+    print(json.dumps({"ok": ok, "lanes": results}, indent=2, ensure_ascii=False))
+    return 0 if ok else 2
 
 
 # --------------------------------------------------------------------------
@@ -1536,6 +2081,19 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--force", action="store_true", help="interrupt a working agent before exiting it")
     r.add_argument("--timeout", type=float, default=30)
     r.set_defaults(func=cmd_retire)
+
+    sw = sub.add_parser("sweep", help="every lane with a cleanup verdict: ready, waiting or keep (reads only)")
+    sw.add_argument("--json", action="store_true")
+    sw.set_defaults(func=cmd_sweep)
+
+    cl = sub.add_parser("cleanup", help="remove lanes: exit agents, archive .fleet/, remove the worktree, "
+                                        "delete the merged local branch")
+    cl.add_argument("targets", nargs="+", metavar="TARGET", help="a workspace id or a lane path, as fleet sweep prints it")
+    cl.add_argument("--unmerged", action="store_true",
+                    help="also remove a clean lane whose branch is not merged; the branch stays")
+    cl.add_argument("--dry-run", action="store_true", help="print the plan and change nothing")
+    cl.add_argument("--timeout", type=float, default=30, help="seconds to wait for each agent to exit")
+    cl.set_defaults(func=cmd_cleanup)
 
     h = sub.add_parser("hook", help="hook handlers")
     h.add_argument("event", choices=("session-start",))

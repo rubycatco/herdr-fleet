@@ -48,7 +48,7 @@ setup (once)
         │              repeats until APPROVE or the stop rule
         ▼
 push, open the PR, merge per your rules
-  └─ fleet retire ─> herdr worktree remove
+  └─ /fleet:cleanup    fleet sweep, you pick, fleet cleanup
 
 along the way
   a lane asks or blocks   fleet watch returns; orchestrator answers or asks you
@@ -89,6 +89,7 @@ After installing, run `/reload-plugins` in open sessions, and `/fleet:onboard` o
 | `/fleet:context` | Chooses between continuing, `/compact`, `/clear` with a re-brief, or a handoff, and does it. |
 | `/fleet:handoff` | Moves this session or a lane to a new pane: through a handoff file, or by resuming the same conversation on another account. |
 | `/fleet:accounts` | remuda accounts, usage and the account of each pane. |
+| `/fleet:cleanup` | Lists every lane with a verdict (ready, waiting, keep), asks which ones to remove, then exits their agents, archives `.fleet/`, removes the worktrees, deletes merged local branches and runs the project's own cleanup. Only you start it. |
 
 ## Conventions
 
@@ -107,11 +108,13 @@ Each lane keeps its state in `.fleet/` at the top of its worktree. The helper ad
 | `panes.json` | `fleet spawn --role` | The role of each pane (impl, critic, orchestrator). |
 | `FLEET.md` | orchestrator | Lane table, decisions, next actions (in the orchestrator's checkout). |
 
+`fleet cleanup` copies a lane's `.fleet/` (without `panes.json`) to `~/.local/state/fleet/archive/<repo>/` before it removes the worktree.
+
 A SessionStart hook runs after `/clear` and compaction. It re-briefs a pane from these files by its role: the implementer from BRIEF, STATUS and HANDOFF; a critic from its newest review request; the orchestrator from FLEET.md when its `Orchestrator: pane <id>` line names that pane. Other sessions in the same checkout get nothing.
 
 ## Helper CLI
 
-`plugins/fleet/scripts/fleet` does the parts that must be exact: start agents and get past their first-run dialogs, submit prompts and confirm that they landed, wait for markers, confirm `/clear` and `/compact`, and refuse to drive the calling pane. `python3 plugins/fleet/scripts/fleet --help` lists the commands. `FLEET_NO_REMUDA=1` forces plain mode.
+`plugins/fleet/scripts/fleet` does the parts that must be exact: start agents and get past their first-run dialogs, submit prompts and confirm that they landed, wait for markers, confirm `/clear` and `/compact`, refuse to drive the calling pane, and remove a lane only when it is clean and its merge holds every commit. `python3 plugins/fleet/scripts/fleet --help` lists the commands. `FLEET_NO_REMUDA=1` forces plain mode.
 
 ## Development
 

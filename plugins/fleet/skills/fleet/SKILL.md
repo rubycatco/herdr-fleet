@@ -41,6 +41,8 @@ Run every command as `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" <command> ..
 | `watch PANE [--marker M] [--file F]` | Wait until a marker shows in a lane file (default `.fleet/STATUS.md`), or the agent stops, blocks or exits. Run it in the background. |
 | `reset PANE [--compact [FOCUS]]` | `/clear` (or `/compact`) a Claude lane at a boundary, confirm it, and send a resume prompt. PANE comes first. |
 | `retire PANE [--close]` | Exit the agent, and close the pane if asked. |
+| `sweep` | Every lane on this machine with a verdict, ready, waiting or keep, and the reason (text; `--json`). It only reads. |
+| `cleanup TARGET... [--unmerged] [--dry-run]` | Remove lanes: exit their agents, archive `.fleet/`, remove the worktree, delete the local branch when the merge holds every commit. It checks every target first and changes nothing when one is not ready. |
 | `prep [DIR] [--handoff]` | Create `.fleet/` and keep it out of git. `--handoff` also returns where a handoff file goes. |
 
 `spawn` options:
@@ -62,7 +64,7 @@ Run every command as `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" <command> ..
 3. **Review**: `/fleet:review`. Review request, critic panes per the conventions, verdict, findings back to the implementer, stop rule.
 4. **Context**: `/fleet:context`. Reset long lanes at a commit. Hand off when an account or model must change (`/fleet:handoff`).
 5. **Finish**: push, open the pull request and merge as the conventions and the project's rules say. Record the result in FLEET.md.
-6. **Clean up**: `retire PANE --close` for each lane pane. Then `herdr worktree remove --workspace W`; it refuses a dirty worktree, so check `git -C <path> status` first. Delete the branch only when `git cherry -v <base> <branch>` prints only `-` lines. Run the project's own worktree cleanup if it documents one.
+6. **Clean up**: `/fleet:cleanup`, which the user runs. It sweeps every lane, asks which ones to remove, removes them and runs the project's own cleanup. After a merge, run `sweep` and tell the user which lanes are ready. Run `cleanup` yourself only on lanes that the user named for removal.
 
 ## Rules
 

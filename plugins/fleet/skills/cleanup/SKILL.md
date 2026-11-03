@@ -1,0 +1,49 @@
+---
+name: cleanup
+description: Clean up finished fleet lanes — list every lane with a verdict (ready, waiting or keep), ask which ones to remove, then exit their agents, archive their .fleet/ records, remove their worktrees, delete their merged local branches and run the project's own cleanup. Use when the user asks to clean up lanes, worktrees, panes or workspaces, or after pull requests merge.
+argument-hint: "[workspace ids or lane paths]"
+disable-model-invocation: true
+allowed-tools:
+  - Read
+  - Edit
+  - AskUserQuestion
+  - Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" *)
+  - Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/fleet *)
+  - Bash(herdr pane read *)
+---
+
+# Clean up lanes
+
+A lane is a linked git worktree that is open as a Herdr workspace, that sits in Herdr's worktrees directory, or that has a `.fleet/` folder. Removing a lane deletes its folder. Remove nothing until the user picks the lanes in step 2.
+
+## 1. Look
+
+1. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" conventions`. Note each cleanup command under `## Projects`.
+2. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" sweep`. It only reads. It puts every lane on this machine in a group, with the reason on its row:
+   - **READY**: its pull request merged, or, without one, its branch is in the default branch; or it is a detached checkout whose commit a branch holds. The worktree is clean, no agent works in it, and no commit is missing from the merge. `cleanup` removes these.
+   - **WAITING**: its pull request is open. The worktree stays for review fixes. `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" retire PANE` exits an idle agent there if the user wants the memory back.
+   - **KEEP**: uncommitted changes, an agent at work, a program running in a pane, commits that no merge or remote holds, no pull request, a closed pull request, or this session.
+   - **OTHER WORKTREES**: worktrees that other tools or the user made (the Codex app, Claude Code agents, sibling checkouts). Never remove them.
+3. When the arguments name lanes, consider only those.
+4. Read your `.fleet/FLEET.md`, if you keep one. A lane that it lists as in progress stays, whatever the sweep says: a READY lane without a pull request (`in main`) can be a lane that has not committed yet.
+
+## 2. Ask
+
+Show the groups in a short table. Then ask with AskUserQuestion. Name the lanes in each question: the user may see only the dialog.
+
+1. Which lanes: "All N ready lanes: <targets> (Recommended)", a subset that makes sense (for example "Only the merged ones"), "None now". The user can name targets under Other.
+2. Only when the user asks about KEEP lanes whose sole reason is a missing merge (no pull request, a closed one, or commits not pushed): offer them with `--unmerged`. Their worktrees go and their branches stay.
+3. When `## Projects` names a cleanup command for a repository among the chosen lanes: "Run <command> in <folder> afterwards (Recommended)", "Skip it".
+
+## 3. Remove
+
+1. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" cleanup <target> [<target> ...]`. Targets are the workspace ids and paths that the sweep printed. Add `--unmerged` only for lanes that the user chose under that option.
+   - It checks every target again before it changes anything. When a target is no longer ready, it changes nothing and prints `refused` with the reasons. Show them, and sweep again.
+   - For each lane in turn, it exits the agents, copies `.fleet/` (without `panes.json`) to the archive path that it prints (by default under `~/.local/state/fleet/archive/`), removes the worktree (Herdr closes the workspace and its panes), and deletes the local branch only when the merge holds every commit. It never pushes, and never deletes a remote branch.
+   - An agent that does not exit stops its lane, and that worktree stays. Read the pane with `herdr pane read <pane> --source recent-unwrapped --lines 80`, and tell the user.
+2. Run each project cleanup command that the user agreed to, in the folder that the conventions name.
+
+## 4. Record and report
+
+- In FLEET.md, mark each removed lane as cleaned, with its archive path.
+- Report one line per lane: removed or not, the branch deleted or kept (with the reason), the archive. Then the result of each project cleanup command.

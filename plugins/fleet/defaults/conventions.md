@@ -19,3 +19,8 @@
 - Use /compact only when an agent cannot stop at a boundary.
 - Hand the orchestrator off to a new pane when its context passes about 70 %.
 - New panes split beside the caller (right when the pane is wide, down when it is tall). Lanes get their own worktree workspace.
+
+## Projects
+<!-- Optional notes per repository: setup and check commands, the base branch, and a cleanup command that
+     /fleet:cleanup offers after it removes lanes. For example:
+- my-app: base branch main. Checks: `make check`. After lanes are removed, run `make prune-test-dbs` in the main checkout. -->

@@ -57,7 +57,7 @@ Call 3, verification, context and accounts:
    - `## Critic`: which agents, with their model and effort; what the critic writes; the stop rule. A Claude critic uses the implementers' Claude model and effort unless the user says otherwise. Write that into the file.
    - `## Context and handoff`: the reset threshold, when to compact, when to hand off, where new panes go.
    - `## Accounts`: **remuda mode only.** First list each account as `account — plan — what it is for`. Then write the user's rules in their words: which account the orchestrator, implementers and critics use, when to switch, and the usage level at which to skip an account (default: skip an account above 85 % of a limit in `fleet accounts`). In plain mode, leave this section out.
-   - `## Projects`: optional. Per-repository notes that the user gives: setup command, check command, base branch.
+   - `## Projects`: optional. Per-repository notes that the user gives: setup command, check command, base branch, and a cleanup command that `/fleet:cleanup` offers after it removes lanes (for example, one that drops the test databases of removed worktrees).
 3. Show the file. Tell the user that they can edit it in plain language at any time, and that the fleet skills read it each time they run.
 
 ## 4. Next steps
@@ -67,3 +67,4 @@ Give one line each:
 - `/fleet:handoff` moves this session to a new pane.
 - `/fleet:context` keeps context small.
 - `/fleet:accounts` shows accounts and usage (remuda mode only).
+- `/fleet:cleanup` removes finished lanes, after you pick them.
