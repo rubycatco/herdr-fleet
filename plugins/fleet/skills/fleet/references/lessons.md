@@ -12,7 +12,7 @@ Lessons from fleet runs that each cost hours. `fleet spawn`, `fleet send` and `f
 
 ## Starting agents
 
-- **The folder trust dialog defaults to "No, exit".** Pressing Enter on it exits Claude Code. `fleet spawn --accept-trust` selects "Yes" and should be used only for a worktree you just created.
+- **The folder trust dialog defaults to "No, exit".** Pressing Enter on it exits Claude Code. `fleet spawn --accept-trust` selects "Yes". Use it only for a worktree you just created, or a folder the fleet already works in. Trust is kept per account: a folder that one account trusts still shows the dialog to another, so an account switch usually needs `--accept-trust`.
 - **Codex starts slowly.** It reports `idle` while its MCP servers start (often 10 s or more), and it shows the launch prompt as sent before it works on it. It may also show an update menu: skip it with Down and Enter (`fleet spawn` does this). In the codex `/model` picker, a number key followed by Enter selects the highlighted row, not the numbered one. Use the arrow keys.
 - **First-run prompts.** A new Claude Code version can show a one-time "fullscreen renderer" question. Escape dismisses it (`fleet spawn` does this).
 - **New panes do not inherit your account.** A Herdr pane starts a fresh login shell. Bare `claude` uses the default config dir. `fleet spawn` passes your `CLAUDE_CONFIG_DIR` / `CODEX_HOME` on, or uses `remuda run <account>` in remuda mode.

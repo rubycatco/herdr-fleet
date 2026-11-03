@@ -39,11 +39,11 @@ Find a session id with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" status --j
 4. Start the successor beside this pane:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --split auto --name <label> [--role <pane_role>] \
-     [--account <account>] [--model <model>] [--permission-mode <mode>] \
+     [--account <account>] [--model <model>] [--permission-mode <mode>] --accept-trust \
      --prompt "Read <handoff_path> and continue the work it describes. You replace pane <your pane id>."
    ```
-   To resume instead: `spawn --split auto --name <label> --account <account> --resume <your session id> --prompt "You now run on <account> in a new pane. Continue where this conversation stopped."`
-   If you orchestrate, pass `--role orchestrator`.
+   To resume instead: `spawn --split auto --name <label> --account <account> --accept-trust --resume <your session id> --prompt "You now run on <account> in a new pane. Continue where this conversation stopped."`
+   If you orchestrate, pass `--role orchestrator`. Folder trust is kept per account, so another account can stop at the trust dialog; `--accept-trust` answers it, which is right here because this session already works in that folder.
 5. Check the result: `ok: true` and status `working`. Read the new pane once to see that it reads the handoff or continues the work.
 6. If you orchestrate, set the `Orchestrator:` line in FLEET.md to the new `pane_id`. The SessionStart hook then re-briefs the successor, not this pane.
 7. Tell the user: the new pane, account, model and handoff file. Then stop. Do no more work here: two sessions in one checkout conflict. Do not close this pane; the user closes it (`/exit`).
@@ -60,8 +60,8 @@ Find a session id with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" status --j
 5. Start the successor in the same pane:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --pane <pane> --role impl --name <label> --agent <agent> \
-     [--account <account>] [--model <model>] [--permission-mode <mode>] \
+     [--account <account>] [--model <model>] [--permission-mode <mode>] --accept-trust \
      --prompt "Read .fleet/HANDOFF.md, then .fleet/BRIEF.md and .fleet/STATUS.md, and continue this lane."
    ```
-   Account change only, with healthy context: skip steps 1 to 3. Note the lane's `session_id` from `status --json`, retire it, then `spawn --pane <pane> --role impl --account <account> --resume <session id> --prompt "Continue this lane from where you stopped."`.
+   Account change only, with healthy context: skip steps 1 to 3. Note the lane's `session_id` from `status --json`, retire it, then `spawn --pane <pane> --role impl --account <account> --accept-trust --resume <session id> --prompt "Continue this lane from where you stopped."`.
 6. Update the lane's row in FLEET.md: pane, account, model.
