@@ -41,6 +41,6 @@ Lessons from fleet runs that each cost hours. `fleet spawn`, `fleet send` and `f
 
 - `/exit` the agent (`fleet retire <pane> --close`) before you remove its worktree.
 - `herdr worktree remove --workspace <id>` removes the worktree and its workspace. It refuses a dirty worktree; check `git -C <path> status` before you ever pass `--force`.
-- Delete a lane branch only when `git cherry -v <base> <branch>` prints only `-` lines (needed after squash merges), then `git branch -D <branch>`.
+- Let `fleet cleanup` delete a lane branch. It deletes the branch only when the merge holds every commit, also after a squash or rebase merge. Do not use `git cherry` for this check: after a squash merge it marks the lane's commits `+` (not merged).
 - Run the project's own worktree cleanup (test databases, caches) if it documents one.
 - Do not close panes, tabs or workspaces you did not create.

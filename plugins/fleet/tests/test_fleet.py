@@ -348,6 +348,27 @@ class SweepTests(unittest.TestCase):
                          ("keep", ["PR #7 merged", "4 commits not pushed"]))
         self.assertEqual(fleet.classify(self.lane(pr=merged, ahead=None))[0], "keep")
 
+    def test_pr_commit_oids(self):
+        calls = []
+
+        def fake_run(cmd, timeout=30, input_text=None, env=None, cwd=None):
+            calls.append((cmd, cwd))
+            if cmd[3] == "boom":
+                raise fleet.FleetError("timed out")
+            return subprocess.CompletedProcess(cmd, 1 if cmd[3] == "gone" else 0, stdout="aa\nbb\n", stderr="")
+
+        pr = {"number": 5, "url": "https://example.com/o/r/pull/5"}
+        with mock.patch.object(fleet, "run", fake_run), mock.patch.object(fleet.shutil, "which", return_value="gh"):
+            self.assertEqual(fleet.pr_commit_oids("/w", pr), ["aa", "bb"])
+            self.assertEqual(calls[0], (["gh", "pr", "view", pr["url"], "--json", "commits",
+                                         "--jq", ".commits[].oid"], "/w"))
+            self.assertEqual(fleet.pr_commit_oids("/w", {"number": 5})[0], "aa")
+            self.assertEqual(calls[1][0][3], "5")
+            self.assertIsNone(fleet.pr_commit_oids("/w", {"number": 6, "url": "gone"}))
+            self.assertIsNone(fleet.pr_commit_oids("/w", {"number": 7, "url": "boom"}))
+        with mock.patch.object(fleet.shutil, "which", return_value=None):
+            self.assertIsNone(fleet.pr_commit_oids("/w", pr))
+
     def test_open_closed_missing_and_git_fallback(self):
         self.assertEqual(fleet.classify(self.lane(pr={"number": 8, "state": "OPEN"}, ahead=1)),
                          ("waiting", ["PR #8 open", "1 commit not pushed"]))
@@ -455,11 +476,14 @@ class LaneGitTests(unittest.TestCase):
         return subprocess.run(["git", *args], cwd=cwd, env=self.env, check=True, capture_output=True,
                               text=True).stdout.strip()
 
-    def facts(self, pr=None, caller_cwd=None):
+    def facts(self, pr=None, caller_cwd=None, commits=None):
         stub = {"workspace": None, "label": None, "path": str(self.lane_path), "panes": []}
         stub.update(fleet.repo_paths(stub["path"]))
         return fleet.finish_lane(fleet.lane_facts(stub, None, caller_cwd or self.tmp.name,
-                                                  lambda path, branch: (pr, None)))
+                                                  lambda path, branch: (pr, None), commits or self.no_gh))
+
+    def no_gh(self, path, pr):
+        self.fail(f"unexpected lookup of the commits of PR #{pr['number']}")
 
     def test_lane_from_open_to_merged(self):
         f = self.facts()
@@ -484,6 +508,43 @@ class LaneGitTests(unittest.TestCase):
         f = self.facts()
         self.assertEqual((f["verdict"], f["reasons"], f["delete_branch"]), ("ready", ["in main"], True))
         self.assertFalse(fleet.repo_paths(str(self.repo))["linked"])
+
+    def test_merged_pull_request_whose_head_is_not_in_the_clone(self):
+        origin = Path(self.tmp.name) / "origin.git"
+        self.git(self.tmp.name, "init", "-q", "--bare", str(origin))
+        self.git(self.repo, "remote", "add", "origin", str(origin))
+        self.git(self.repo, "push", "-q", "origin", "main")
+        self.git(self.lane_path, "commit", "-q", "--allow-empty", "-m", "a")
+        first = self.git(self.lane_path, "rev-parse", "HEAD")
+        self.git(self.lane_path, "commit", "-q", "--allow-empty", "-m", "b")
+        lane = set(self.git(self.lane_path, "rev-list", "HEAD", "--not", "--remotes").split())
+        # The head on GitHub is a merge commit that this clone never fetched, and the remote deleted the branch.
+        merged = {"number": 5, "state": "MERGED", "headRefOid": "f" * 40, "url": "https://example.com/pull/5"}
+        listed = lane | {"e" * 40}
+        f = self.facts(pr=merged, commits=lambda path, pr: listed)
+        self.assertEqual((f["verdict"], f["reasons"], f["delete_branch"]), ("ready", ["PR #5 merged"], True))
+        # A short list without HEAD: HEAD is not in the pull request, and only the commits not in it count.
+        f = self.facts(pr=merged, commits=lambda path, pr: [first])
+        self.assertEqual((f["verdict"], f["reasons"]), ("keep", ["PR #5 merged", "1 commit not pushed"]))
+        # A full page without HEAD can be cut short: nobody can tell.
+        page = [first] + [f"{i:040x}" for i in range(fleet.GH_COMMITS_PAGE - 1)]
+        f = self.facts(pr=merged, commits=lambda path, pr: page)
+        self.assertEqual((f["verdict"], f["reasons"]),
+                         ("keep", ["PR #5 merged", "cannot tell whether every commit is pushed"]))
+        # HEAD in a full page is still proof.
+        f = self.facts(pr=merged, commits=lambda path, pr: page + sorted(lane))
+        self.assertEqual((f["verdict"], f["delete_branch"]), ("ready", True))
+        # A commit after the merge keeps the lane.
+        self.git(self.lane_path, "commit", "-q", "--allow-empty", "-m", "c")
+        f = self.facts(pr=merged, commits=lambda path, pr: listed)
+        self.assertEqual((f["verdict"], f["reasons"]), ("keep", ["PR #5 merged", "1 commit not pushed"]))
+        # When gh cannot list the commits, every commit on no remote counts.
+        f = self.facts(pr=merged, commits=lambda path, pr: None)
+        self.assertEqual((f["verdict"], f["reasons"]), ("keep", ["PR #5 merged", "3 commits not pushed"]))
+        # A pushed lane with an open pull request needs no list.
+        self.git(self.lane_path, "push", "-q", "origin", "lane-a")
+        f = self.facts(pr={"number": 6, "state": "OPEN", "headRefOid": "d" * 40})
+        self.assertEqual((f["verdict"], f["reasons"]), ("waiting", ["PR #6 open"]))
 
     def test_detached_checkout(self):
         self.git(self.lane_path, "checkout", "-q", "--detach")
