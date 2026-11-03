@@ -308,7 +308,7 @@ class SpawnGateTests(unittest.TestCase):
         """Run spawn with herdr stubbed; returns (exit code, JSON out)."""
         pane_cwd = str(self.lane) if pane_cwd is None else pane_cwd
 
-        def create(args, cwd=None):
+        def create(args, cwd=None, info=None):
             self.made.append(cwd)
             return {"pane_id": "w1:p9", "workspace_id": "w1", "cwd": cwd or pane_cwd, "placement": "split"}
 
@@ -375,40 +375,48 @@ class SpawnGateTests(unittest.TestCase):
         self.plan.unlink()
         self.refused("--role", "impl", "--pane", "w1:p5", pane_cwd="", reason="herdr reports no directory")
 
-    def test_one_checked_directory_drives_an_existing_pane_spawn(self):
-        # The pane's shell changes directory between the gate's read and the launch: the launch still uses the
-        # directory that the gate checked, and cds there first.
+    def test_an_existing_pane_is_read_once(self):
+        # Through the real create_pane: one pane snapshot drives the gate, the registry, the event and the
+        # target, for a gated role and for another role. The launch command is the one 0.6.0 ran: no `cd`.
         other = self.root / "elsewhere"
         other.mkdir()
+        git("init", "-q", "-b", "main", cwd=other)
         self.plan.write_text("PLAN READY: 1\n")  # the lane's plan is not approved
-        snapshots = iter([{"cwd": str(other)}, {"cwd": str(self.lane)}])
-        runs = []
+        for role, pane in (("impl", "w1:p5"), ("critic", "w1:p6")):
+            reads, runs = [], []
 
-        def run(cmd, *a, **k):
-            if cmd[0] == "herdr":
-                runs.append(cmd)
-                return subprocess.CompletedProcess(cmd, 0, "{}", "")
-            return _guarded_run(cmd, *a, **k)
-        buf = io.StringIO()
-        with mock.patch.object(fleet, "require_herdr"), mock.patch.object(fleet, "run", run), \
-                mock.patch.object(fleet, "pane_info", side_effect=lambda p: next(snapshots, {"cwd": str(self.lane)})), \
-                mock.patch.object(fleet, "herdr_ok", return_value=True), chdir(self.root), redirect_stdout(buf):
-            code = fleet.main(["spawn", "--no-wait", "--pane", "w1:p5", "--role", "impl"])
-        out = json.loads(buf.getvalue())
-        self.assertEqual((code, out["cwd"]), (0, str(other)))
-        self.assertEqual(fleet.load_panes(self.fleet_dir), {})  # nothing registered in the unapproved lane
-        self.assertEqual(fleet.load_panes(other / ".fleet")["w1:p5"]["role"], "impl")
-        [launch] = [c for c in runs if c[:3] == ["herdr", "pane", "run"]]
-        self.assertTrue(launch[4].startswith(f"cd {fleet.shlex.quote(str(other))} && "), launch)
-        # Other roles launch as before, without the cd.
-        runs.clear()
-        snapshots = iter([{"cwd": str(self.lane)}] * 3)
-        with mock.patch.object(fleet, "require_herdr"), mock.patch.object(fleet, "run", run), \
-                mock.patch.object(fleet, "pane_info", side_effect=lambda p: next(snapshots)), \
-                mock.patch.object(fleet, "herdr_ok", return_value=True), chdir(self.root), redirect_stdout(io.StringIO()):
-            self.assertEqual(fleet.main(["spawn", "--no-wait", "--pane", "w1:p6", "--role", "critic"]), 0)
-        [launch] = [c for c in runs if c[:3] == ["herdr", "pane", "run"]]
-        self.assertFalse(launch[4].startswith("cd "))
+            def info(p):
+                reads.append(("read", p))
+                return {"cwd": str(other)} if len(reads) == 1 else {"cwd": str(self.lane)}
+
+            def run(cmd, *a, **k):
+                if cmd[0] == "herdr":
+                    runs.append(cmd)
+                    reads.append(tuple(cmd[:3]))
+                    return subprocess.CompletedProcess(cmd, 0, "{}", "")
+                return _guarded_run(cmd, *a, **k)
+            buf = io.StringIO()
+            argv = ["spawn", "--no-wait", "--pane", pane, "--role", role, "--prompt", "Read .fleet/BRIEF.md."]
+            with mock.patch.object(fleet, "require_herdr"), mock.patch.object(fleet, "run", run), \
+                    mock.patch.object(fleet, "pane_info", side_effect=info), \
+                    mock.patch.object(fleet, "herdr_ok", return_value=True), chdir(self.root), redirect_stdout(buf):
+                code = fleet.main(argv)
+            out = json.loads(buf.getvalue())
+            # One read before the launch; the read after it only looks up the new session, as in 0.6.0.
+            before = reads[:reads.index(("herdr", "pane", "run"))]
+            self.assertEqual((code, before, out["cwd"]), (0, [("read", pane)], str(other)), role)
+            self.assertEqual(fleet.load_panes(other / ".fleet")[pane]["role"], role)
+            self.assertNotIn(pane, fleet.load_panes(self.fleet_dir))
+            [event] = [e for e in fleet.read_events([fleet.project_for(str(other))])
+                       if e["event"] == "spawn" and e.get("pane") == pane]
+            self.assertEqual(event["cwd"], str(other))
+            # The launch equals the command that --dry-run prints for the same arguments.
+            dry = io.StringIO()
+            with chdir(self.root), redirect_stdout(dry):
+                fleet.main([a for a in argv if a != "--no-wait"] + ["--dry-run"])
+            [launch] = [c for c in runs if c[:3] == ["herdr", "pane", "run"]]
+            self.assertEqual(launch, ["herdr", "pane", "run", pane, json.loads(dry.getvalue())["command"]])
+            self.assertFalse(launch[4].startswith("cd "))
 
     def test_target_cwd_mirrors_create_pane(self):
         parse = lambda *argv: fleet.build_parser().parse_args(["spawn", *argv])

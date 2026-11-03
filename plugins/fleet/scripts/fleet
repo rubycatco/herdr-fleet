@@ -474,11 +474,12 @@ def cmd_worktree(args: argparse.Namespace) -> int:
     return 0
 
 
-def target_cwd(args: argparse.Namespace) -> str | None:
+def target_cwd(args: argparse.Namespace, info: dict | None = None) -> str | None:
     """The directory that `create_pane` will start the agent in, found before anything is created; None for a
-    new worktree (it has no lane files yet) and for a split with no pane to split (`create_pane` refuses it)."""
+    new worktree (it has no lane files yet) and for a split with no pane to split (`create_pane` refuses it).
+    `info`: the existing pane's `pane_info`, read once by the caller."""
     if args.pane:
-        return pane_info(args.pane).get("cwd")
+        return (info if info is not None else pane_info(args.pane)).get("cwd")
     if args.worktree:
         return None
     cwd = os.path.abspath(os.path.expanduser(args.cwd or os.getcwd()))
@@ -522,11 +523,12 @@ def plan_gate(cwd: str | None) -> tuple[str | None, Path | None, int | None]:
     return None, plan, n
 
 
-def create_pane(args: argparse.Namespace, cwd: str | None = None) -> dict:
+def create_pane(args: argparse.Namespace, cwd: str | None = None, info: dict | None = None) -> dict:
     """Create the pane the agent will run in. Returns ids and cwd. `cwd` is the directory that `target_cwd`
-    found (and the plan gate checked): the returned cwd, also for an existing pane."""
+    found (and the plan gate checked): the returned cwd, also for an existing pane. `info` is that pane's
+    snapshot, so that the pane is read once: the gate, the registry and the event use one directory."""
     if args.pane:
-        info = pane_info(args.pane)
+        info = info if info is not None else pane_info(args.pane)
         if info.get("agent"):
             raise FleetError(f"pane {args.pane} already runs {info['agent']}; pick a shell pane")
         return {"pane_id": args.pane, "tab_id": info.get("tab_id"), "workspace_id": info.get("workspace_id"),
@@ -667,16 +669,16 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         print(json.dumps({"dry_run": True, **launch, **({"task": task} if task else {})}, indent=2, ensure_ascii=False))
         return 0
     require_herdr()
-    cwd = target_cwd(args)
-    gated = args.role in GATED_ROLES
-    if gated:
+    info = pane_info(args.pane) if args.pane else None  # one snapshot of an existing pane
+    cwd = target_cwd(args, info)
+    if args.role in GATED_ROLES:
         if args.pane and not cwd:
             return refuse(reason=f"herdr reports no directory for pane {args.pane}, so the plan gate cannot be "
                                  "checked; pass a pane that herdr knows, or another placement", role=args.role)
         reason, plan, n = plan_gate(cwd)
         if reason:
             return refuse(reason=reason, role=args.role, cwd=cwd, plan=str(plan), round=n)
-    target = create_pane(args, cwd)
+    target = create_pane(args, cwd, info)
     pane = target["pane_id"]
     if args.name:
         herdr_ok("pane", "rename", pane, args.name)
@@ -686,11 +688,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         if task:
             entry["task"] = task
         target["registry"] = register_pane(target["cwd"], pane, entry)
-    command = launch["command"]
-    if gated and cwd:
-        # The checked directory is the launch's: the pane's shell may have changed directory since.
-        command = f"cd {shlex.quote(cwd)} && {command}"
-    run(["herdr", "pane", "run", pane, command])
+    run(["herdr", "pane", "run", pane, launch["command"]])
     # Record the launch now: the wait can take minutes, and the caller can stop the command during it.
     cwd = target.get("cwd")
     where = {"pane": pane, "workspace": target.get("workspace_id"), "cwd": cwd,
