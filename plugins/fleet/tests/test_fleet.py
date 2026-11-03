@@ -1194,6 +1194,114 @@ class MarkerTests(unittest.TestCase):
         self.assertIsNone(fleet.first_note("## Next step\nREADY FOR REVIEW: round 1\n", r"Next steps?"))
 
 
+class ApprovePlanTests(unittest.TestCase):
+    """approve-plan, the gate between a planner and the implementer: it refuses on every condition of the design,
+    and then writes neither PLAN.md nor the log."""
+
+    PLAN = "# Plan: x\n\nRisk: none\n\n## Approach\nDo it.\n\nPLAN READY: 1\n"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.patch = mock.patch.dict(os.environ, {"FLEET_HOME": str(self.root / "home")})
+        self.patch.start()
+        self.repo = self.root / "app"
+        self.repo.mkdir()
+        git("init", "-q", "-b", "main", cwd=self.repo)
+        (self.repo / "app.py").write_text("x = 1\n")
+        git("add", "app.py", cwd=self.repo)
+        git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "init", cwd=self.repo)
+        self.lane = self.root / "lane"
+        git("worktree", "add", "-q", "-b", "feat/lane", str(self.lane), cwd=self.repo)
+        self.plan = Path(fleet.prep_dir(str(self.lane))["fleet_dir"]) / "PLAN.md"
+
+    def tearDown(self):
+        self.patch.stop()
+        self.tmp.cleanup()
+
+    def approve(self, *argv, cwd=None):
+        buf = io.StringIO()
+        with chdir(cwd or self.lane), redirect_stdout(buf):
+            code = fleet.main(["approve-plan", *argv])
+        return code, json.loads(buf.getvalue())
+
+    def approvals(self):
+        home = fleet.project_for(str(self.repo))
+        return [e for e in fleet.read_events([home]) if e["event"] == "plan_approved"]
+
+    def refused(self, *argv, reason, cwd=None):
+        before = self.plan.read_bytes() if self.plan.is_file() else None
+        code, out = self.approve(*argv, cwd=cwd)
+        self.assertEqual((code, out["ok"], out["changed"]), (2, False, "nothing"), out)
+        self.assertIn(reason, out["reason"])
+        self.assertEqual(self.plan.read_bytes() if self.plan.is_file() else None, before)
+        self.assertEqual(self.approvals(), [])
+        return out
+
+    def test_refuses_without_a_plan_or_a_ready_round(self):
+        self.refused("--by", "user", reason="no .fleet/PLAN.md")
+        self.assertFalse(self.plan.exists())
+        self.plan.write_text("# Plan\n\nRisk: none\n\nPLAN READY: <n>\n")  # the template line is no round
+        self.refused("--by", "orch", reason="no PLAN READY line")
+        self.plan.write_text("Risk: none\n5. Then add PLAN READY: 1 and stop.\n")  # a sentence is no marker
+        self.refused("--by", "orch", reason="no PLAN READY line")
+        self.plan.write_text(self.PLAN)
+        self.refused("--by", "orch", "--round", "2", reason="no PLAN READY: 2 line")
+        self.refused("--by", "orch", reason="not in a git worktree", cwd=self.root)
+
+    def test_refuses_changes_outside_fleet(self):
+        self.plan.write_text(self.PLAN)
+        (self.lane / "app.py").write_text("x = 2\n")
+        out = self.refused("--by", "user", reason="1 changed file outside .fleet/")
+        self.assertEqual(out["changes"], 1)
+        git("checkout", "app.py", cwd=self.lane)
+        (self.lane / "new.py").write_text("")
+        self.refused("--by", "orch", reason="outside .fleet/")
+        (self.lane / "new.py").unlink()
+        (self.plan.parent / "notes.md").write_text("inside .fleet/ is fine")
+        self.assertEqual(self.approve("--by", "orch")[0], 0)
+
+    def test_risk_needs_the_user(self):
+        for risk in (None, "none | migration | auth-payments | deletion | hotfix", "migration", "auth-payments",
+                     "deletion", "hotfix", "low", "none, deletion"):
+            head = "" if risk is None else f"Risk: {risk}\n"
+            self.plan.write_text(f"# Plan\n{head}\n## Approach\nx\n\nPLAN READY: 1\n")
+            self.assertEqual(self.refused("--by", "orch", reason="Ask the user")["risk"], risk)
+        # A second Risk line that disagrees also needs the user.
+        self.plan.write_text("Risk: none\n## Risks\n- Risk: deletion of old rows\nPLAN READY: 1\n")
+        self.assertEqual(self.refused("--by", "orch", reason="Ask the user")["risk"], "none, deletion of old rows")
+        self.plan.write_text("# Plan\n**Risk:** `deletion`\n\nPLAN READY: 1\n")
+        code, out = self.approve("--by", "user")
+        self.assertEqual((code, out["ok"], out["risk"], out["round"]), (0, True, "deletion", 1))
+        self.assertRegex(self.plan.read_text().splitlines()[-1], r"^PLAN APPROVED: 1 by user \d{4}-\d\d-\d\dT")
+        self.assertEqual([(e["round"], e["approved_by"], e["risk"]) for e in self.approvals()], [(1, "user", "deletion")])
+
+    def test_orch_approves_a_low_risk_plan_once_per_round(self):
+        self.plan.write_text(self.PLAN.rstrip("\n"))  # no newline at the end
+        code, out = self.approve("--by", "orch")
+        self.assertEqual((code, out["ok"], out["round"], out["by"], out["risk"], out["branch"]),
+                         (0, True, 1, "orch", "none", "feat/lane"))
+        lines = self.plan.read_text().splitlines()
+        self.assertEqual(lines[-2], "PLAN READY: 1")
+        self.assertTrue(lines[-1].startswith("PLAN APPROVED: 1 by orch "))
+        [event] = self.approvals()
+        self.assertEqual((event["round"], event["approved_by"], event["risk"], event["branch"], event["lane"]),
+                         (1, "orch", "none", "feat/lane", str(self.lane)))
+        self.assertEqual(fleet.describe_event(event), "plan round 1 approved by orch, risk none")
+        # Approving the same round again refuses; the next round can be approved, also by --round.
+        before = self.plan.read_bytes()
+        code, out = self.approve("--by", "user")
+        self.assertEqual((code, out["changed"]), (2, "nothing"))
+        self.assertIn("already approved", out["reason"])
+        self.assertEqual(self.plan.read_bytes(), before)
+        with self.plan.open("a") as fh:
+            fh.write("\n## Changes\n- y\n\n- PLAN READY: 2\n")
+        self.assertIn("already approved", self.approve("--by", "orch", "--round", "1")[1]["reason"])
+        code, out = self.approve(str(self.lane), "--by", "orch", cwd=self.root)
+        self.assertEqual((code, out["round"]), (0, 2))
+        self.assertEqual([e["round"] for e in self.approvals()], [1, 2])
+
+
 class OrchTests(unittest.TestCase):
     """orch, board, digest and the orch re-brief, in a temporary FLEET_HOME. herdr and gh never run."""
 

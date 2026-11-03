@@ -24,6 +24,7 @@ Commands:
   fleet orch [show|claim|release]         the project's orchestrator pane, in its project home
   fleet board [--json]                    one row per lane of this project, with its phase
   fleet digest [--peek] [--json]          phase changes and events since the last digest
+  fleet approve-plan [DIR] --by orch|user approve the lane's .fleet/PLAN.md (refuses on changes or a risk)
   fleet hook session-start|session-end    hooks: record fleet sessions; re-brief the orch, and a lane after /clear
 
 Python 3.8+, standard library only.
@@ -1061,12 +1062,12 @@ PROJECTS_DIR = "projects"
 EVENTS_DIR = "events"
 PROJECT_FILE = "project.json"
 LOG_EVENTS = ("worktree", "spawn", "spawn_result", "send", "reset", "retire", "cleanup", "handoff",
-              "session_start", "session_end", "orch_claim", "orch_release", "phase")
+              "session_start", "session_end", "orch_claim", "orch_release", "phase", "plan_approved")
 HOOK_GIT_TIMEOUT = 1  # seconds for each git call in a hook; SessionEnd has 5 s in all, SessionStart 10 s
 # Types of the event fields that are not text. `fleet log` drops a field of another type, so one damaged
 # line cannot break it. Add each new field that is not text here.
 EVENT_FIELD_TYPES = {"ok": bool, "closed": bool, "removed": bool, "replace": bool, "force": bool, "by": dict,
-                     "exited": list, "reasons": list}
+                     "exited": list, "reasons": list, "round": int}
 
 
 def fleet_home() -> Path:
@@ -1411,6 +1412,8 @@ def describe_event(e: dict) -> str:
         text = f"orch pane {e.get('old') or '-'} -> {e.get('pane') or '-'}" + (" (replace)" if e.get("replace") else "")
     elif kind == "orch_release":
         text = f"released orch pane {e.get('pane') or '-'}" + (" (force)" if e.get("force") else "")
+    elif kind == "plan_approved":
+        text = f"plan round {e.get('round', '?')} approved by {e.get('approved_by') or '?'}, risk {e.get('risk') or '?'}"
     elif kind == "phase":
         text = f"{e.get('name') or e.get('branch') or short_path(e.get('lane') or '')}: {e.get('old') or 'new'} -> {e.get('new')}"
     elif kind in ("session_start", "session_end"):
@@ -2192,6 +2195,13 @@ def marker_line(marker: str) -> str:
 
 
 READY_LINE = re.compile(marker_line(r"READY FOR REVIEW: round (\d+)"), re.M)
+PLAN_FILE = "PLAN.md"
+PLAN_READY_LINE = re.compile(marker_line(r"PLAN READY: (\d+)"), re.M)
+PLAN_APPROVED_LINE = re.compile(marker_line(r"PLAN APPROVED: (\d+)"), re.M)
+RESEARCH_DIR = "research"
+RESEARCH_DONE_LINE = re.compile(marker_line("RESEARCH DONE"), re.M)
+RISK_LINE = re.compile(r"^[^\w\n]*Risk[*_`]*:[*_`]*[ \t]*(.*)$", re.M)
+RISKS = ("none", "migration", "auth-payments", "deletion", "hotfix")  # only `none` is low risk
 EMPTY_NOTE = re.compile(r"^(?:[-*]\s*)?(?:none\.?|<[^>]*>)?$", re.I)  # "-", "none", "- none", a template "<...>"
 HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 
@@ -3231,6 +3241,76 @@ def cmd_accounts(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# approve-plan: the gate between a planner and the implementer
+
+
+def plan_rounds(text: str) -> tuple[list[int], set[int]]:
+    """The rounds of a PLAN.md: those with a `PLAN READY: <n>` line, and those with a `PLAN APPROVED: <n>` line."""
+    return ([int(n) for n in PLAN_READY_LINE.findall(text)], {int(n) for n in PLAN_APPROVED_LINE.findall(text)})
+
+
+def plan_risk(text: str) -> tuple[str | None, bool]:
+    """(the value of the `Risk:` lines, low risk). Low risk only when every `Risk:` line says exactly `none`; a
+    missing line, the template's list of values, or an unknown or second value needs the user."""
+    values = []
+    for raw in RISK_LINE.findall(text):
+        value = re.sub(r"[*_`]", "", raw).strip().rstrip(".").strip().lower()
+        if value not in values:
+            values.append(value)
+    if not values:
+        return None, False
+    return ", ".join(values), values == ["none"]
+
+
+def cmd_approve_plan(args: argparse.Namespace) -> int:
+    """Append `PLAN APPROVED: <n> by <who> <date>` to the lane's PLAN.md. It refuses, and writes nothing, unless
+    round n is ready and not yet approved, the worktree has no change outside .fleet/, and the risk is `none`
+    or the user approves."""
+    start = os.path.abspath(os.path.expanduser(args.dir or os.getcwd()))
+    top = git_toplevel(start) if os.path.isdir(start) else None
+    if not top:
+        return refuse(reason=f"{start} is not in a git worktree")
+    plan = Path(top) / FLEET_DIR / PLAN_FILE
+    out = {"plan": str(plan), "by": args.by}
+    if not plan.is_file():
+        return refuse(**out, reason=f"no {FLEET_DIR}/{PLAN_FILE} in {top}")
+    text = read_text(plan)
+    ready, approved = plan_rounds(text)
+    if args.round is not None:
+        if args.round not in ready:
+            return refuse(**out, reason=f"{PLAN_FILE} has no PLAN READY: {args.round} line")
+        n = args.round
+    elif ready:
+        n = max(ready)
+    else:
+        return refuse(**out, reason=f"{PLAN_FILE} has no PLAN READY line: the planner has not finished")
+    out["round"] = n
+    if n in approved:
+        return refuse(**out, reason=f"round {n} of the plan is already approved")
+    status = run_git(top, "status", "--porcelain")
+    if status is None or status.returncode != 0:
+        return refuse(**out, reason="git status failed, so the worktree cannot be checked")
+    dirty = count_dirty(status.stdout)
+    if dirty:
+        return refuse(**out, reason=f"the worktree has {plural(dirty, 'changed file')} outside {FLEET_DIR}/: a "
+                                    f"planner changes no file except {PLAN_FILE}", changes=dirty)
+    risk, low = plan_risk(text)
+    out["risk"] = risk
+    if not low and args.by != "user":
+        why = "has no Risk: line" if risk is None else f"says Risk: {risk}"
+        return refuse(**out, reason=f"{PLAN_FILE} {why}; only Risk: none can be approved by the orch. Ask the "
+                                    "user, then pass --by user")
+    line = f"PLAN APPROVED: {n} by {args.by} {now_iso()}"
+    with plan.open("a") as fh:
+        fh.write(("" if not text or text.endswith("\n") else "\n") + line + "\n")
+    branch = git_branch(top) or None
+    record("plan_approved", top, lane=top, cwd=top, branch=branch, workspace=os.environ.get("HERDR_WORKSPACE_ID"),
+           round=n, approved_by=args.by, risk=risk)
+    print(json.dumps({"ok": True, **out, "lane": top, "branch": branch, "line": line}, indent=2, ensure_ascii=False))
+    return 0
+
+
+# --------------------------------------------------------------------------
 # hook session-start
 
 
@@ -3531,6 +3611,17 @@ def build_parser() -> argparse.ArgumentParser:
     dg.add_argument("--project", help="a project name (default: the project of this directory)")
     dg.add_argument("--json", action="store_true")
     dg.set_defaults(func=cmd_digest)
+
+    ap = sub.add_parser("approve-plan", help="approve the newest round of the lane's .fleet/PLAN.md (the plan gate)",
+                        description="Appends 'PLAN APPROVED: <n> by <who> <date>' and records plan_approved. It "
+                                    "refuses, changing nothing, when PLAN.md is missing, has no 'PLAN READY: <n>' "
+                                    "line (for --round N), already approves round n, the worktree has changes "
+                                    "outside .fleet/, or the Risk: line is not 'none' and --by is not user.")
+    ap.add_argument("dir", nargs="?", help="the lane's worktree (default: the git top of the current directory)")
+    ap.add_argument("--by", choices=("orch", "user"), required=True,
+                    help="who approves: user only after the user said yes; a risk other than none needs it")
+    ap.add_argument("--round", type=int, metavar="N", help="the round to approve (default: the newest)")
+    ap.set_defaults(func=cmd_approve_plan)
 
     h = sub.add_parser("hook", help="hook handlers")
     h.add_argument("event", choices=("session-start", "session-end"))
