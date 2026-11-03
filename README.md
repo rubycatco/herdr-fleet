@@ -2,6 +2,62 @@
 
 A Claude Code plugin for running fleets of coding-agent lanes in [Herdr](https://herdr.dev) panes. It opens lanes (worktree, brief, implementer pane), runs critic review rounds, keeps context small with `/clear` and `/compact`, and hands work off to a new pane. [remuda](https://github.com/ya-luotao/remuda) is optional: with it, lanes can run on different Claude and Codex accounts; without it, every lane uses the agent's own login and nothing switches accounts.
 
+## How it works
+
+You talk to one Claude Code session, the orchestrator. It opens each lane in its own git worktree and Herdr workspace, starts the agents there, and drives them. The agents report through files in `.fleet/`. In the diagrams, `/fleet:<skill>` is a skill, and `fleet <command>` is the helper CLI that the skills call (`plugins/fleet/scripts/fleet`).
+
+```text
+┌─ Herdr ──────────────────────────────────────────────────────────────────────┐
+│                                                                              │
+│  workspace: my-repo                 workspace: fix-login  (git worktree)     │
+│  ┌──────────────────────────┐       ┌───────────────────┬──────────────────┐ │
+│  │ orchestrator             │       │ implementer       │ critic           │ │
+│  │ you + Claude Code        │ spawn │ Claude Code       │ Codex or Claude  │ │
+│  │ fleet skills             │──────>│                   │ (review rounds)  │ │
+│  │ fleet helper CLI         │ send  │ reads BRIEF.md    │ reads the diff   │ │
+│  │                          │       │ writes STATUS.md  │ writes REVIEW-n  │ │
+│  │ .fleet/FLEET.md          │<──────│                   │                  │ │
+│  │                          │ watch │                   │                  │ │
+│  └──────────────────────────┘       └───────────────────┴──────────────────┘ │
+│                                                                              │
+│                                     workspace: add-export  (another lane)    │
+│                                     ┌───────────────────┐                    │
+│                                     │ implementer       │                    │
+│                                     └───────────────────┘                    │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+One lane from start to finish. You type the first command; the orchestrator does the rest and asks you only for decisions. The thresholds and the stop rule are defaults; your conventions file can change them.
+
+```text
+setup (once)
+  /fleet:onboard ─> ~/.config/fleet/conventions.md (every skill reads it)
+
+/fleet:lane "fix the login redirect"    <── you type this
+  ├─ fleet worktree    branch, git worktree, its own Herdr workspace
+  ├─ BRIEF.md          goal, scope, acceptance, checks
+  ├─ fleet spawn       implementer: plan ─> code and commit ─> checks
+  └─ fleet watch       waits for "READY FOR REVIEW: round 1"
+        │
+        ▼              from here on, the orchestrator drives
+/fleet:review <─────────────────────────────────────────────────┐
+  ├─ REVIEW-REQUEST-n  diff range, focus, round rule            │
+  ├─ fleet spawn       critic: reads the diff, writes REVIEW-n  │
+  ├─ rulings           fix / decline / ask you                  │
+  └─ fleet send, watch implementer: fixes, commits, round n+1 ──┘
+        │              repeats until APPROVE or the stop rule
+        ▼
+push, open the PR, merge per your rules
+  └─ fleet retire ─> herdr worktree remove
+
+along the way
+  a lane asks or blocks   fleet watch returns; orchestrator answers or asks you
+  a lane's context fills  at ~60 %: fleet reset at a commit, /clear, re-brief
+  your session fills up   at ~70 %: /fleet:handoff to a successor in a new pane
+  an account runs low     /fleet:accounts, then /fleet:handoff self <account>
+                          (remuda only; plain mode never switches accounts)
+```
+
 ## Requirements
 
 - Herdr 0.9 or later, with Claude Code running inside a Herdr pane (`HERDR_ENV=1`).
