@@ -3773,8 +3773,8 @@ def cmd_approve_plan(args: argparse.Namespace) -> int:
 # risk: the lane's real changes against the high-risk patterns, and the user's yes for them
 
 RISK_FILE = "RISK.md"
-RISK_APPROVED_LINE = re.compile(marker_line(r"RISK APPROVED: (migration|auth-payments|deletion|hotfix) (.+?) by user "
-                                            r"(\S+)") + r"[ \t]*$", re.M)
+RISK_APPROVED_LINE = re.compile(marker_line(rf"RISK APPROVED: ({'|'.join(RISK_CATEGORIES)}) (.+?) by user (\S+)")
+                                + r"[ \t]*$", re.M)
 
 
 def risk_approvals(fleet_dir: Path) -> set[tuple[str, str]]:
