@@ -268,7 +268,7 @@ class LaunchTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"FLEET_NO_REMUDA": "1"}), mock.patch.object(fleet, "run", fake_run), \
                     mock.patch.object(fleet, "require_herdr"), mock.patch.object(fleet, "create_pane", return_value=target), \
                     mock.patch.object(fleet, "pane_info", return_value={}), redirect_stdout(buf):
-                rc = fleet.main(["spawn", "--role", "researcher", "--task", str(task), "--no-wait",
+                rc = fleet.main(["spawn", "--role", "researcher", "--task", str(task), "--no-wait", "--cwd", str(repo),
                                  "--prompt", f"Read {task} and follow it."])
             self.assertEqual(rc, 0)
             entry = fleet.load_panes(repo / ".fleet")["w2:p5"]
@@ -280,8 +280,117 @@ class LaunchTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"FLEET_NO_REMUDA": "1"}), mock.patch.object(fleet, "run", fake_run), \
                     mock.patch.object(fleet, "require_herdr"), mock.patch.object(fleet, "create_pane", return_value=target), \
                     mock.patch.object(fleet, "pane_info", return_value={}), redirect_stdout(io.StringIO()):
-                fleet.main(["spawn", "--role", "impl", "--no-wait"])
+                fleet.main(["spawn", "--role", "impl", "--no-wait", "--cwd", str(repo)])
             self.assertNotIn("task", fleet.load_panes(repo / ".fleet")["w2:p6"])
+
+
+class SpawnGateTests(unittest.TestCase):
+    """spawn refuses an implementer in a lane whose PLAN.md is not approved, before it creates anything."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.env = mock.patch.dict(os.environ, {"FLEET_HOME": str(self.root / "home"), "FLEET_NO_REMUDA": "1",
+                                                "HERDR_PANE_ID": "w1:p1"})
+        self.env.start()
+        self.lane = self.root / "lane"
+        self.lane.mkdir()
+        git("init", "-q", "-b", "feat/x", cwd=self.lane)
+        self.fleet_dir = Path(fleet.prep_dir(str(self.lane))["fleet_dir"])
+        self.plan = self.fleet_dir / "PLAN.md"
+        self.made = []
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def spawn(self, *argv, pane_cwd=None):
+        """Run spawn with herdr stubbed; returns (exit code, JSON out)."""
+        pane_cwd = str(self.lane) if pane_cwd is None else pane_cwd
+
+        def create(args, cwd=None):
+            self.made.append(cwd)
+            return {"pane_id": "w1:p9", "workspace_id": "w1", "cwd": cwd or pane_cwd, "placement": "split"}
+
+        def run(cmd, *a, **k):
+            if cmd[0] == "herdr":
+                return subprocess.CompletedProcess(cmd, 0, "{}", "")
+            return _guarded_run(cmd, *a, **k)
+        buf = io.StringIO()
+        with mock.patch.object(fleet, "require_herdr"), mock.patch.object(fleet, "run", run), \
+                mock.patch.object(fleet, "create_pane", side_effect=create), \
+                mock.patch.object(fleet, "pane_info", return_value={"cwd": pane_cwd}), \
+                mock.patch.object(fleet, "herdr_ok", return_value=True), chdir(self.root), redirect_stdout(buf):
+            code = fleet.main(["spawn", "--no-wait", *argv])
+        return code, json.loads(buf.getvalue())
+
+    def events(self):
+        return [e["event"] for e in fleet.read_events([fleet.project_for(str(self.lane))])]
+
+    def refused(self, *argv, reason, **kw):
+        code, out = self.spawn(*argv, **kw)
+        self.assertEqual((code, out["ok"], out["changed"]), (2, False, "nothing"), out)
+        self.assertIn(reason, out["reason"])
+        self.assertEqual(self.made, [])  # no pane
+        self.assertEqual(fleet.load_panes(self.fleet_dir), {})  # no registry entry
+        self.assertEqual(self.events(), [])  # no event
+        return out
+
+    def test_impl_and_no_role_wait_for_the_approved_round(self):
+        for argv in (["--role", "impl"], []):
+            self.plan.write_text("# Plan\nRisk: none\nPLAN READY: <n>\n")  # the template: no round yet
+            out = self.refused(*argv, reason="has no PLAN READY line: the planner has not finished")
+            self.assertEqual((out["plan"], out["round"]), (str(self.plan), None))
+            self.plan.write_text("PLAN READY: 1\nPLAN APPROVED: 1 by orch 2026\nPLAN READY: 2\n")
+            self.assertEqual(self.refused(*argv, reason="round 2 of")["round"], 2)
+            self.refused(*argv, "--pane", "w1:p5", reason="round 2 of")  # in an existing pane
+            self.refused(*argv, "--cwd", str(self.lane / ".fleet"), reason="round 2 of")  # below the git top
+        self.plan.write_text("PLAN READY: 1\nPLAN APPROVED: 1 by orch 2026\nPLAN READY: 2\nPLAN APPROVED: 2 by user\n")
+        code, out = self.spawn("--role", "impl")
+        self.assertEqual((code, out["ok"], self.made), (0, True, [str(self.lane)]))
+        self.assertEqual(fleet.load_panes(self.fleet_dir)["w1:p9"]["role"], "impl")
+        self.assertEqual(self.events(), ["spawn", "spawn_result"])
+
+    def test_other_roles_and_lanes_without_a_plan_pass(self):
+        self.plan.write_text("PLAN READY: 1\n")
+        for role in ("planner", "critic", "helper", "researcher", "orchestrator"):
+            self.assertEqual(self.spawn("--role", role)[0], 0, role)
+        self.plan.unlink()
+        self.assertEqual(self.spawn("--role", "impl")[0], 0)
+        self.assertEqual(self.spawn("--role", "impl", pane_cwd=str(self.root))[0], 0)  # not a git checkout
+
+    def test_dry_run_and_a_pane_herdr_cannot_place(self):
+        self.plan.write_text("PLAN READY: 1\n")
+        buf = io.StringIO()
+        with chdir(self.lane), redirect_stdout(buf):
+            self.assertEqual(fleet.main(["spawn", "--dry-run", "--role", "impl"]), 0)  # it checks nothing
+        self.plan.unlink()
+        self.refused("--role", "impl", "--pane", "w1:p5", pane_cwd="", reason="herdr reports no directory")
+
+    def test_target_cwd_mirrors_create_pane(self):
+        parse = lambda *argv: fleet.build_parser().parse_args(["spawn", *argv])
+        with mock.patch.object(fleet, "pane_info", return_value={"cwd": "/src/pane"}) as info, chdir(self.root):
+            self.assertEqual(fleet.target_cwd(parse("--pane", "w1:p5")), "/src/pane")
+            self.assertIsNone(fleet.target_cwd(parse("--worktree", "feat/y")))
+            self.assertEqual(fleet.target_cwd(parse("--tab")), str(self.root))
+            self.assertEqual(fleet.target_cwd(parse("--new-workspace", "--cwd", "/a/b")), "/a/b")
+            self.assertEqual(fleet.target_cwd(parse("--cwd", "/a/b")), "/a/b")  # a split with --cwd
+            self.assertEqual(fleet.target_cwd(parse("--from", "w3:p3")), "/src/pane")  # the split pane's directory
+            self.assertEqual(info.call_args_list[-1][0], ("w3:p3",))
+            with mock.patch.dict(os.environ, {"HERDR_PANE_ID": ""}):
+                self.assertIsNone(fleet.target_cwd(parse()))  # nothing to split: create_pane refuses
+        # create_pane starts the split in the directory that target_cwd found.
+        calls = []
+
+        def herdr(*argv, **kw):
+            calls.append(argv)
+            return {"pane": {"pane_id": "w1:p7"}}
+        with mock.patch.object(fleet, "herdr", side_effect=herdr), mock.patch.object(fleet, "pane_rect"), \
+                mock.patch.object(fleet, "auto_direction", return_value="right"), \
+                mock.patch.object(fleet, "find_pane_id", return_value="w1:p7"):
+            out = fleet.create_pane(parse("--from", "w3:p3"), "/src/pane")
+        self.assertEqual((out["cwd"], calls[0][:4], calls[0][calls[0].index("--cwd") + 1]),
+                         ("/src/pane", ("pane", "split", "w3:p3", "--direction"), "/src/pane"))
 
 
 class ScreenTests(unittest.TestCase):

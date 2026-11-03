@@ -470,8 +470,48 @@ def cmd_worktree(args: argparse.Namespace) -> int:
     return 0
 
 
-def create_pane(args: argparse.Namespace) -> dict:
-    """Create the pane the agent will run in. Returns ids and cwd."""
+def target_cwd(args: argparse.Namespace) -> str | None:
+    """The directory that `create_pane` will start the agent in, found before anything is created; None for a
+    new worktree (it has no lane files yet) and for a split with no pane to split (`create_pane` refuses it)."""
+    if args.pane:
+        return pane_info(args.pane).get("cwd")
+    if args.worktree:
+        return None
+    cwd = os.path.abspath(os.path.expanduser(args.cwd or os.getcwd()))
+    if args.tab or args.new_workspace or args.cwd:
+        return cwd
+    source = args.from_pane or os.environ.get("HERDR_PANE_ID")
+    if not source:
+        return None
+    # A split works where the pane it splits works (a critic next to its lane).
+    return pane_info(source).get("cwd") or cwd
+
+
+GATED_ROLES = ("impl", None)  # the roles that wait for an approved plan; the board counts no role as the implementer
+
+
+def plan_gate(cwd: str | None) -> tuple[str | None, Path | None, int | None]:
+    """(why an implementer may not start in `cwd` yet, the PLAN.md, its newest ready round). The reason is None
+    when the checkout has no .fleet/PLAN.md, or when the newest `PLAN READY: <n>` round has its
+    `PLAN APPROVED: <n>` line."""
+    top = git_toplevel(cwd) if cwd and os.path.isdir(cwd) else None
+    plan = Path(top) / FLEET_DIR / PLAN_FILE if top else None
+    if plan is None or not plan.is_file():
+        return None, None, None
+    ready, approved = plan_rounds(read_text(plan))
+    if not ready:
+        return (f"{plan} has no PLAN READY line: the planner has not finished, so no implementer starts. Approve "
+                "the plan first, or remove PLAN.md on purpose"), plan, None
+    n = max(ready)
+    if n not in approved:
+        return (f"round {n} of {plan} is not approved: run approve-plan (the user approves a high-risk plan) "
+                "before an implementer starts, or remove PLAN.md on purpose"), plan, n
+    return None, plan, n
+
+
+def create_pane(args: argparse.Namespace, cwd: str | None = None) -> dict:
+    """Create the pane the agent will run in. Returns ids and cwd. `cwd` is the directory that `target_cwd`
+    found for a split, tab or workspace."""
     if args.pane:
         info = pane_info(args.pane)
         if info.get("agent"):
@@ -480,7 +520,7 @@ def create_pane(args: argparse.Namespace) -> dict:
                 "cwd": info.get("cwd"), "placement": "existing pane"}
     if args.worktree:
         return create_worktree(args.worktree, args.base, args.repo, args.name)
-    cwd = os.path.abspath(os.path.expanduser(args.cwd or os.getcwd()))
+    cwd = cwd or os.path.abspath(os.path.expanduser(args.cwd or os.getcwd()))
     if args.tab:
         cmd = ["tab", "create", "--cwd", cwd, "--no-focus"]
         workspace = args.workspace or os.environ.get("HERDR_WORKSPACE_ID")
@@ -502,9 +542,6 @@ def create_pane(args: argparse.Namespace) -> dict:
     source = args.from_pane or os.environ.get("HERDR_PANE_ID")
     if not source:
         raise FleetError("no pane to split from: pass --from PANE or run inside Herdr")
-    if not args.cwd:
-        # A split works where the pane it splits works (a critic next to its lane).
-        cwd = pane_info(source).get("cwd") or cwd
     direction = args.split
     if direction == "auto":
         direction = auto_direction(pane_rect(source))
@@ -617,7 +654,15 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         print(json.dumps({"dry_run": True, **launch, **({"task": task} if task else {})}, indent=2, ensure_ascii=False))
         return 0
     require_herdr()
-    target = create_pane(args)
+    cwd = target_cwd(args)
+    if args.role in GATED_ROLES:
+        if args.pane and not cwd:
+            return refuse(reason=f"herdr reports no directory for pane {args.pane}, so the plan gate cannot be "
+                                 "checked; pass a pane that herdr knows, or another placement", role=args.role)
+        reason, plan, n = plan_gate(cwd)
+        if reason:
+            return refuse(reason=reason, role=args.role, cwd=cwd, plan=str(plan), round=n)
+    target = create_pane(args, cwd)
     pane = target["pane_id"]
     if args.name:
         herdr_ok("pane", "rename", pane, args.name)
@@ -3853,7 +3898,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--effort", help="reasoning effort, e.g. high or max (claude --effort; codex model_reasoning_effort)")
     s.add_argument("--permission-mode", help="claude --permission-mode")
     s.add_argument("--name", help="pane label, and the claude session name")
-    s.add_argument("--role", choices=ROLES, help="record the pane's role in .fleet/panes.json (the hook reads it)")
+    s.add_argument("--role", choices=ROLES,
+                   help="record the pane's role in .fleet/panes.json (the hook reads it). With impl, or with no "
+                        "role, spawn refuses while the lane's .fleet/PLAN.md has no approved newest round")
     s.add_argument("--task", metavar="FILE",
                    help="the pane's task file, kept as an absolute path with its role; after /clear or compaction "
                         "the hook tells a researcher or helper to re-read it (needs --role)")
