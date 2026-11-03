@@ -37,7 +37,7 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 FLEET_DIR = ".fleet"
 LANE_FILES = ("BRIEF.md", "STATUS.md", "HANDOFF.md")
@@ -55,10 +55,14 @@ REPLY_MARKS = ("⏺", "•")
 # Dialogs that block a freshly started agent.
 TRUST_DIALOG = re.compile(
     r"Yes, I trust this folder|Do you trust the files in this folder|"
-    r"allow Codex to work in this folder|Do you trust the contents of this directory",
+    r"allow Codex to work in this folder|Do you trust the contents of this directory|"
+    r"Trust this folder\?|Trust and continue",
     re.I,
 )
-TRUST_ACCEPT = re.compile(r"Yes, I trust this folder|Yes, allow Codex|^\s*(?:[❯›>]\s*)?(?:\d+\.\s*)?Yes\b", re.I)
+TRUST_ACCEPT = re.compile(
+    r"Yes, I trust this folder|Yes, allow Codex|Trust and continue|^\s*(?:[❯›>]\s*)?(?:\d+\.\s*)?Yes\b", re.I)
+# A highlighted, numbered menu option: some dialog is open, even one that this file does not know.
+MENU_SELECTED = re.compile(r"^\s*[❯›>]\s*\d+\.\s+\S.*$", re.M)
 FULLSCREEN_PROMPT = re.compile(r"fullscreen renderer", re.I)
 CODEX_UPDATE_MENU = re.compile(r"Update now", re.I)
 CODEX_UPDATE_SKIP = re.compile(r"^\s*(?:[❯›>]\s*)?(?:\d+\.\s*)?Skip\b", re.I)
@@ -74,9 +78,10 @@ class FleetError(Exception):
 # Process helpers
 
 
-def run(cmd: list[str], timeout: float = 30, input_text: str | None = None) -> subprocess.CompletedProcess:
+def run(cmd: list[str], timeout: float = 30, input_text: str | None = None,
+        env: dict | None = None) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=input_text)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=input_text, env=env)
     except FileNotFoundError:
         raise FleetError(f"{cmd[0]}: command not found")
     except subprocess.TimeoutExpired:
@@ -288,10 +293,22 @@ def caller_account(agent: str, accounts: list[dict], env: dict) -> dict | None:
     return None
 
 
-def agent_args(agent: str, model: str | None, permission_mode: str | None, name: str | None, extra: list[str]) -> list[str]:
+EFFORT_WORD = re.compile(r"[a-z]+")
+
+
+def agent_args(agent: str, model: str | None, permission_mode: str | None, name: str | None, extra: list[str],
+               effort: str | None = None) -> list[str]:
     args: list[str] = []
     if model:
         args += ["--model", model]
+    if effort:
+        if not EFFORT_WORD.fullmatch(effort):
+            raise FleetError(f"--effort takes one lowercase word such as high or max, not {effort!r}")
+        if agent == "claude":
+            args += ["--effort", effort]
+        else:
+            # Codex has no effort flag; a config override sets it for this session.
+            args += ["-c", f'model_reasoning_effort="{effort}"']
     if permission_mode:
         if agent != "claude":
             raise FleetError("--permission-mode applies to claude only; pass codex approval flags after --")
@@ -303,11 +320,11 @@ def agent_args(agent: str, model: str | None, permission_mode: str | None, name:
 
 def build_launch(agent: str, account: str | None, model: str | None, permission_mode: str | None,
                  name: str | None, prompt: str | None, extra: list[str],
-                 remuda: str | None, accounts: list[dict] | None, env: dict) -> dict:
+                 remuda: str | None, accounts: list[dict] | None, env: dict, effort: str | None = None) -> dict:
     """Return the shell command that starts the agent, and how its account was chosen."""
     if agent not in AGENTS:
         raise FleetError(f"--agent must be one of {', '.join(AGENTS)}")
-    args = agent_args(agent, model, permission_mode, name, extra)
+    args = agent_args(agent, model, permission_mode, name, extra, effort)
     tail = [prompt] if prompt else []
     var = HOME_VAR[agent]
     if not remuda:
@@ -521,6 +538,11 @@ def wait_for_start(pane: str, agent: str, prompt: str | None, accept_trust: bool
         if status == "blocked":
             idle_since = None
             continue
+        menu = MENU_SELECTED.search("\n".join(lines[-15:]))
+        if menu and status in ("idle", "done"):
+            # The state hook can report idle while a startup dialog waits.
+            return {"ok": False, "status": "blocked", "notes": notes,
+                    "reason": f"a dialog is open in the pane ({menu.group(0).strip()}); read the pane and answer it"}
         if not prompt:
             if status in ("idle", "done"):
                 return {"ok": True, "status": status, "notes": notes}
@@ -560,7 +582,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         # be running (a self-handoff) without two writers on one file.
         extra = ["--resume", args.resume, "--fork-session", *extra]
     launch = build_launch(agent, args.account, args.model, args.permission_mode, args.name, prompt,
-                          extra, remuda, accounts, dict(os.environ))
+                          extra, remuda, accounts, dict(os.environ), effort=args.effort)
     if args.resume and not transcript_visible(launch["home"], args.resume):
         who = launch["account"] or launch["home"]
         raise FleetError(f"{who} cannot see session {args.resume} (no transcript under {launch['home']}/projects); "
@@ -1081,9 +1103,135 @@ def conventions_path() -> Path:
     return Path(base).expanduser() / "fleet" / "conventions.md"
 
 
+TOML_STRING_KEY = re.compile(r"""^\s*([A-Za-z0-9_-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')\s*(?:#.*)?$""")
+HOOK_STATUS_LINE = re.compile(r"^(claude|codex):\s*(.+?)\s*\((/[^()]*)\)\s*$")
+
+
+def toml_top_level(text: str) -> dict:
+    """String keys of a TOML file that sit above its first [table] header."""
+    keys: dict = {}
+    for line in (text or "").splitlines():
+        if line.lstrip().startswith("["):
+            break
+        m = TOML_STRING_KEY.match(line)
+        if m:
+            keys[m.group(1)] = m.group(2) if m.group(2) is not None else m.group(3)
+    return keys
+
+
+def agent_defaults(agent: str, home: str) -> dict:
+    """The model and effort that an agent's config dir sets (None where it sets none)."""
+    base = Path(os.path.expanduser(home))
+    try:
+        if agent == "claude":
+            data = json.loads((base / "settings.json").read_text())
+            return {"model": data.get("model"), "effort": data.get("effortLevel")}
+        keys = toml_top_level((base / "config.toml").read_text(errors="replace"))
+        return {"model": keys.get("model"), "effort": keys.get("model_reasoning_effort")}
+    except (OSError, ValueError, AttributeError):
+        return {"model": None, "effort": None}
+
+
+def codex_models(home: str) -> list[dict]:
+    """The models that Codex lists, with their effort levels, from its models cache."""
+    try:
+        data = json.loads((Path(os.path.expanduser(home)) / "models_cache.json").read_text())
+    except (OSError, ValueError):
+        return []
+    rows = data.get("models") if isinstance(data, dict) else data
+    models = []
+    for m in rows if isinstance(rows, list) else []:
+        if not isinstance(m, dict) or m.get("visibility", "list") != "list":
+            continue
+        slug = m.get("slug") or m.get("id")
+        levels = [x.get("effort") if isinstance(x, dict) else x for x in m.get("supported_reasoning_levels") or []]
+        if slug:
+            models.append({"model": slug, "efforts": [x for x in levels if isinstance(x, str)],
+                           "default_effort": m.get("default_reasoning_level")})
+    return models
+
+
+def config_env(agent: str, home: str | None, env: dict) -> dict:
+    """`env` with the agent's config-dir variable set to `home` (unset for "default")."""
+    out = dict(env)
+    var = HOME_VAR[agent]
+    if not home or home == "default":
+        out.pop(var, None)
+    else:
+        out[var] = os.path.expanduser(home)
+    return out
+
+
+def parse_integration_status(text: str) -> dict:
+    """The claude and codex lines of `herdr integration status`, as {agent: {"status", "path"}}."""
+    found = {}
+    for line in (text or "").splitlines():
+        m = HOOK_STATUS_LINE.match(line.strip())
+        if m:
+            found[m.group(1)] = {"status": m.group(2), "path": m.group(3)}
+    return found
+
+
+def codex_hook_trusted(home: str) -> bool | None:
+    """Whether Codex runs Herdr's SessionStart hook in this home (None: no such hook found).
+
+    Codex runs a hook from hooks.json only after the user trusts it once; the trust
+    is a `[hooks.state."<hooks.json>:session_start:<group>:<index>"]` table in config.toml.
+    """
+    base = Path(os.path.expanduser(home))
+    hooks_file = base / "hooks.json"
+    try:
+        groups = (json.loads(hooks_file.read_text()).get("hooks") or {}).get("SessionStart") or []
+        config = (base / "config.toml").read_text(errors="replace")
+    except (OSError, ValueError, AttributeError):
+        return None
+    for i, group in enumerate(groups if isinstance(groups, list) else []):
+        for j, hook in enumerate((group or {}).get("hooks") or []):
+            if "herdr-agent-state" not in str((hook or {}).get("command", "")):
+                continue
+            parts = config.split(f'[hooks.state."{hooks_file}:session_start:{i}:{j}"]', 1)
+            if len(parts) < 2:
+                return False
+            table = parts[1].split("\n[", 1)[0]
+            return "trusted_hash" in table and not re.search(r"^\s*enabled\s*=\s*false", table, re.M)
+    return None
+
+
+def hook_install_command(agent: str, home: str | None) -> str:
+    command = f"herdr integration install {agent}"
+    if home and home != "default":
+        return f"{HOME_VAR[agent]}={shlex.quote(os.path.expanduser(home))} {command}"
+    return command
+
+
+def hook_report(herdr_bin: str, homes: list[dict], env: dict) -> list[dict]:
+    """Herdr's agent state hook in each config dir that a lane can run with.
+
+    Each remuda account has its own config dir, and the hook must be installed in
+    each one: `herdr integration status` checks only the dir that its environment names.
+    """
+    report = []
+    for h in homes:
+        try:
+            cp = run([herdr_bin, "integration", "status"], timeout=15, env=config_env(h["agent"], h["home"], env))
+            found = parse_integration_status(cp.stdout).get(h["agent"]) or {}
+        except FleetError:
+            found = {}
+        status = found.get("status")
+        ok = bool(status and status.startswith("current"))
+        fix = None if ok else hook_install_command(h["agent"], h["home"])
+        if ok and h["agent"] == "codex" and codex_hook_trusted(account_home("codex", {"home": h["home"]})) is False:
+            ok = False
+            status = f"{status}, not trusted by Codex"
+            fix = "start Codex on this account and trust the Herdr hook in its hooks review (t: trust all)"
+        report.append({**h, "status": status, "path": found.get("path"), "ok": ok, "fix": fix})
+    return report
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     herdr_bin = shutil.which("herdr")
     remuda = remuda_path()
+    env = dict(os.environ)
     accounts: list[dict] = []
     remuda_error = None
     if remuda:
@@ -1091,20 +1239,32 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             accounts = remuda_accounts(remuda)
         except FleetError as e:
             remuda_error = str(e)
-    claude = shutil.which("claude")
-    codex = shutil.which("codex")
+    accounts = [{**a, **agent_defaults(a["provider"], account_home(a["provider"], a))} if a["provider"] in AGENTS else a
+                for a in accounts]
+    installed = {agent: shutil.which(agent) for agent in AGENTS}
+    claude_home = env.get("CLAUDE_CONFIG_DIR") or DEFAULT_HOME["claude"]
+    codex_home = env.get("CODEX_HOME") or DEFAULT_HOME["codex"]
+    if accounts:
+        homes = [{"agent": a["provider"], "account": a["account"], "home": a["home"]}
+                 for a in accounts if a["provider"] in AGENTS]
+    else:
+        homes = [{"agent": agent, "account": None, "home": env.get(HOME_VAR[agent]) or "default"}
+                 for agent in AGENTS if installed[agent]]
     conv = conventions_path()
     report = {
         "fleet": VERSION,
         "python": sys.version.split()[0],
         "mode": "remuda" if remuda else "plain",
-        "herdr": {"path": herdr_bin, "version": tool_version(herdr_bin), "inside_herdr": os.environ.get("HERDR_ENV") == "1",
-                  "pane": os.environ.get("HERDR_PANE_ID")},
+        "herdr": {"path": herdr_bin, "version": tool_version(herdr_bin), "inside_herdr": env.get("HERDR_ENV") == "1",
+                  "pane": env.get("HERDR_PANE_ID")},
         "remuda": {"path": remuda, "version": tool_version(remuda), "accounts": accounts, "error": remuda_error,
-                   "disabled_by_env": os.environ.get("FLEET_NO_REMUDA") == "1"},
-        "claude": {"path": claude, "version": tool_version(claude),
-                   "config_dir": os.environ.get("CLAUDE_CONFIG_DIR")},
-        "codex": {"path": codex, "version": tool_version(codex), "home": os.environ.get("CODEX_HOME")},
+                   "disabled_by_env": env.get("FLEET_NO_REMUDA") == "1"},
+        "claude": {"path": installed["claude"], "version": tool_version(installed["claude"]),
+                   "config_dir": env.get("CLAUDE_CONFIG_DIR"), **agent_defaults("claude", claude_home)},
+        "codex": {"path": installed["codex"], "version": tool_version(installed["codex"]), "home": env.get("CODEX_HOME"),
+                  **agent_defaults("codex", codex_home),
+                  "models": codex_models(codex_home) if installed["codex"] else []},
+        "hooks": hook_report(herdr_bin, homes, env) if herdr_bin else [],
         "git": shutil.which("git"),
         "conventions": {"path": str(conv), "exists": conv.is_file()},
     }
@@ -1113,19 +1273,26 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         return 0
     def show(label: str, value: str) -> None:
         print(f"{label:<12} {value}")
+    def settings(row: dict) -> str:
+        parts = [f"{key} {row[key]}" for key in ("model", "effort") if row.get(key)]
+        return ("  " + ", ".join(parts)) if parts else ""
     show("fleet", VERSION)
     show("mode", "remuda (account switching on)" if remuda else "plain (no remuda: one login per agent, no account switching)")
     show("herdr", f"{report['herdr']['version'] or 'missing'}" + ("" if report["herdr"]["inside_herdr"] else "  (this shell is not inside Herdr)"))
     if remuda:
         show("remuda", f"{report['remuda']['version']}  {len(accounts)} accounts" + (f"  error: {remuda_error}" if remuda_error else ""))
         for a in accounts:
-            show("", f"{a['account']:<16} {a['plan'] or '-':<6} {a['home']}")
+            show("", f"{a['account']:<16} {a['plan'] or '-':<6} {a['home']}{settings(a)}")
     elif report["remuda"]["disabled_by_env"]:
         show("remuda", "disabled by FLEET_NO_REMUDA=1")
     else:
         show("remuda", "not installed (optional)")
-    show("claude", report["claude"]["version"] or "missing")
-    show("codex", report["codex"]["version"] or "missing")
+    show("claude", (report["claude"]["version"] or "missing") + settings(report["claude"]))
+    show("codex", (report["codex"]["version"] or "missing") + settings(report["codex"]))
+    for i, h in enumerate(report["hooks"]):
+        who = h["account"] or f"{h['agent']} ({h['home']})"
+        state = h["status"] or "unknown"
+        show("herdr hooks" if i == 0 else "", f"{who:<16} {state}" + ("" if h["ok"] else f"  fix: {h['fix']}"))
     show("conventions", f"{conv}" + ("" if conv.is_file() else "  (missing: run /fleet:onboard)"))
     return 0
 
@@ -1323,6 +1490,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--agent", choices=AGENTS, help="default: claude, or the account's provider")
     s.add_argument("--account", help="remuda account (name or provider:name); needs remuda")
     s.add_argument("--model")
+    s.add_argument("--effort", help="reasoning effort, e.g. high or max (claude --effort; codex model_reasoning_effort)")
     s.add_argument("--permission-mode", help="claude --permission-mode")
     s.add_argument("--name", help="pane label, and the claude session name")
     s.add_argument("--role", choices=ROLES, help="record the pane's role in .fleet/panes.json (the hook reads it)")

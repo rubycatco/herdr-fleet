@@ -46,7 +46,7 @@ Write `<cwd>/.fleet/BRIEF.md` from the BRIEF template in `${CLAUDE_PLUGIN_ROOT}/
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --pane <pane_id> --role impl --name <label> \
-  --agent <agent> [--model <model>] [--permission-mode <mode>] [--account <account>] --accept-trust \
+  --agent <agent> [--model <model>] [--effort <effort>] [--permission-mode <mode>] [--account <account>] --accept-trust \
   --prompt "Read .fleet/BRIEF.md and execute it."
 ```
 

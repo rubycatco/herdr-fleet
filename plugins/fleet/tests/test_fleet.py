@@ -54,6 +54,15 @@ CODEX_SCREEN = """\
   model-x high · /tmp/x
 """
 
+CODEX_TRUST_SCREEN = """\
+  Folder access
+  /tmp/x
+  Trust this folder? Codex can read, edit, and run files here, subject to your permission settings.
+› 1. Trust and continue
+  2. Quit
+  enter continue · esc quit
+"""
+
 TRUST_SCREEN = """\
  Accessing workspace:
  /tmp/x
@@ -159,6 +168,16 @@ class LaunchTests(unittest.TestCase):
         with self.assertRaises(fleet.FleetError):
             self.launch(agent="codex", permission_mode="auto")
 
+    def test_effort_maps_per_agent(self):
+        claude = self.launch(model="opus", effort="high", permission_mode="auto")
+        self.assertEqual(claude["command"], "claude --model opus --effort high --permission-mode auto")
+        codex = self.launch(agent="codex", account="v0", model="model-x", effort="max",
+                            remuda="/bin/remuda", accounts=self.accounts, prompt="Review.")
+        self.assertEqual(codex["command"],
+                         "/bin/remuda run codex:v0 --model model-x -c 'model_reasoning_effort=\"max\"' Review.")
+        with self.assertRaisesRegex(fleet.FleetError, "one lowercase word"):
+            self.launch(effort="High")
+
     def test_main_passes_args_after_double_dash(self):
         buf = io.StringIO()
         old = os.environ.get("FLEET_NO_REMUDA")
@@ -209,6 +228,16 @@ class ScreenTests(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertGreater(hits[0], sel)
 
+    def test_codex_trust_dialog_and_unknown_menus(self):
+        lines = fleet.clean_lines(CODEX_TRUST_SCREEN)
+        text = "\n".join(lines)
+        self.assertTrue(fleet.TRUST_DIALOG.search(text))
+        self.assertTrue(fleet.TRUST_ACCEPT.search(lines[fleet.selected_line(lines)]))
+        self.assertTrue(fleet.MENU_SELECTED.search(text))
+        # A composer, or a prompt that was sent, is not a menu.
+        for screen in (CODEX_SCREEN, CLAUDE_SCREEN):
+            self.assertIsNone(fleet.MENU_SELECTED.search("\n".join(fleet.clean_lines(screen))))
+
     def test_clean_lines_drops_padding_and_rules(self):
         self.assertEqual(fleet.clean_lines("\n\n────────\n  text  \n\n"), ["  text"])
 
@@ -220,6 +249,69 @@ class ScreenTests(unittest.TestCase):
     def test_auto_direction(self):
         self.assertEqual(fleet.auto_direction({"width": 172, "height": 105}), "down")
         self.assertEqual(fleet.auto_direction({"width": 344, "height": 60}), "right")
+
+
+class DoctorTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_toml_top_level_stops_at_first_table(self):
+        text = 'model = "model-x"  # main\nmodel_reasoning_effort = \'high\'\n\n[profiles.fast]\nmodel = "other"\n'
+        self.assertEqual(fleet.toml_top_level(text), {"model": "model-x", "model_reasoning_effort": "high"})
+
+    def test_agent_defaults(self):
+        (self.home / "settings.json").write_text(json.dumps({"model": "opus", "effortLevel": "high"}))
+        (self.home / "config.toml").write_text('model = "model-x"\nmodel_reasoning_effort = "xhigh"\n')
+        self.assertEqual(fleet.agent_defaults("claude", str(self.home)), {"model": "opus", "effort": "high"})
+        self.assertEqual(fleet.agent_defaults("codex", str(self.home)), {"model": "model-x", "effort": "xhigh"})
+        self.assertEqual(fleet.agent_defaults("codex", str(self.home / "missing")), {"model": None, "effort": None})
+
+    def test_codex_models_lists_visible_models(self):
+        (self.home / "models_cache.json").write_text(json.dumps({"models": [
+            {"slug": "model-x", "visibility": "list", "default_reasoning_level": "medium",
+             "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}, {"effort": "max"}]},
+            {"slug": "hidden", "visibility": "hide", "supported_reasoning_levels": ["low"]},
+        ]}))
+        self.assertEqual(fleet.codex_models(str(self.home)),
+                         [{"model": "model-x", "efforts": ["low", "high", "max"], "default_effort": "medium"}])
+        self.assertEqual(fleet.codex_models(str(self.home / "missing")), [])
+
+    def test_parse_integration_status(self):
+        text = ("pi: not installed (/h/.pi/agent/extensions/herdr-agent-state.ts)\n"
+                "claude: current (v9) (/h/.claude/hooks/herdr-agent-state.sh)\n"
+                "codex: not installed (/h/v0/herdr-agent-state.sh)\n")
+        self.assertEqual(fleet.parse_integration_status(text), {
+            "claude": {"status": "current (v9)", "path": "/h/.claude/hooks/herdr-agent-state.sh"},
+            "codex": {"status": "not installed", "path": "/h/v0/herdr-agent-state.sh"},
+        })
+
+    def test_hook_fix_command_and_env(self):
+        self.assertEqual(fleet.hook_install_command("codex", "default"), "herdr integration install codex")
+        self.assertEqual(fleet.hook_install_command("codex", "/x y/v0"),
+                         "CODEX_HOME='/x y/v0' herdr integration install codex")
+        env = {"CODEX_HOME": "/old", "PATH": "/bin"}
+        self.assertEqual(fleet.config_env("codex", "default", env), {"PATH": "/bin"})
+        self.assertEqual(fleet.config_env("codex", "/new", env)["CODEX_HOME"], "/new")
+        self.assertEqual(fleet.config_env("claude", "/c", env)["CLAUDE_CONFIG_DIR"], "/c")
+
+    def test_codex_hook_trusted(self):
+        herdr_hook = {"hooks": [{"type": "command", "command": f"bash '{self.home}/herdr-agent-state.sh' session"}]}
+        other_hook = {"hooks": [{"type": "command", "command": "other-tool session-start"}]}
+        (self.home / "hooks.json").write_text(json.dumps({"hooks": {"SessionStart": [other_hook, herdr_hook]}}))
+        table = f'[hooks.state."{self.home / "hooks.json"}:session_start:1:0"]'
+        config = self.home / "config.toml"
+        config.write_text('model = "model-x"\n')
+        self.assertIs(fleet.codex_hook_trusted(str(self.home)), False)
+        config.write_text(f'[hooks.state]\n\n{table}\ntrusted_hash = "sha256:abc"\n\n[other]\nx = 1\n')
+        self.assertIs(fleet.codex_hook_trusted(str(self.home)), True)
+        config.write_text(f'{table}\nenabled = false\ntrusted_hash = "sha256:abc"\n')
+        self.assertIs(fleet.codex_hook_trusted(str(self.home)), False)
+        (self.home / "hooks.json").write_text(json.dumps({"hooks": {"SessionStart": [other_hook]}}))
+        self.assertIsNone(fleet.codex_hook_trusted(str(self.home)))
 
 
 class FilesTests(unittest.TestCase):

@@ -37,11 +37,11 @@ For each critic in the conventions (dual review: one Codex and one Claude):
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --from <impl pane> --role critic --name <label>-review-<n> \
-  --agent <agent> [--model <model>] [--account <account>] \
+  --agent <agent> [--model <model>] [--effort <effort>] [--account <account>] --accept-trust \
   --prompt "Read .fleet/REVIEW-REQUEST-<n>.md and follow it."
 ```
 
-The split starts in the lane's worktree. Then, for each critic, start a background watcher (Bash with `run_in_background: true`):
+The split starts in the lane's worktree. `--accept-trust` answers the folder trust dialog there, because the critic's account has not seen this new worktree. Then, for each critic, start a background watcher (Bash with `run_in_background: true`):
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" watch <critic pane> --marker "VERDICT:" --file .fleet/REVIEW-<n>.md

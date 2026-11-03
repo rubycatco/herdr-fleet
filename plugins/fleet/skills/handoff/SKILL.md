@@ -27,7 +27,7 @@ First run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" conventions` for placem
 |---|---|
 | Context is large, noisy or compacted | Handoff file, then a fresh session. |
 | Only the account changes, the context is healthy, and the agent is Claude | Resume: `spawn --resume <session id> --account <account>`. The new pane forks this conversation on the new account. If that account cannot see the transcript, `spawn` refuses: use a handoff file. |
-| The model changes | Either one. `--resume` with `--model` keeps the history. |
+| The model or effort changes | Either one. `--resume` with `--model` or `--effort` keeps the history. |
 
 Find a session id with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" status --json` (field `session_id`; your own row has `self: true`).
 
@@ -39,7 +39,7 @@ Find a session id with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" status --j
 4. Start the successor beside this pane:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --split auto --name <label> [--role <pane_role>] \
-     [--account <account>] [--model <model>] [--permission-mode <mode>] --accept-trust \
+     [--account <account>] [--model <model>] [--effort <effort>] [--permission-mode <mode>] --accept-trust \
      --prompt "Read <handoff_path> and continue the work it describes. You replace pane <your pane id>."
    ```
    To resume instead: `spawn --split auto --name <label> --account <account> --accept-trust --resume <your session id> --prompt "You now run on <account> in a new pane. Continue where this conversation stopped."`
@@ -60,7 +60,7 @@ Find a session id with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" status --j
 5. Start the successor in the same pane:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --pane <pane> --role impl --name <label> --agent <agent> \
-     [--account <account>] [--model <model>] [--permission-mode <mode>] --accept-trust \
+     [--account <account>] [--model <model>] [--effort <effort>] [--permission-mode <mode>] --accept-trust \
      --prompt "Read .fleet/HANDOFF.md, then .fleet/BRIEF.md and .fleet/STATUS.md, and continue this lane."
    ```
    Account change only, with healthy context: skip steps 1 to 3. Note the lane's `session_id` from `status --json`, retire it, then `spawn --pane <pane> --role impl --account <account> --accept-trust --resume <session id> --prompt "Continue this lane from where you stopped."`.

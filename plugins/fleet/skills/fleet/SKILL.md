@@ -45,7 +45,7 @@ Run every command as `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" <command> ..
 
 `spawn` options:
 - Placement: `--pane P` (an existing shell pane), `--worktree BRANCH --base REF`, `--tab`, `--new-workspace`, or a split (`--split auto|right|down`, `--from PANE`; default: split the calling pane). A split starts in the directory of the pane it splits unless you pass `--cwd`.
-- Agent: `--agent claude|codex`, `--model`, `--permission-mode` (claude), `--account` (remuda only), `--name LABEL`, `--role impl|critic|orchestrator|helper`, `-- <more agent arguments>`.
+- Agent: `--agent claude|codex`, `--model`, `--effort` (claude `--effort`; codex `model_reasoning_effort`), `--permission-mode` (claude), `--account` (remuda only), `--name LABEL`, `--role impl|critic|orchestrator|helper`, `-- <more agent arguments>`.
 - Task: `--prompt "<one line>"` (passed as an argument, so it is never pasted). Put longer tasks in a file and point at it.
 - `--resume SESSION_ID` (claude): fork that session in the new pane, for example on another account. It refuses when the target account cannot see the transcript.
 - `--accept-trust`: answer the folder trust dialog. Use it only for a worktree you just created.
