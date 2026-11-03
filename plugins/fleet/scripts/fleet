@@ -1322,22 +1322,30 @@ def clean_event(e: dict) -> dict:
     return out
 
 
+def jsonl_events(data: bytes) -> list[dict]:
+    """The events in JSONL bytes. Records end at LF bytes only: a JSON string can hold U+2028, U+2029 or U+0085,
+    which `str.splitlines()` would take for line ends. A damaged record or field is skipped."""
+    events = []
+    for line in data.split(b"\n"):
+        try:
+            e = json.loads(line.decode("utf-8", errors="replace"))
+        except ValueError:
+            continue
+        if isinstance(e, dict):
+            events.append(clean_event(e))
+    return events
+
+
 def read_events(dirs: list[Path]) -> list[dict]:
     """Every event in these homes, oldest first. A damaged line or field is skipped."""
     events = []
     for d in dirs:
         for f in sorted((Path(d) / EVENTS_DIR).glob("*.jsonl")):
             try:
-                text = f.read_text(errors="replace")
+                data = f.read_bytes()
             except OSError:
                 continue
-            for line in text.splitlines():
-                try:
-                    e = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(e, dict):
-                    events.append(clean_event(e))
+            events += jsonl_events(data)
     events.sort(key=event_time)
     return events
 
@@ -2463,8 +2471,8 @@ def project_home(args: argparse.Namespace, create: bool = True) -> Path:
 
 
 def pane_state(pane: str | None) -> str:
-    """`alive` (the pane runs an agent), `dead` (herdr says that the pane is gone or runs no agent), or
-    `unknown` (no herdr, a timeout, an error or an answer that it cannot read)."""
+    """`alive` (the pane runs an agent), `dead` (herdr says that the pane is gone, or shows it without an agent),
+    or `unknown` (no herdr, a timeout, an error, or an answer that is not about this pane or that it cannot read)."""
     if not pane or not shutil.which("herdr"):
         return "unknown"
     try:
@@ -2479,10 +2487,14 @@ def pane_state(pane: str | None) -> str:
         return "unknown"
     if data.get("error") is not None:
         return "dead" if as_dict(data.get("error")).get("code") == "pane_not_found" else "unknown"
+    # Valid only for the pane asked about. A shell pane, also one whose agent exited, has no `agent` key.
     info = as_dict(as_dict(data.get("result")).get("pane"))
-    if cp.returncode != 0 or not info:
+    if cp.returncode != 0 or info.get("pane_id") != pane:
         return "unknown"
-    return "alive" if info.get("agent") else "dead"
+    agent = info.get("agent")
+    if agent is None:
+        return "dead"
+    return "alive" if isinstance(agent, str) and agent else "unknown"
 
 
 def project_checkouts(home: Path) -> list[str]:
@@ -2652,13 +2664,7 @@ def read_new_events(home: Path, read: dict[str, int],
             continue
         end = data.rfind(b"\n") + 1  # a partial last line waits for the next read
         offsets[f.name] = start + end
-        for line in data[:end].decode("utf-8", errors="replace").splitlines():
-            try:
-                e = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(e, dict):
-                events.append(clean_event(e))
+        events += jsonl_events(data[:end])
         if left is not None:
             left -= len(data)
             if len(data) < size - start:

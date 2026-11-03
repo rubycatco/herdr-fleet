@@ -25,9 +25,27 @@ _loader.exec_module(fleet)
 _FLEET_HOME = tempfile.TemporaryDirectory()
 os.environ["FLEET_HOME"] = _FLEET_HOME.name
 
+# No test runs herdr or gh through fleet.run: a test that needs them stubs fleet.run (or the function that calls
+# it). git runs for real.
+_UNSTUBBED = []
+_REAL_RUN = fleet.run
+
+
+def _guarded_run(cmd, *args, **kwargs):
+    if cmd and os.path.basename(str(cmd[0])) in ("herdr", "gh"):
+        _UNSTUBBED.append(" ".join(map(str, cmd)))
+        raise AssertionError(f"a test ran {cmd[0]} without a stub: {cmd}")
+    return _REAL_RUN(cmd, *args, **kwargs)
+
+
+fleet.run = _guarded_run
+
 
 def tearDownModule():
     _FLEET_HOME.cleanup()
+    # A guard error that a caller swallowed still fails the run here.
+    if _UNSTUBBED:
+        raise AssertionError(f"tests ran herdr or gh without a stub: {_UNSTUBBED}")
 
 REMUDA_LIST = """\
 ACCOUNT         EMAIL                  ORG                            PLAN  HOME
@@ -1406,10 +1424,31 @@ class OrchTests(unittest.TestCase):
                 "w1:p5": (1, json.dumps({"error": {"code": "server_unreachable", "message": "no server"}})),
                 "w1:p6": (0, "not json"),
                 "w1:p7": (0, json.dumps({"result": {}})),
+                # A pane object is valid only for the pane asked about; a shell pane has no `agent` key.
+                "w2:p1": (0, json.dumps({"result": {"pane": {"pane_id": "w2:p1"}}})),
+                "w2:p2": (0, json.dumps({"result": {"pane": {"pane_id": "w2:p2", "agent": False}}})),
+                "w2:p3": (0, json.dumps({"result": {"pane": {"pane_id": "w2:p3", "agent": []}}})),
+                "w2:p4": (0, json.dumps({"result": {"pane": {"unexpected": "shape"}}})),
+                "w2:p5": (0, json.dumps({"result": {"pane": {"pane_id": "w9:p9", "agent": "claude"}}})),
+                "w2:p6": (0, json.dumps({"result": {"pane": {"pane_id": "w2:p6", "agent": ""}}})),
             }
             with self.herdr_answers(answers), mock.patch.object(fleet.shutil, "which", return_value="/usr/bin/herdr"):
                 self.assertEqual([fleet.pane_state(f"w1:p{i}") for i in range(1, 8)],
                                  ["alive", "dead", "dead", "unknown", "unknown", "unknown", "unknown"])
+                self.assertEqual([fleet.pane_state(f"w2:p{i}") for i in range(1, 7)],
+                                 ["dead", "unknown", "unknown", "unknown", "unknown", "unknown"])
+                # A malformed pane object never authorizes a claim or a foreign digest.
+                for bad in ("w2:p2", "w2:p3", "w2:p4"):
+                    fleet.write_json(self.project / "orch.json", {"pane": bad})
+                    self.assertEqual(self.main("orch", "claim", pane="w9:p9")[0], 2, bad)
+                    self.assertEqual(fleet.read_json(self.project / "orch.json")["pane"], bad)
+                    with mock.patch.object(fleet, "collect_lanes", return_value=([], [], [])):
+                        self.assertTrue(json.loads(self.main("digest", "--json")[1])["read_only"], bad)
+                    self.assertFalse((self.project / "digest.json").exists())
+                # A shell pane whose agent exited is dead: a successor claims without --force.
+                fleet.write_json(self.project / "orch.json", {"pane": "w2:p1"})
+                self.assertEqual(self.main("orch", "claim", pane="w9:p9")[0], 0)
+                (self.project / "orch.json").unlink()
                 # Claim and digest on the real lookup: a timeout never authorizes a takeover or a foreign digest.
                 self.main("orch", "claim", pane="w1:p4")
                 code, out = self.main("orch", "claim", pane="w9:p9")
@@ -1427,7 +1466,7 @@ class OrchTests(unittest.TestCase):
                 # --force takes over an unknown pane, but never a live one.
                 self.assertEqual(self.main("orch", "claim", "--force", pane="w9:p9")[0], 0)
                 self.assertEqual(self.events("orch_claim")[-1].get("force"), True)
-                answers["w9:p9"] = answers["w1:p1"]
+                answers["w9:p9"] = (0, json.dumps({"result": {"pane": {"pane_id": "w9:p9", "agent": "claude"}}}))
                 self.assertEqual(self.main("orch", "claim", "--force", pane="w8:p8")[0], 2)
                 # The registered pane hands over even when herdr cannot see the successor.
                 answers["w7:p7"] = fleet.FleetError("timed out")
@@ -1463,7 +1502,8 @@ class OrchTests(unittest.TestCase):
         results = []
 
         def slow_board(*args, **kwargs):
-            with mock.patch.object(fleet, "LOCK_WAIT", 0.2), mock.patch.object(sys, "stderr", io.StringIO()):
+            with mock.patch.object(fleet, "LOCK_WAIT", 0.2), mock.patch.object(sys, "stderr", io.StringIO()), \
+                    mock.patch.object(fleet, "pane_info", return_value={"workspace_id": "w2"}):
                 results.append(("claim", fleet.main(["orch", "claim", "--pane", "w2:p1"])))
                 results.append(("digest", fleet.main(["digest"])))
             return ([self.facts(a, label="lane-a")], [], [])
@@ -1542,6 +1582,18 @@ class OrchTests(unittest.TestCase):
         self.assertEqual(self.digest(), ["x"])
         self.assertEqual(set(fleet.read_json(self.project / "digest.json")["read"]),
                          {self.log_file().name, "2099-01.jsonl"})
+
+    def test_unicode_line_separators_stay_inside_their_event(self):
+        texts = ["a\u2028b", "c\u2029d", "e\u0085f"]
+        for text in texts:
+            fleet.record("send", None, home=self.project, by=False, pane="w2:p1", text=text)
+        log = self.log_file()
+        self.assertEqual(log.read_bytes().count(b"\n"), 3)
+        self.assertEqual(self.digest("--peek"), texts)
+        self.assertEqual(self.digest(), texts)
+        self.assertEqual(fleet.read_json(self.project / "digest.json")["read"], {log.name: log.stat().st_size})
+        self.assertEqual(self.digest(), [])
+        self.assertEqual([e["text"] for e in json.loads(self.main("log", "--json")[1])], texts)
 
     def test_record_takes_its_time_under_the_lock(self):
         order = []
