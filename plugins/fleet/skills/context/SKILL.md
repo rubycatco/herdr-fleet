@@ -46,6 +46,12 @@ Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" conventions` first. Its "Cont
    `reset` waits for a boundary, confirms the `/clear` (a new session id) or the `/compact` (a `Compacted` line), and sends a resume prompt that reads BRIEF.md, STATUS.md and HANDOFF.md. When the pane was started with `--role`, the SessionStart hook also gives it a re-brief for its role.
 3. Watch the lane again (`/fleet:lane`, step 5).
 
+A planner is short-lived: it ends at `PLAN READY`. Reset it only as you would an implementer, above the threshold and at a boundary, and give it its own resume prompt, since the default one would make it implement:
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" reset <pane> --message "Re-read .fleet/BRIEF.md and .fleet/PLAN.md, change no file except PLAN.md, and continue the plan."
+```
+A researcher is shorter still. When its context fills, ask it to write what it found into its research file, retire it with `--close`, and start a new researcher on the same file (`/fleet:research`, step 3).
+
 ## Yourself
 
 The helper refuses to drive its own pane, and you cannot type into your own composer.

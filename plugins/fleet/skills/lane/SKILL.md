@@ -21,7 +21,7 @@ The task comes from the arguments. If there are none, ask the user what the lane
 
 ## 1. Prepare
 
-1. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" conventions`. Use its implementer, critic and account rules.
+1. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" conventions`. Use its implementer, critic, planning and account rules.
 2. Learn enough to write the brief: read the issue, plan or code that the task names. Settle the scope with the user when the goal is unclear or another lane could touch the same files.
 3. Names: a short lane label (for example `fix-login-redirect`) and a branch (the project's naming, else the label). Base: the remote default branch after `git fetch`, unless the user names one.
 4. Account: in remuda mode, choose by the conventions. When the rules depend on usage, run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" accounts`. In plain mode there is no account.
@@ -40,7 +40,15 @@ Write `<cwd>/.fleet/BRIEF.md` from the BRIEF template in `${CLAUDE_PLUGIN_ROOT}/
 - Goal, scope, sources, constraints, acceptance, verification and reporting.
 - If the project documents a worktree setup step, put it under Setup.
 - Link to sources instead of copying them. Name exact files and commands. Keep it under about 80 lines.
-- Give the lane the goal and the design points, not a step list. The lane writes its own plan into STATUS.md.
+- Give the lane the goal and the design points, not a step list. The lane writes its own plan into STATUS.md, or a planner writes PLAN.md (step 4b).
+- Link to research files in the project home instead of copying them.
+
+### Triage: research or plan first?
+
+Follow the conventions' `## Planning and research` section. Its defaults:
+- **Research first** when you cannot name the files or the facts that the brief needs, or when several lanes need the same answer: run `/fleet:research <question>`, then finish the brief with a link to the answer.
+- **Plan first** for a high-risk change (a migration, auth or payments, deletion logic, an incident hotfix), a change that spans subsystems, or a brief that cannot name its files: step 4b instead of step 4.
+- Otherwise go on with step 4: the implementer plans in STATUS.md.
 
 ## 4. Start the implementer
 
@@ -51,6 +59,36 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --pane <pane_id> --role impl
 ```
 
 `ok: true` with status `working` means it started. Otherwise read the pane (`herdr pane read <pane_id> --source recent-unwrapped --lines 300`) and fix what blocks it.
+
+## 4b. Plan first (instead of step 4)
+
+1. Copy the PLAN template from `${CLAUDE_PLUGIN_ROOT}/skills/fleet/references/templates.md` to `<cwd>/.fleet/PLAN.md`. Fill in the title; leave the `Risk:` line open.
+2. Start the planner in the lane's pane, with the planner settings from the conventions (default: the strongest model available, high effort):
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --pane <pane_id> --role planner --name <label>-plan \
+     --agent <agent> [--model <model>] [--effort <effort>] [--account <account>] --accept-trust \
+     --prompt "Read .fleet/BRIEF.md and write the plan in .fleet/PLAN.md. Change no other file. End with the line PLAN READY: 1 and stop."
+   ```
+3. Watch for the plan, in the background: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" watch <pane_id> --marker "PLAN READY: 1" --file .fleet/PLAN.md`.
+4. Read PLAN.md. To ask for changes, send them to the same planner, and watch for the next number:
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" send <pane_id> --text "<changes>. Revise .fleet/PLAN.md, change no other file, and end it with the line PLAN READY: <n+1>."
+   ```
+5. Approve it. With `Risk: none`:
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" approve-plan <cwd> --by orch
+   ```
+   Any other risk: first ask the user, with the plan's approach and risks in a few lines. Pass `--by user` only after the user's yes. `approve-plan` refuses, and changes nothing, when the round is not ready or already approved, the worktree has changes outside `.fleet/` (a planner changes no file except PLAN.md), or the risk needs the user. Read its `reason`, fix the cause, and run it again.
+6. Exit the planner, keep the pane, and start the implementer in it:
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" retire <pane_id>
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --pane <pane_id> --role impl --name <label> \
+     --agent <agent> [--model <model>] [--effort <effort>] [--permission-mode <mode>] [--account <account>] \
+     --prompt "Read .fleet/BRIEF.md and .fleet/PLAN.md and execute them."
+   ```
+   The implementer's STATUS.md Plan section points to PLAN.md and lists only deviations from it. Go on with step 5.
+
+The board shows `planning`, `plan ready <n>` and `plan approved <n>` for the lane until the implementer runs.
 
 ## 5. Record and watch
 

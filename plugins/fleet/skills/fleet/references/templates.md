@@ -1,6 +1,6 @@
 # Fleet file templates
 
-The orchestrator's own file, PROJECT.md, lives in the project home (`~/.fleet/projects/<name>/`). All lane files live in `.fleet/` at the top of the lane's worktree. `fleet prep` and `fleet worktree` create the folder and add `/.fleet/` to the repository's `.git/info/exclude`, so nothing here is committed. Keep each file short: link to plans, issues, PRs and specs instead of copying them.
+The orchestrator's own files, PROJECT.md and the research files, live in the project home (`~/.fleet/projects/<name>/`). All lane files live in `.fleet/` at the top of the lane's worktree. `fleet prep` and `fleet worktree` create the folder and add `/.fleet/` to the repository's `.git/info/exclude`, so nothing here is committed. Keep each file short: link to plans, issues, PRs and specs instead of copying them.
 
 ## BRIEF.md (the orchestrator writes it; the lane reads it first)
 
@@ -32,9 +32,71 @@ The orchestrator's own file, PROJECT.md, lives in the project home (`~/.fleet/pr
 
 ## Reporting
 - Write your plan as the first section of .fleet/STATUS.md before you edit code.
+  <with an approved .fleet/PLAN.md instead: the Plan section points to PLAN.md and lists only deviations from it>
 - Commit at each working step on branch <branch>. Do not push unless this brief says so.
 - When done, add the line `READY FOR REVIEW: round 1` to STATUS.md and stop.
 - <who reviews; critic files are .fleet/REVIEW-<n>.md>
+```
+
+## PLAN.md (the orchestrator starts it; the planner writes it)
+
+The orchestrator copies this template to `.fleet/PLAN.md` with the title filled in and the `Risk:` line still open, then starts a planner. The planner keeps one value on the `Risk:` line, writes the sections, ends the file with `PLAN READY: <n>` on its own line and stops. Each revision ends with a new line and the next number. Only `fleet approve-plan` writes the `PLAN APPROVED: <n> by <who> <date>` lines.
+
+```markdown
+# Plan: <lane name>
+
+Risk: none | migration | auth-payments | deletion | hotfix
+
+## Approach
+<the design in a few lines: what changes, and why this way>
+
+## Steps
+1. <one commit: what it changes>. Verify: <command or check>
+2. ...
+
+## Files
+- <path>: <what changes>
+
+## Tests and verification
+- <tests to add or change; exact commands>
+
+## Risks and open questions
+- <what can go wrong; what the orchestrator must decide>
+
+## Out of scope
+- <what this plan leaves alone>
+
+PLAN READY: <n>
+```
+
+Risk values: `none`, `migration`, `auth-payments` (auth or payments), `deletion` (deletion logic), `hotfix` (incident hotfix). Only `none` is low risk: the orchestrator approves it. Any other value, more than one, or a missing `Risk:` line needs the user's yes, and then `approve-plan --by user`. Write the `Risk:` line once, and start no other line with `Risk:`.
+
+## RESEARCH (`<home>/research/<slug>.md`; the orchestrator asks, a researcher answers)
+
+The orchestrator writes the title, `Asked:`, Question and Context; the researcher writes the rest. Look in `<home>/research/` first: an earlier answer may exist. Do not write the done line yourself: `fleet watch` would end at once.
+
+```markdown
+# Research: <the question, short>
+
+Asked: <date>, by pane <orchestrator pane>, for <lane branch | the project>
+
+Researcher: when the answer is complete, the last line of this file says RESEARCH DONE and nothing else. Until then, read code, docs and the web as you need, run only commands that change nothing, change no file except this one, and fill in Findings, Answer and Open questions.
+
+## Question
+<one question, and what the answer is for>
+
+## Context
+- <what the orchestrator already knows>
+- <where to look: paths, docs, URLs>
+
+## Findings
+- <fact>. Source: <file:line, URL or command>
+
+## Answer
+<the answer in a few lines, ready to link from a brief or a plan>
+
+## Open questions
+- <what the researcher could not settle>
 ```
 
 ## STATUS.md (the lane writes it and keeps it current)
@@ -146,7 +208,7 @@ An empty section, `-`, `none` and `- none` count as empty.
 
 ## How `fleet board` reads the lane files
 
-The phase of a lane comes from these markers, the first rule that matches wins: `removed` (cleanup removed it), `merged` and `pr open` (its pull request), `blocked` (an agent pane is blocked, or STATUS.md has text under `## Blocked`), `review <n>` (REVIEW-REQUEST-<n>.md is the newest request and a review file of round n has no `VERDICT:` line yet), `reviewed <n>: <verdict>` (every review file of the newest round has a verdict; `CHANGES REQUESTED` wins), `ready <n>` (the highest `READY FOR REVIEW: round <n>` without a request), then `working` or `idle` (the implementer pane), else `no agent`. The review files of round n are the ones that REVIEW-REQUEST-<n>.md names (`REVIEW-<n>.md`, `REVIEW-<n>-<critic>.md`); a named file that does not exist yet has no verdict. When the request names none, the files that exist count. The board also shows the first line under `## Blocked` and `## Next step` in STATUS.md.
+A marker counts only at the start of a line, after optional list or bold marks; a mention inside a sentence does not. The phase of a lane comes from these markers, the first rule that matches wins: `removed` (cleanup removed it), `merged` and `pr open` (its pull request), `blocked` (an agent pane is blocked, or STATUS.md has text under `## Blocked`), then, for a lane with PLAN.md while no implementer pane runs an agent and STATUS.md has no `READY FOR REVIEW` line: `planning` (a planner pane is working, or PLAN.md has no `PLAN READY: <n>` line), `plan approved <n>` (the newest round n has a `PLAN APPROVED: <n>` line) or `plan ready <n>` (the note says so when the worktree has changes outside `.fleet/`); then `review <n>` (REVIEW-REQUEST-<n>.md is the newest request and a review file of round n has no `VERDICT:` line yet), `reviewed <n>: <verdict>` (every review file of the newest round has a verdict; `CHANGES REQUESTED` wins), `ready <n>` (the highest `READY FOR REVIEW: round <n>` without a request), then `working` or `idle` (the implementer pane), else `no agent`. The review files of round n are the ones that REVIEW-REQUEST-<n>.md names (`REVIEW-<n>.md`, `REVIEW-<n>-<critic>.md`); a named file that does not exist yet has no verdict. When the request names none, the files that exist count. The board also shows the first line under `## Blocked` and `## Next step` in STATUS.md, and lists the project's research files that have no `RESEARCH DONE` line.
 
 ## FLEET.md (the old form: the orchestrator kept it in its own checkout)
 

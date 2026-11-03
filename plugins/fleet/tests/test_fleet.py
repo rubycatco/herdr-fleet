@@ -1302,6 +1302,43 @@ class ApprovePlanTests(unittest.TestCase):
         self.assertEqual([e["round"] for e in self.approvals()], [1, 2])
 
 
+class DocsTests(unittest.TestCase):
+    """The templates and skills that the plan and research flow relies on match the code."""
+
+    PLUGIN = SCRIPT.parent.parent
+
+    def template(self, heading):
+        text = (self.PLUGIN / "skills" / "fleet" / "references" / "templates.md").read_text()
+        part = text.split(f"\n## {heading}", 1)[1]
+        return part.split("```markdown\n", 1)[1].split("\n```", 1)[0]
+
+    def test_a_copied_template_ends_no_watch(self):
+        plan = self.template("PLAN.md")
+        self.assertEqual(fleet.plan_rounds(plan), ([], set()))
+        self.assertEqual(fleet.plan_risk(plan), ("none | migration | auth-payments | deletion | hotfix", False))
+        self.assertEqual(fleet.plan_risk(plan.replace("none | migration | auth-payments | deletion | hotfix",
+                                                      "none")), ("none", True))
+        research = self.template("RESEARCH")
+        self.assertIn("RESEARCH DONE", research)  # the researcher learns the marker from the file
+        self.assertIsNone(fleet.RESEARCH_DONE_LINE.search(research))
+        self.assertIsNone(fleet.READY_LINE.search(self.template("BRIEF.md")))
+
+    def test_skills_and_defaults_name_the_new_parts(self):
+        skill = (self.PLUGIN / "skills" / "research" / "SKILL.md").read_text()
+        self.assertTrue(skill.startswith("---\nname: research\n"))
+        self.assertIn("--role researcher", skill)
+        self.assertIn("--task", skill)
+        self.assertIn("## Planning and research", (self.PLUGIN / "defaults" / "conventions.md").read_text())
+        lane = (self.PLUGIN / "skills" / "lane" / "SKILL.md").read_text()
+        for text in ("--role planner", "approve-plan <cwd> --by orch", "PLAN READY: 1",
+                     "Read .fleet/BRIEF.md and .fleet/PLAN.md and execute them."):
+            self.assertIn(text, lane)
+        for role in fleet.ROLES:
+            self.assertIn(role, (self.PLUGIN / "skills" / "fleet" / "SKILL.md").read_text())
+        manifest = json.loads((self.PLUGIN / ".claude-plugin" / "plugin.json").read_text())
+        self.assertEqual(manifest["version"], fleet.VERSION)
+
+
 class OrchTests(unittest.TestCase):
     """orch, board, digest and the orch re-brief, in a temporary FLEET_HOME. herdr and gh never run."""
 

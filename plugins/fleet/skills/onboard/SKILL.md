@@ -1,6 +1,6 @@
 ---
 name: onboard
-description: Set up the fleet plugin for this user — check Herdr, Claude Code, Codex, remuda and Herdr's agent hooks, ask how implementer and critic lanes should run (agents, models, effort, review and context rules), and write the user's conventions file (with account rules only when remuda is installed). Run it once, and again to change the conventions.
+description: Set up the fleet plugin for this user — check Herdr, Claude Code, Codex, remuda and Herdr's agent hooks, ask how implementer, critic and planner lanes should run (agents, models, effort, review, planning and context rules), and write the user's conventions file (with account rules only when remuda is installed). Run it once, and again to change the conventions.
 disable-model-invocation: true
 allowed-tools:
   - Read
@@ -43,11 +43,12 @@ Call 2, review:
 3. Codex effort, when Codex is installed: "<codex.effort> (your config) (Recommended)" when it is set, otherwise "high (Recommended)"; then other levels from that model's `efforts` in `codex.models`, for example "xhigh" and "max". Leave this question out without Codex.
 4. Stop rule: "From round 3, re-check fixes only; new findings block only at high severity (Recommended)", "Until the critic approves", "One round, then I decide".
 
-Call 3, verification, context and accounts:
+Call 3, verification, context, planning and accounts:
 1. Verification: "The project's documented checks, real results in STATUS.md (Recommended)", "Tests for the changed files only", "The full suite before each review".
 2. Lane context: "Reset at a commit once context passes about 60 % (Recommended)", "Only near auto-compaction (about 80 %)", "Never; I decide".
 3. Remuda mode, accounts. Build the options from `remuda.accounts`, for example "Lanes use my current account", "Spread lanes across accounts by remaining usage", "Ask me each time". Invite the user to pick Other and write rules in their own words, such as "team account for work repositories, max for personal projects, codex v0 when codex default passes 80 %".
    Plain mode, placement instead: "A new worktree workspace per lane (Recommended)", "A split beside the orchestrator", "A new tab".
+4. Plan first, and the planner: "By the triage rules; planner on the strongest model available, high effort (Recommended)", "Always plan first, same planner", "Never; the implementer plans in STATUS.md". Invite the user to pick Other to name the planner's agent and model, for example "by the triage rules, planner Claude Code <model>, max effort".
 
 ## 3. Write
 
@@ -55,6 +56,7 @@ Call 3, verification, context and accounts:
 2. Start from `${CLAUDE_PLUGIN_ROOT}/defaults/conventions.md`. Replace each section with the user's answers, in short plain sentences that another agent can follow without this conversation. Write each agent's settings as `fleet spawn` options, for example `--agent claude --model opus --effort high`, or `--agent codex --model <model> --effort high`. Leave an option out where the user chose the agent's default.
    - `## Implementer lanes`: agent, model, effort, permission mode, git rules, verification.
    - `## Critic`: which agents, with their model and effort; what the critic writes; the stop rule. A Claude critic uses the implementers' Claude model and effort unless the user says otherwise. Write that into the file.
+   - `## Planning and research`: when to plan first (the triage rules of the defaults, always, or never), the planner as `fleet spawn` options, and the researcher (the implementer settings unless the user says otherwise). Keep the defaults' research and approval rules unless the user changes them.
    - `## Context and handoff`: the reset threshold, when to compact, when to hand off, where new panes go.
    - `## Accounts`: **remuda mode only.** First list each account as `account — plan — what it is for`. Then write the user's rules in their words: which account the orchestrator, implementers and critics use, when to switch, and the usage level at which to skip an account (default: skip an account above 85 % of a limit in `fleet accounts`). In plain mode, leave this section out.
    - `## Projects`: optional. Per-repository notes that the user gives: setup command, check command, base branch, and a cleanup command that `/fleet:cleanup` offers after it removes lanes (for example, one that drops the test databases of removed worktrees).
@@ -63,7 +65,8 @@ Call 3, verification, context and accounts:
 ## 4. Next steps
 
 Give one line each:
-- `/fleet:lane <task>` opens a lane.
+- `/fleet:lane <task>` opens a lane, with a plan first when the triage says so.
+- `/fleet:research <question>` has a researcher pane answer a question into the project home.
 - `/fleet:handoff` moves this session to a new pane.
 - `/fleet:context` keeps context small.
 - `/fleet:accounts` shows accounts and usage (remuda mode only).

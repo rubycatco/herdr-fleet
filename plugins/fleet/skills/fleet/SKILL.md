@@ -17,7 +17,7 @@ allowed-tools:
 
 # Fleet
 
-You are the orchestrator. Lanes do the work in their own Herdr panes. You plan, brief, watch, review, integrate and clean up.
+You are the orchestrator. Lanes do the work in their own Herdr panes. You decide, brief, watch, review, integrate and clean up. Stay small: when a brief needs digging, a researcher pane digs (`/fleet:research`); when a change needs a plan first, a planner pane writes it.
 
 ## Start here
 
@@ -44,17 +44,19 @@ Run every command as `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" <command> ..
 | `watch PANE [--marker M] [--file F]` | Wait until a line of a lane file (default `.fleet/STATUS.md`) starts with the marker, or the agent stops, blocks or exits. A mention inside a sentence does not count. Run it in the background. |
 | `reset PANE [--compact [FOCUS]]` | `/clear` (or `/compact`) a Claude lane at a boundary, confirm it, and send a resume prompt. PANE comes first. |
 | `retire PANE [--close]` | Exit the agent, and close the pane if asked. |
+| `approve-plan [DIR] --by orch\|user [--round N]` | Approve the newest round of the lane's `.fleet/PLAN.md` (DIR: the lane's worktree): it appends `PLAN APPROVED: <n> by <who> <date>` and records the approval. It refuses, changing nothing, when PLAN.md has no `PLAN READY: <n>` line for the round, the round is already approved, the worktree has changes outside `.fleet/`, or the `Risk:` line is not `none` and `--by` is not `user`. Pass `--by user` only after the user said yes. |
 | `sweep` | Every lane on this machine with a verdict, ready, waiting or keep, and the reason (text; `--json`). It only reads. |
 | `cleanup TARGET... [--unmerged] [--dry-run]` | Remove lanes: exit their agents, archive `.fleet/`, remove the worktree, delete the local branch when the merge holds every commit. It checks every target first and changes nothing when one is not ready. |
 | `prep [DIR] [--handoff]` | Create `.fleet/` and keep it out of git. `--handoff` also returns where a handoff file goes. |
 | `orch [show\|claim\|release] [--pane P] [--replace] [--force] [--project NAME]` | The project's orchestrator pane in `orch.json` (`show`: text; `--json`). `claim` registers the calling pane, or `--pane P`; it refuses while another registered pane is alive, except `--replace` from that pane (a handoff). When herdr cannot tell whether the registered pane is alive, it refuses too: check that pane, then `--force` takes over. It warns about a live FLEET.md orchestrator. `release` removes your record (`--force`: another pane's). |
-| `board [--project NAME]` | One row per lane of this project: phase, pull request, panes, newest event, and the blocked or next-step line of STATUS.md (text; `--json`). It saves the board for the re-brief and never consumes a change. |
+| `board [--project NAME]` | One row per lane of this project: phase, pull request, panes, newest event, and the blocked or next-step line of STATUS.md (text; `--json`). Then the project's research files without a `RESEARCH DONE` line. It saves the board for the re-brief and never consumes a change. |
 | `digest [--peek] [--project NAME]` | Lane phase changes and the lanes' events since the last digest, at most 30, newest last (text; `--json`). It records each phase change in the log and moves the cursor. With `--peek`, or from another pane while the registered orchestrator is alive (or herdr cannot tell), it only reads. |
 | `log [PROJECT] [--lane L] [--pane P] [--event E] [--since 7d] [--sessions]` | The project's event log (text; `--json`): the commands above that change something, and each Claude session in a fleet checkout. `--sessions`: one row per agent session, with its transcript. It only reads. |
 
 `spawn` options:
 - Placement: `--pane P` (an existing shell pane), `--worktree BRANCH --base REF`, `--tab`, `--new-workspace`, or a split (`--split auto|right|down`, `--from PANE`; default: split the calling pane). A split starts in the directory of the pane it splits unless you pass `--cwd`.
-- Agent: `--agent claude|codex`, `--model`, `--effort` (claude `--effort`; codex `model_reasoning_effort`), `--permission-mode` (claude), `--account` (remuda only), `--name LABEL`, `--role impl|critic|orchestrator|helper`, `-- <more agent arguments>`.
+- Agent: `--agent claude|codex`, `--model`, `--effort` (claude `--effort`; codex `model_reasoning_effort`), `--permission-mode` (claude), `--account` (remuda only), `--name LABEL`, `--role impl|critic|orchestrator|helper|planner|researcher`, `-- <more agent arguments>`.
+- Task file: `--task FILE` (needs `--role`) keeps the file's absolute path with the pane's role. After /clear or compaction, the SessionStart hook tells a researcher or helper to re-read it.
 - Task: `--prompt "<one line>"` (passed as an argument, so it is never pasted). Put longer tasks in a file and point at it.
 - `--resume SESSION_ID` (claude): fork that session in the new pane, for example on another account. It refuses when the target account cannot see the transcript.
 - `--accept-trust`: answer the folder trust dialog. Use it only for a worktree you just created.
@@ -64,7 +66,9 @@ Run every command as `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" <command> ..
 
 ## Lane lifecycle
 
-1. **Open**: `/fleet:lane`. Worktree, BRIEF.md, an implementer pane with `--role impl`, and a background `watch` for `READY FOR REVIEW: round 1`.
+0. **Research** (on demand): `/fleet:research <question>`. A researcher pane answers into `<home>/research/<slug>.md`; briefs and plans link to the answer.
+1. **Open**: `/fleet:lane`. Worktree, BRIEF.md, then the triage below. Then an implementer pane with `--role impl`, and a background `watch` for `READY FOR REVIEW: round 1`.
+   - **Plan first** (when the triage says so): a planner pane writes `.fleet/PLAN.md` and ends it with `PLAN READY: <n>`; you approve it with `approve-plan` (the user approves a high-risk plan), retire the planner, and start the implementer in the same pane on BRIEF.md and PLAN.md. The board shows `planning`, `plan ready <n>`, `plan approved <n>`.
 2. **Watch**: act on each `watch` result, then watch again.
    - 4 (blocked): read the pane. Answer only dialogs that you can safely decide. Never approve a flagged command for a lane: cancel it with `herdr pane send-keys <pane> Escape` and re-instruct.
    - 6 (stopped): read STATUS.md (its `Blocked` section) and the pane. The lane may have a question, a placeholder, or a background job. Answer with `send`.
@@ -75,6 +79,8 @@ Run every command as `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" <command> ..
 
 ## Rules
 
+- Triage, by the conventions' `## Planning and research` section. Research first when you cannot name the files or facts a brief needs, or several lanes need the same answer. Plan first for a high-risk change (migration, auth or payments, deletion logic, incident hotfix), a change that spans subsystems, or a brief that cannot name its files. Otherwise the implementer plans in STATUS.md.
+- A planner writes only PLAN.md, and a researcher only its research file. Approve a plan only with `approve-plan`; a plan with a risk other than `none` needs the user's yes.
 - One implementer per worktree. Critics work in the lane's worktree, write only their review file, and never edit code.
 - Dispatch with `send`, `spawn --prompt` or files. Use `herdr pane run` or `send-keys` only to answer a dialog.
 - Watch files and git, not scrollback. Each marker carries a round number. Never reuse a number.

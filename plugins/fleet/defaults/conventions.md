@@ -14,6 +14,13 @@
 - The critic writes findings to .fleet/REVIEW-<n>.md, most severe first, and never edits code.
 - Stop rule: from round 3, the critic re-checks earlier fixes and looks for regressions only. New findings block only when they are high severity; the rest become follow-ups.
 
+## Planning and research
+- Research first when the orchestrator cannot name the files or the facts that a brief needs, or when several lanes need the same answer. A researcher pane answers into the project home (research/<slug>.md), and briefs and plans link to the answer.
+- Plan first for a high-risk change (a migration, auth or payments, deletion logic, an incident hotfix), a change that spans subsystems, or a brief that cannot name its files. Otherwise the implementer plans in .fleet/STATUS.md.
+- Planner: the strongest model available, with high effort. It writes only .fleet/PLAN.md, then stops.
+- Researcher: the implementer settings. It writes only its research file.
+- Approval: the user approves a high-risk plan (any Risk other than none); the orchestrator approves the others.
+
 ## Context and handoff
 - Reset a lane (/clear, then re-brief from .fleet/) at its next commit once its context passes about 60 %.
 - Use /compact only when an agent cannot stop at a boundary.
