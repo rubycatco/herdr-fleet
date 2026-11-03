@@ -25,7 +25,7 @@ A lane is a linked git worktree that is open as a Herdr workspace, that sits in 
    - **KEEP**: uncommitted changes, an agent at work, a program running in a pane, commits that no merge or remote holds, no pull request, a closed pull request, or this session.
    - **OTHER WORKTREES**: worktrees that other tools or the user made (the Codex app, Claude Code agents, sibling checkouts). Never remove them.
 3. When the arguments name lanes, consider only those.
-4. Read your `.fleet/FLEET.md`, if you keep one. A lane that it lists as in progress stays, whatever the sweep says: a READY lane without a pull request (`in main`) can be a lane that has not committed yet.
+4. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" board`, and read the old `.fleet/FLEET.md` if you still keep one. A lane that is still in progress there (working, review, ready, blocked) stays, whatever the sweep says: a READY lane without a pull request (`in main`) can be a lane that has not committed yet.
 
 ## 2. Ask
 
@@ -45,5 +45,5 @@ Show the groups in a short table. Then ask with AskUserQuestion. Name the lanes 
 
 ## 4. Record and report
 
-- In FLEET.md, mark each removed lane as cleaned, with its archive path.
+- Nothing to record by hand: each cleanup is an event in the log with its archive path, and the next `board` and `digest` show the lane as `removed`. Write a follow-up that the cleanup leaves (a kept branch, a failed project cleanup command) to PROJECT.md. An old FLEET.md, if you keep one, marks each removed lane as cleaned.
 - Report one line per lane: removed or not, the branch deleted or kept (with the reason), the archive. Then the result of each project cleanup command.

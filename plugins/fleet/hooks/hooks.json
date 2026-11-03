@@ -1,5 +1,5 @@
 {
-  "description": "Re-brief a fleet lane or orchestrator from its .fleet/ files after /clear or compaction, and record the Claude sessions of Herdr panes in the project's event log.",
+  "description": "Re-brief the registered orchestrator pane of a project from its project home at every session start, re-brief a fleet lane or an old FLEET.md orchestrator from its .fleet/ files after /clear or compaction, and record the Claude sessions of Herdr panes in the project's event log.",
   "hooks": {
     "SessionStart": [
       {

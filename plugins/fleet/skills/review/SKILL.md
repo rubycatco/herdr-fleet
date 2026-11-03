@@ -20,7 +20,7 @@ allowed-tools:
 ## 1. Check that the lane is ready
 
 1. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" conventions`. Use its critic rules and stop rule.
-2. Find the lane in `.fleet/FLEET.md`, or with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" status`. Round `<n>` is the number on the newest `READY FOR REVIEW: round <n>` line in the lane's STATUS.md.
+2. Find the lane with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" board` (its phase is `ready <n>`), or with `status`. Round `<n>` is the number on the newest `READY FOR REVIEW: round <n>` line in the lane's STATUS.md.
 3. Read STATUS.md. Verification results must be real: no `PLACEHOLDER`, nothing "still running". The work must be committed (`git -C <worktree> status --short` is empty). If not, send the implementer one request to finish, and watch again.
 
 ## 2. Write the request
@@ -62,4 +62,4 @@ Read each review file yourself. For each finding, decide: fix, decline with a re
 
 ## 5. Stop
 
-Enforce the stop rule from the conventions. Once it applies, a finding below the blocking level becomes a follow-up in FLEET.md (or an issue, if the user wants one), not another round. Retire critic panes you no longer need: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" retire <critic pane> --close`.
+Enforce the stop rule from the conventions. Once it applies, a finding below the blocking level becomes a follow-up in PROJECT.md (or an issue, if the user wants one), not another round. Each declined finding that the user may want later is a follow-up too. Retire critic panes you no longer need: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" retire <critic pane> --close`.

@@ -33,8 +33,8 @@ Find a session id with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" status --j
 
 ## Self
 
-1. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" prep --handoff`. It returns `handoff_path`, `lane`, `fleet_md` and `pane_role`.
-2. If `fleet_md` is set and you orchestrate that fleet, bring FLEET.md up to date: lane table, decisions, next actions.
+1. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" prep --handoff`. It returns `handoff_path`, `lane`, `fleet_md` and `pane_role`. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" orch show` too: `self` is true when you are the project's registered orchestrator.
+2. If you orchestrate, bring PROJECT.md up to date: decisions, follow-ups, the user's rules. The handoff file then needs only what is in flight. If `fleet_md` is set and you orchestrate that fleet the old way, bring FLEET.md up to date instead: lane table, decisions, next actions.
 3. Unless you resume: write the handoff file at `handoff_path` from the HANDOFF template in `${CLAUDE_PLUGIN_ROOT}/skills/fleet/references/templates.md`. A stranger must be able to continue from it: goal, state, exact next steps, decisions with reasons, the user's rules from this conversation, commands, what not to redo, open questions. Never copy a secret; name where it lives.
 4. Start the successor beside this pane:
    ```bash
@@ -45,7 +45,7 @@ Find a session id with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" status --j
    To resume instead: `spawn --split auto --name <label> --account <account> --accept-trust --resume <your session id> --prompt "You now run on <account> in a new pane. Continue where this conversation stopped."`
    If you orchestrate, pass `--role orchestrator`. Folder trust is kept per account, so another account can stop at the trust dialog; `--accept-trust` answers it, which is right here because this session already works in that folder.
 5. Check the result: `ok: true` and status `working`. Read the new pane once to see that it reads the handoff or continues the work.
-6. If you orchestrate, set the `Orchestrator:` line in FLEET.md to the new `pane_id`. The SessionStart hook then re-briefs the successor, not this pane.
+6. If you orchestrate, move the registration to the successor: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" orch claim --pane <new pane_id> --replace`. The SessionStart hook then re-briefs the successor from the project home, not this pane, and the successor's first `digest` shows what happened since your last one. With an old FLEET.md, set its `Orchestrator:` line to the new `pane_id` instead.
 7. Tell the user: the new pane, account, model and handoff file. Then stop. Do no more work here: two sessions in one checkout conflict. Do not close this pane; the user closes it (`/exit`).
 
 ## Lane

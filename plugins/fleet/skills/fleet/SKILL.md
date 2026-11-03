@@ -23,7 +23,10 @@ You are the orchestrator. Lanes do the work in their own Herdr panes. You plan, 
 
 1. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" conventions`. It prints the mode and the user's conventions: agents, models, critics, context limits and, in remuda mode, accounts. Follow them. If it prints the plugin defaults, suggest `/fleet:onboard` once.
 2. Plain mode (no remuda): never pass `--account` and ignore account rules. Every lane uses the agent's own login.
-3. Keep `.fleet/FLEET.md` in your own checkout (template: `${CLAUDE_PLUGIN_ROOT}/skills/fleet/references/templates.md`). Put your pane id (`$HERDR_PANE_ID`) on its `Orchestrator:` line. After /clear or compaction, the SessionStart hook re-briefs only that pane from FLEET.md.
+3. Your memory is the project home, `~/.fleet/projects/<name>/`, which every clone of the repository shares. Run `orch show`. When no live pane is registered, run `orch claim`: it registers your pane as the project's one orchestrator and creates `PROJECT.md`. When another live pane is registered, that pane orchestrates this project: tell the user, and do not claim it.
+4. Run `digest`: what changed since the orchestrator last looked (lane phases, and the events of the lanes). Then `board` whenever you need the lane table; it consumes nothing.
+5. Write only what nothing else knows to `PROJECT.md`: the user's rules for this project, decisions with reasons, and follow-ups (template: `${CLAUDE_PLUGIN_ROOT}/skills/fleet/references/templates.md`). The board and the event log keep the rest. At every session start of your pane (startup, resume, /clear, compaction), the SessionStart hook re-briefs it from the project home: PROJECT.md's rules and follow-ups, the cached board, and the number of new events.
+6. An existing `.fleet/FLEET.md` keeps working: the hook still re-briefs the pane on its `Orchestrator:` line after /clear or compaction, and `orch claim` warns while that pane is alive. Do not start a new FLEET.md.
 
 ## The helper
 
@@ -44,6 +47,9 @@ Run every command as `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" <command> ..
 | `sweep` | Every lane on this machine with a verdict, ready, waiting or keep, and the reason (text; `--json`). It only reads. |
 | `cleanup TARGET... [--unmerged] [--dry-run]` | Remove lanes: exit their agents, archive `.fleet/`, remove the worktree, delete the local branch when the merge holds every commit. It checks every target first and changes nothing when one is not ready. |
 | `prep [DIR] [--handoff]` | Create `.fleet/` and keep it out of git. `--handoff` also returns where a handoff file goes. |
+| `orch [show\|claim\|release] [--pane P] [--replace] [--force] [--project NAME]` | The project's orchestrator pane in `orch.json` (`show`: text; `--json`). `claim` registers the calling pane, or `--pane P`; it refuses while another registered pane is alive, except `--replace` from that pane (a handoff), and warns about a live FLEET.md orchestrator. `release` removes your record (`--force`: another pane's). |
+| `board [--project NAME]` | One row per lane of this project: phase, pull request, panes, newest event, and the blocked or next-step line of STATUS.md (text; `--json`). It saves the board for the re-brief and never consumes a change. |
+| `digest [--peek] [--project NAME]` | Lane phase changes and the lanes' events since the last digest, at most 30, newest last (text; `--json`). It records each phase change in the log and moves the cursor. With `--peek`, or from another pane than a live registered orchestrator, it only reads. |
 | `log [PROJECT] [--lane L] [--pane P] [--event E] [--since 7d] [--sessions]` | The project's event log (text; `--json`): the commands above that change something, and each Claude session in a fleet checkout. `--sessions`: one row per agent session, with its transcript. It only reads. |
 
 `spawn` options:
@@ -64,7 +70,7 @@ Run every command as `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" <command> ..
    - 6 (stopped): read STATUS.md (its `Blocked` section) and the pane. The lane may have a question, a placeholder, or a background job. Answer with `send`.
 3. **Review**: `/fleet:review`. Review request, critic panes per the conventions, verdict, findings back to the implementer, stop rule.
 4. **Context**: `/fleet:context`. Reset long lanes at a commit. Hand off when an account or model must change (`/fleet:handoff`).
-5. **Finish**: push, open the pull request and merge as the conventions and the project's rules say. Record the result in FLEET.md.
+5. **Finish**: push, open the pull request and merge as the conventions and the project's rules say. The board shows the merge; write follow-ups and decisions to PROJECT.md.
 6. **Clean up**: `/fleet:cleanup`, which the user runs. It sweeps every lane, asks which ones to remove, removes them and runs the project's own cleanup. After a merge, run `sweep` and tell the user which lanes are ready. Run `cleanup` yourself only on lanes that the user named for removal.
 
 ## Rules
@@ -72,10 +78,10 @@ Run every command as `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" <command> ..
 - One implementer per worktree. Critics work in the lane's worktree, write only their review file, and never edit code.
 - Dispatch with `send`, `spawn --prompt` or files. Use `herdr pane run` or `send-keys` only to answer a dialog.
 - Watch files and git, not scrollback. Each marker carries a round number. Never reuse a number.
-- To recall what a lane was told and which sessions worked on it, read `log --lane <branch>` or `log --sessions`, not old scrollback.
+- To see where the lanes stand, run `digest` or `board`, not `status` and scrollback. To recall what a lane was told and which sessions worked on it, read `log --lane <branch>` or `log --sessions`.
 - `done` does not mean finished. Before a review, check that STATUS.md has real verification results and no `PLACEHOLDER`.
 - The helper refuses to drive your own pane. For yourself, use `/fleet:context` or `/fleet:handoff`.
 - Close only panes, tabs and workspaces that you created. Never delete a branch or worktree that holds unmerged work.
-- Update FLEET.md after each spawn, review round, reset, handoff, merge and cleanup.
+- Decisions, follow-ups and the user's project rules go to PROJECT.md as soon as they happen. Do not keep a lane table: the board and the log keep it.
 
 The reasons behind these rules, from earlier fleets: `${CLAUDE_PLUGIN_ROOT}/skills/fleet/references/lessons.md`.

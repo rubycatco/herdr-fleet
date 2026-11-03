@@ -50,7 +50,7 @@ Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" conventions` first. Its "Cont
 
 The helper refuses to drive its own pane, and you cannot type into your own composer.
 
-1. Write down your state first. Orchestrator: FLEET.md (lane table, decisions, next actions). Lane: STATUS.md (log, verification, next step), and commit.
+1. Write down your state first. Orchestrator: PROJECT.md (decisions, follow-ups, the user's rules from this conversation); the board and the log keep the lanes. An orchestrator with an old FLEET.md updates it. Lane: STATUS.md (log, verification, next step), and commit.
 2. Then either:
-   - ask the user to type `/clear` (or `/compact <focus>`). The hook re-briefs this pane from your files: from FLEET.md when its `Orchestrator:` line names this pane, from the lane files when this pane is registered as the lane's implementer; or
+   - ask the user to type `/clear` (or `/compact <focus>`). The hook re-briefs this pane from your files. The registered orchestrator (`orch show`) gets PROJECT.md's rules and follow-ups, the cached board and the count of new events, so `/clear` loses almost nothing; it then runs `digest`. An old FLEET.md orchestrator is re-briefed from FLEET.md when its `Orchestrator:` line names this pane, and a lane's implementer from the lane files; or
    - hand off with `/fleet:handoff`. It needs nothing from the user, and it is the right choice when the account or model also changes.

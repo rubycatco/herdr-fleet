@@ -54,7 +54,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --pane <pane_id> --role impl
 
 ## 5. Record and watch
 
-1. Add the lane to `.fleet/FLEET.md` in your own checkout: pane, workspace, worktree, branch, agent, account, model, state and next action.
+1. Nothing to write down for the lane itself: `fleet board` finds it, and the event log holds the spawn with its agent, account, model and prompt. Write a decision or a follow-up from step 1 to the project's PROJECT.md (`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" orch show` prints its path). An orchestrator that still keeps the old `.fleet/FLEET.md` adds the lane there.
 2. Start a watcher with the Bash tool and `run_in_background: true`:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" watch <pane_id> --marker "READY FOR REVIEW: round 1"
