@@ -1494,6 +1494,68 @@ class OrchTests(unittest.TestCase):
         self.assertEqual(self.phase(panes=[{"pane": "w2:p1", "agent": "claude", "status": "done"}]), "idle")
         self.assertEqual(self.phase(panes=[{"pane": "w2:p1", "agent": None, "status": None}]), "no agent")
 
+    def test_plan_phases(self):
+        planner = lambda status: [{"pane": "w2:p1", "agent": "claude", "status": status, "role": "planner"}]
+        template = "# Plan: x\n\nRisk: none | migration\n\n## Approach\n\nPLAN READY: <n>\n"
+        ready1 = "# Plan: x\nRisk: none\n\nPLAN READY: 1\n"
+        approved1 = ready1 + "PLAN APPROVED: 1 by orch 2026-11-03T10:00:00+00:00\n"
+        self.assertEqual(self.phase(files={"PLAN.md": template}, panes=planner("working")), "planning")
+        self.assertEqual(self.phase(files={"PLAN.md": template}), "planning")
+        self.assertEqual(self.phase(files={"PLAN.md": "Then add PLAN READY: 1 and stop.\n"}, panes=planner("idle")),
+                         "planning")  # a sentence is no marker
+        self.assertEqual(self.phase(files={"PLAN.md": ready1}, panes=planner("working")), "planning")  # revising
+        self.assertEqual(self.phase(files={"PLAN.md": ready1}, panes=planner("idle")), "plan ready 1")
+        self.assertEqual(self.phase(files={"PLAN.md": ready1}), "plan ready 1")
+        self.assertEqual(self.phase(files={"PLAN.md": approved1}), "plan approved 1")
+        self.assertEqual(self.phase(files={"PLAN.md": approved1 + "\n- **PLAN READY: 2**\n"}, panes=planner("idle")),
+                         "plan ready 2")
+        # A critic or a shell pane does not stop the plan rules; blocked still wins.
+        others = [{"pane": "w2:p2", "agent": "codex", "status": "working", "role": "critic"},
+                  {"pane": "w2:p3", "agent": None, "status": None, "role": None}]
+        self.assertEqual(self.phase(files={"PLAN.md": approved1}, panes=others), "plan approved 1")
+        self.assertEqual(self.phase(files={"PLAN.md": ready1, "STATUS.md": "## Blocked\n- Which API?\n"}), "blocked")
+        # Once an implementer runs, or STATUS.md reports a round, the existing rules decide.
+        impl = [{"pane": "w2:p1", "agent": "claude", "status": "working", "role": "impl"}]
+        self.assertEqual(self.phase(files={"PLAN.md": approved1}, panes=impl), "working")
+        self.assertEqual(self.phase(files={"PLAN.md": approved1},
+                                    panes=[{"pane": "w2:p1", "agent": "claude", "status": "idle"}]), "idle")
+        self.assertEqual(self.phase(files={"PLAN.md": approved1, "STATUS.md": "READY FOR REVIEW: round 1\n"}),
+                         "ready 1")
+        # Without PLAN.md, a planner pane is never the implementer.
+        self.assertEqual(self.phase(panes=planner("working")), "no agent")
+
+    def test_board_plan_warning_and_open_research(self):
+        a = self.add_lane("a", PLAN_md="Risk: none\nPLAN READY: 1\n", STATUS_md="## Next step\nWait.\n")
+        b = self.add_lane("b", STATUS_md="## Next step\nGo.\n")
+        fleet.save_panes(a / ".fleet", {"w2:p1": {"role": "planner"}})
+        lanes = [{**self.facts(a, panes=[{"pane": "w2:p1", "agent": "claude", "status": "idle"}]), "dirty": 2},
+                 {**self.facts(b, panes=[{"pane": "w3:p1", "agent": "claude", "status": "working"}]), "dirty": 3}]
+        research = self.project / "research"
+        research.mkdir()
+        (research / "auth-flow.md").write_text("# Research: how does auth work?\n\n## Question\nx\n"
+                                                "\nEnd with the line RESEARCH DONE when done.\n")
+        (research / "cache.md").write_text("# Research: cache\n\n## Answer\ny\n\nRESEARCH DONE\n")
+        (research / "notes.txt").write_text("not research")
+        out = json.loads(self.board(lanes, "board", "--json")[1])
+        recs = {r["lane"]: r for r in out["lanes"]}
+        self.assertEqual(recs["feat/a"]["phase"], "plan ready 1")
+        self.assertIn("2 changed files outside .fleet/", recs["feat/a"]["warning"])
+        self.assertEqual(recs["feat/b"]["phase"], "working")
+        self.assertNotIn("warning", recs["feat/b"])  # only at plan ready
+        self.assertEqual(out["research"], [{"file": str(research / "auth-flow.md"),
+                                            "title": "Research: how does auth work?"}])
+        text = self.board(lanes, "board")[1]
+        self.assertRegex(text, r"feat/a\s+plan ready 1\s+-\s+planner:idle\s+-\s+2 changed files outside")
+        self.assertIn("Open research (1, no RESEARCH DONE line yet):", text)
+        self.assertIn("auth-flow.md  Research: how does auth work?", text)
+        self.assertNotIn("cache.md", text)
+        # Clean worktree: no warning. No open research: no research block.
+        lanes[0]["dirty"] = 0
+        (research / "auth-flow.md").write_text("# Research\n\n- RESEARCH DONE\n")
+        text = self.board(lanes, "board")[1]
+        self.assertNotIn("outside .fleet", text)
+        self.assertNotIn("Open research", text)
+
     def test_status_notes(self):
         md = ("# Status: x\n\n## Plan\n1. a\n\n## Blocked\n- none\n\n## Next steps\n\n- Run the tests.\n- More.\n\n"
               "READY FOR REVIEW: round 1\n")

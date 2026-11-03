@@ -2293,6 +2293,22 @@ def implementer_pane(panes: list[dict]) -> dict | None:
             or (agents[0] if agents else None))
 
 
+def plan_phase(panes: list[dict], fleet_dir: Path, status_md: str) -> str | None:
+    """`planning`, `plan ready <n>` or `plan approved <n>` for a lane with a PLAN.md, while no implementer runs
+    (an agent pane with role impl, or with no role) and STATUS.md has no READY FOR REVIEW line; else None."""
+    path = Path(fleet_dir) / PLAN_FILE
+    if not path.is_file() or READY_LINE.search(status_md):
+        return None
+    if any(p.get("agent") and p.get("role") in ("impl", None) for p in panes):
+        return None
+    ready, approved = plan_rounds(read_text(path))
+    planner_works = any(p.get("agent") and p.get("role") == "planner" and p.get("status") == "working" for p in panes)
+    if planner_works or not ready:
+        return "planning"
+    n = max(ready)
+    return f"plan approved {n}" if n in approved else f"plan ready {n}"
+
+
 def lane_phase(f: dict, fleet_dir: Path, removed: bool = False) -> str:
     """The lane's phase; the first rule that matches wins. `f` holds the lane facts and panes with roles."""
     if removed:
@@ -2306,6 +2322,9 @@ def lane_phase(f: dict, fleet_dir: Path, removed: bool = False) -> str:
     status_md = read_text(Path(fleet_dir) / "STATUS.md")
     if any(p.get("agent") and p.get("status") == "blocked" for p in panes) or section_text(status_md, "Blocked"):
         return "blocked"
+    planned = plan_phase(panes, fleet_dir, status_md)
+    if planned:
+        return planned
     requests, reviews = review_rounds(Path(fleet_dir))
     ready = max((int(n) for n in READY_LINE.findall(status_md)), default=None)
     if requests or reviews:
@@ -2347,11 +2366,27 @@ def board_record(f: dict, events: list[dict]) -> dict:
               "agent": p.get("agent"), "status": p.get("status")} for p in f.get("panes") or []]
     status_md = read_text(d / "STATUS.md")
     pr = f.get("pr") or None
-    return {"lane": lane_name(f), "path": f["path"], "branch": f.get("branch"), "workspace": f.get("workspace"),
-            "panes": panes, "pr": {"number": pr.get("number"), "state": pr.get("state")} if pr else None,
-            "phase": lane_phase({**f, "panes": panes}, d),
-            "last_event": newest_lane_event(events, f["path"], f.get("branch")),
-            "blocked": first_note(status_md, "Blocked"), "next": first_note(status_md, r"Next steps?")}
+    phase = lane_phase({**f, "panes": panes}, d)
+    out = {"lane": lane_name(f), "path": f["path"], "branch": f.get("branch"), "workspace": f.get("workspace"),
+           "panes": panes, "pr": {"number": pr.get("number"), "state": pr.get("state")} if pr else None,
+           "phase": phase, "last_event": newest_lane_event(events, f["path"], f.get("branch")),
+           "blocked": first_note(status_md, "Blocked"), "next": first_note(status_md, r"Next steps?")}
+    if phase.startswith("plan ready") and f.get("dirty"):
+        out["warning"] = (f"{plural(f['dirty'], 'changed file')} outside {FLEET_DIR}/: a planner changes only "
+                          f"{PLAN_FILE}; approve-plan refuses")
+    return out
+
+
+def open_research(home: Path) -> list[dict]:
+    """The research files of the project, <home>/research/*.md, that have no RESEARCH DONE line yet."""
+    out = []
+    for path in sorted((home / RESEARCH_DIR).glob("*.md")):
+        text = read_text(path)
+        if RESEARCH_DONE_LINE.search(text):
+            continue
+        title = next((m.group(2) for m in map(HEADING.match, text.splitlines()) if m and len(m.group(1)) == 1), None)
+        out.append({"file": str(path), "title": title})
+    return out
 
 
 def removed_records(events: list[dict], since: float | None, on_board: set[str], names: dict[str, str]) -> list[dict]:
@@ -2473,8 +2508,8 @@ def board_lines(records: list) -> list[str]:
         panes = " ".join(f"{as_text(p.get('role')) or as_text(p.get('agent'))}:{as_text(p.get('status')) or '-'}"
                          for p in panes if isinstance(p, dict) and p.get("agent"))
         last = as_dict(r.get("last_event"))
-        blocked, nxt = as_text(r.get("blocked")), as_text(r.get("next"))
-        note = f"blocked: {blocked}" if blocked else f"next: {nxt}" if nxt else ""
+        blocked, nxt, warning = as_text(r.get("blocked")), as_text(r.get("next")), as_text(r.get("warning"))
+        note = warning if warning else f"blocked: {blocked}" if blocked else f"next: {nxt}" if nxt else ""
         number = pr.get("number")
         table.append([clip(as_text(r.get("lane")) or "?", 28), as_text(r.get("phase")) or "?",
                       f"#{number} {as_text(pr.get('state')).lower()}".strip() if isinstance(number, int) else "-",
@@ -2748,12 +2783,17 @@ def cmd_board(args: argparse.Namespace) -> int:
     records = make_board(home, cursor, {p: b.get("lane") for p, b in base.items() if b.get("lane")})
     with project_lock(home):
         saved = save_board(home, records, made)
+    research = open_research(home)
     if args.json:
-        print(json.dumps({"project": home.name, "board": str(home / BOARD_FILE), "saved": saved, "lanes": records},
-                         indent=2, ensure_ascii=False))
+        print(json.dumps({"project": home.name, "board": str(home / BOARD_FILE), "saved": saved, "lanes": records,
+                          "research": research}, indent=2, ensure_ascii=False))
         return 0
     print(f"project {home.name}: {plural(len(records), 'lane')}" + ("" if saved else " (board.json holds a newer board)"))
     print("\n".join(board_lines(records)))
+    if research:
+        print(f"\nOpen research ({len(research)}, no RESEARCH DONE line yet):")
+        for r in research:
+            print(f"  {short_path(r['file'])}" + (f"  {clip(r['title'], 80)}" if r["title"] else ""))
     return 0
 
 
