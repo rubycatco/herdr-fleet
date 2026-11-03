@@ -1107,7 +1107,7 @@ PROJECTS_DIR = "projects"
 EVENTS_DIR = "events"
 PROJECT_FILE = "project.json"
 LOG_EVENTS = ("worktree", "spawn", "spawn_result", "send", "reset", "retire", "cleanup", "handoff",
-              "session_start", "session_end", "orch_claim", "orch_release", "phase", "plan_approved")
+              "session_start", "session_end", "orch_claim", "orch_release", "phase", "plan_approved", "risk_approved")
 HOOK_GIT_TIMEOUT = 1  # seconds for each git call in a hook; SessionEnd has 5 s in all, SessionStart 10 s
 # Types of the event fields that are not text. `fleet log` drops a field of another type, so one damaged
 # line cannot break it. Add each new field that is not text here.
@@ -1461,6 +1461,8 @@ def describe_event(e: dict) -> str:
     elif kind == "plan_approved":
         text = f"plan round {e.get('round', '?')} approved by {e.get('approved_by') or '?'}, risk {e.get('risk') or '?'}"
         text += f"; high-risk paths: {event_matches(e.get('high_risk'))}" if e.get("high_risk") else ""
+    elif kind == "risk_approved":
+        text = f"risky diff approved by user: {event_matches(e.get('matches'))}"
     elif kind == "phase":
         text = f"{e.get('name') or e.get('branch') or short_path(e.get('lane') or '')}: {e.get('old') or 'new'} -> {e.get('new')}"
     elif kind in ("session_start", "session_end"):
@@ -3782,6 +3784,85 @@ def needs_user(state: dict) -> bool:
     return bool(state.get("needs_user") or state.get("error"))
 
 
+def lane_top(args: argparse.Namespace) -> tuple[str, str | None]:
+    """(the directory that DIR names, default the current one; its git top, or None)."""
+    start = os.path.abspath(os.path.expanduser(args.dir or os.getcwd()))
+    return start, git_toplevel(start) if os.path.isdir(start) else None
+
+
+def risk_lines(state: dict) -> list[str]:
+    """`fleet risk` as text: a line per high-risk match, then what to do."""
+    branch = state.get("branch") or "detached HEAD"
+    if state["error"]:
+        return [f"lane {short_path(state['lane'])} ({branch}): the changes cannot be told: {state['error']}",
+                "It needs the user before merge: show the user the diff and ask."]
+    lines = [f"lane {short_path(state['lane'])} ({branch}): {plural(state['paths'], 'changed path')}, "
+             f"{len(state['matches'])} high-risk"]
+    rows = [[m["category"], m["path"], f"{m['source']} {m['pattern']}",
+             f"covered by {m['covered_by']}" if m["covered_by"] else "needs the user"] for m in state["matches"]]
+    widths = [max(len(r[i]) for r in rows) for i in range(3)] if rows else []
+    lines += ["  " + "  ".join(r[i].ljust(widths[i]) for i in range(3)) + "  " + r[3] for r in rows]
+    if state["needs_user"]:
+        lines.append(f"{plural(len(state['needs_user']), 'path')} need the user: show the user the diff and ask; "
+                     "after the yes, run approve-risk --by user")
+    else:
+        lines.append("Nothing needs the user.")
+    return lines
+
+
+def cmd_risk(args: argparse.Namespace) -> int:
+    start, top = lane_top(args)
+    if not top:
+        raise FleetError(f"{start} is not in a git worktree")
+    state = risk_state(top, project_for(top, create=False), args.base)
+    state["branch"] = git_branch(top) or None
+    if args.json:
+        print(json.dumps({**state, "needs_the_user": needs_user(state)}, indent=2, ensure_ascii=False))
+    else:
+        print("\n".join(risk_lines(state)))
+    return 0
+
+
+def cmd_approve_risk(args: argparse.Namespace) -> int:
+    """Append one `RISK APPROVED: <category> <path> by user <date>` line to the lane's .fleet/RISK.md for each
+    high-risk path that nothing covers, and record risk_approved. Only after the user said yes."""
+    start, top = lane_top(args)
+    if not top:
+        return refuse(reason=f"{start} is not in a git worktree")
+    out = {"lane": top, "by": args.by, **({"base": args.base} if args.base is not None else {})}
+    state = risk_state(top, project_for(top, create=False), args.base)
+    if state["error"]:
+        return refuse(**out, reason=f"the lane's changes cannot be told ({state['error']}), so there is no path "
+                                    "to approve: fix that first (a detached HEAD needs --base <ref>)")
+    todo = state["needs_user"]
+    if not todo:
+        return refuse(**out, reason=f"nothing needs the user: {len(state['matches'])} high-risk "
+                                    f"{'match is' if len(state['matches']) == 1 else 'matches are'} covered")
+    odd = [m["path"] for m in todo if re.search(r"[\x00-\x1f\x7f]", m["path"])]
+    if odd:
+        return refuse(**out, reason=f"{plural(len(odd), 'path')} with a control character cannot be written to "
+                                    f"{RISK_FILE}", paths=odd[:5])
+    d = Path(prep_dir(top)["fleet_dir"])
+    risk_md = d / RISK_FILE
+    branch = git_branch(top) or None
+    when = now_iso()
+    lines = [f"RISK APPROVED: {m['category']} {m['path']} by user {when}" for m in todo]
+    if risk_md.is_file():
+        old = read_text(risk_md)
+        head_text = "" if not old or old.endswith("\n") else "\n"
+    else:
+        head_text = f"# Risk approvals: {branch or 'detached HEAD'}\n\n"
+    with risk_md.open("a") as fh:
+        fh.write(head_text + "\n".join(lines) + "\n")
+    head = git_text(top, "rev-parse", "--verify", "--quiet", "HEAD")
+    matches = [{"category": m["category"], "path": m["path"]} for m in todo]
+    record("risk_approved", top, lane=top, cwd=top, branch=branch, workspace=os.environ.get("HERDR_WORKSPACE_ID"),
+           head=head.strip() if head else None, matches=matches, base=args.base)
+    print(json.dumps({"ok": True, **out, "branch": branch, "file": str(risk_md), "approved": matches,
+                      "lines": lines}, indent=2, ensure_ascii=False))
+    return 0
+
+
 # --------------------------------------------------------------------------
 # hook session-start
 
@@ -4105,6 +4186,28 @@ def build_parser() -> argparse.ArgumentParser:
                     help="the lane's base: its own commits are REF..HEAD (default: the commits of HEAD that no other "
                          "branch, remote branch or tag holds); also allows a detached HEAD")
     ap.set_defaults(func=cmd_approve_plan)
+
+    rk = sub.add_parser("risk", help="the lane's changed paths that match a high-risk pattern, and who approved "
+                                     "them (reads only)",
+                        description="Matches the paths of the lane's own commits and of git status against the "
+                                    "built-in migration directories and the project's ## High-risk paths. A match "
+                                    "is covered by a plan round that the user approved and that shows its category, "
+                                    "or by a RISK APPROVED line in .fleet/RISK.md; the rest needs the user before "
+                                    "merge. When the changes cannot be told, the lane needs the user.")
+    rk.add_argument("dir", nargs="?", help="the lane's worktree (default: the git top of the current directory)")
+    rk.add_argument("--base", metavar="REF", help="the lane's base: its own commits are REF..HEAD (see approve-plan)")
+    rk.add_argument("--json", action="store_true")
+    rk.set_defaults(func=cmd_risk)
+
+    ar = sub.add_parser("approve-risk", help="record the user's yes for the lane's high-risk paths in .fleet/RISK.md",
+                        description="Appends 'RISK APPROVED: <category> <path> by user <date>' for each high-risk "
+                                    "path that `risk` says needs the user, and records risk_approved. It refuses, "
+                                    "changing nothing, outside a git worktree, when the changes cannot be told, and "
+                                    "when nothing needs the user. Run it only after the user said yes.")
+    ar.add_argument("dir", nargs="?", help="the lane's worktree (default: the git top of the current directory)")
+    ar.add_argument("--by", choices=("user",), required=True, help="who approves: only the user can")
+    ar.add_argument("--base", metavar="REF", help="the lane's base: its own commits are REF..HEAD (see approve-plan)")
+    ar.set_defaults(func=cmd_approve_risk)
 
     h = sub.add_parser("hook", help="hook handlers")
     h.add_argument("event", choices=("session-start", "session-end"))

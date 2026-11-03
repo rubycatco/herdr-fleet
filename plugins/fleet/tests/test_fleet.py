@@ -1710,9 +1710,8 @@ class RiskPatternTests(unittest.TestCase):
                          [("app/auth/x.py", "deletion"), ("app/a.py", "deletion")])
 
 
-class RiskDiffTests(unittest.TestCase):
-    """The lane's real changes against the high-risk patterns: which paths count, who covers a match, and the
-    commands risk and approve-risk."""
+class RiskLaneCase(unittest.TestCase):
+    """A main checkout and a lane worktree in a scratch directory, with a temporary FLEET_HOME."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1743,6 +1742,10 @@ class RiskDiffTests(unittest.TestCase):
 
     def state(self, base=None):
         return fleet.risk_state(str(self.lane), self.home, base)
+
+
+class RiskDiffTests(RiskLaneCase):
+    """The lane's real changes against the high-risk patterns: which paths count, and who covers a match."""
 
     def test_changed_paths(self):
         self.assertEqual(self.changed(), ([], None))
@@ -1837,6 +1840,97 @@ class RiskDiffTests(unittest.TestCase):
         self.assertEqual((state["needs_user"], state["covered"][0]["covered_by"]), ([], "RISK.md"))
         (self.lane / "db" / "migrate" / "002.sql").write_text("alter\n")
         self.assertEqual([m["path"] for m in self.state()["needs_user"]], ["db/migrate/002.sql"])
+
+
+class RiskCommandTests(RiskLaneCase):
+    """`risk` (reads only) and `approve-risk` (the record of the user's yes)."""
+
+    def run_cmd(self, *argv, cwd=None):
+        buf = io.StringIO()
+        with chdir(cwd or self.lane), redirect_stdout(buf):
+            code = fleet.main(list(argv))
+        return code, buf.getvalue()
+
+    def logs(self):
+        return {str(p): p.read_bytes() for p in sorted((self.root / "home").rglob("*.jsonl"))}
+
+    def refused(self, *argv, reason, cwd=None):
+        risk_md = self.fleet_dir / "RISK.md"
+        before = risk_md.read_bytes() if risk_md.is_file() else None
+        fleet.record("send", str(self.repo), by=False, pane="w9:p9", text="an earlier event")
+        logs = self.logs()
+        code, text = self.run_cmd("approve-risk", *argv, cwd=cwd)
+        out = json.loads(text)
+        self.assertEqual((code, out["ok"], out["changed"]), (2, False, "nothing"), out)
+        self.assertIn(reason, out["reason"])
+        self.assertEqual(risk_md.read_bytes() if risk_md.is_file() else None, before)
+        self.assertEqual(self.logs(), logs)
+        return out
+
+    def test_risk_text_and_json(self):
+        code, text = self.run_cmd("risk")
+        self.assertEqual((code, text.splitlines()[-1]), (0, "Nothing needs the user."))
+        (self.home / "PROJECT.md").write_text("## High-risk paths\n- auth-payments: app/auth/\n")
+        self.commit(self.lane, "db/migrate/001.sql", "create\n", "a migration")
+        (self.lane / "app" / "auth").mkdir(parents=True)
+        (self.lane / "app" / "auth" / "x.py").write_text("")
+        (self.fleet_dir / "RISK.md").write_text("RISK APPROVED: auth-payments app/auth/x.py by user 2026\n")
+        code, text = self.run_cmd("risk", str(self.lane), cwd=self.root)
+        lines = text.splitlines()
+        self.assertEqual(lines[0], f"lane {fleet.short_path(str(self.lane))} (feat/lane): 2 changed paths, 2 high-risk")
+        self.assertRegex(lines[1], r"^  auth-payments  app/auth/x\.py\s+PROJECT\.md app/auth/\s+covered by RISK\.md$")
+        self.assertRegex(lines[2], r"^  migration\s+db/migrate/001\.sql\s+builtin \*\*/migrate/\*\*\s+needs the user$")
+        self.assertIn("1 path need the user", lines[3])
+        self.assertIn("approve-risk --by user", lines[3])
+        code, text = self.run_cmd("risk", "--json")
+        out = json.loads(text)
+        self.assertEqual((out["needs_the_user"], [m["path"] for m in out["needs_user"]], out["branch"]),
+                         (True, ["db/migrate/001.sql"], "feat/lane"))
+        git("checkout", "-q", "--detach", cwd=self.lane)
+        text = self.run_cmd("risk")[1]
+        self.assertIn("the changes cannot be told: HEAD is detached", text)
+        self.assertTrue(json.loads(self.run_cmd("risk", "--json")[1])["needs_the_user"])
+
+    def test_approve_risk(self):
+        self.refused("--by", "user", reason="not in a git worktree", cwd=self.root)
+        self.refused("--by", "user", reason="nothing needs the user: 0 high-risk matches are covered")
+        self.commit(self.lane, "db/migrate/001.sql", "create\n", "a migration")
+        (self.lane / "db" / "migrations").mkdir(parents=True)
+        (self.lane / "db" / "migrations" / "x.py").write_text("")
+        git("checkout", "-q", "--detach", cwd=self.lane)
+        self.refused("--by", "user", reason="cannot be told (HEAD is detached")
+        git("checkout", "-q", "feat/lane", cwd=self.lane)
+        code, text = self.run_cmd("approve-risk", "--by", "user")
+        out = json.loads(text)
+        self.assertEqual((code, out["ok"], out["approved"]),
+                         (0, True, [{"category": "migration", "path": "db/migrate/001.sql"},
+                                    {"category": "migration", "path": "db/migrations/x.py"}]))
+        lines = (self.fleet_dir / "RISK.md").read_text().splitlines()
+        self.assertEqual(lines[0], "# Risk approvals: feat/lane")
+        self.assertRegex(lines[2], r"^RISK APPROVED: migration db/migrate/001\.sql by user \d{4}-\d\d-\d\dT")
+        self.assertFalse(fleet.needs_user(self.state()))
+        [event] = [e for e in fleet.read_events([self.home]) if e["event"] == "risk_approved"]
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.lane, capture_output=True, text=True).stdout.strip()
+        self.assertEqual((event["head"], event["branch"], event["lane"], event["matches"]),
+                         (head, "feat/lane", str(self.lane), out["approved"]))
+        self.assertEqual(fleet.describe_event(event), "risky diff approved by user: migration db/migrate/001.sql, "
+                                                      "migration db/migrations/x.py")
+        self.assertEqual(fleet.clean_event(event)["matches"], out["approved"])
+        self.refused("--by", "user", reason="nothing needs the user: 2 high-risk matches are covered")
+        # A later risky path gets its own line; the old lines stay.
+        with (self.fleet_dir / "RISK.md").open("a") as fh:
+            fh.write("a note without a newline")
+        self.commit(self.lane, "alembic/env.py", "", "alembic")
+        self.assertEqual(self.run_cmd("approve-risk", "--by", "user")[0], 0)
+        lines = (self.fleet_dir / "RISK.md").read_text().splitlines()
+        self.assertEqual((len(lines), lines[4], lines[5][:40]),
+                         (6, "a note without a newline", "RISK APPROVED: migration alembic/env.py "))
+        # A path with a control character cannot be written as one line.
+        (self.lane / "db" / "migrate" / "a\nb.sql").write_text("")
+        self.refused("--by", "user", reason="with a control character")
+        with self.assertRaises(SystemExit), mock.patch.object(sys, "stderr", io.StringIO()):
+            fleet.main(["approve-risk", "--by", "orch"])
+        self.assertEqual(fleet.status_paths(str(self.lane)).count(".fleet/RISK.md"), 0)  # .fleet/ stays out of git
 
 
 class DocsTests(unittest.TestCase):
