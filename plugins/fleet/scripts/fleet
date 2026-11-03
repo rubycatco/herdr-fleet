@@ -2194,10 +2194,12 @@ def marker_line(marker: str) -> str:
     return r"^[^\w\n]*" + marker + r"(?!\w)"
 
 
-READY_LINE = re.compile(marker_line(r"READY FOR REVIEW: round (\d+)"), re.M)
+# A round number has at most 9 digits; with the marker's (?!\w), a longer one is no marker. int() then never meets
+# a number too long to convert.
+READY_LINE = re.compile(marker_line(r"READY FOR REVIEW: round (\d{1,9})"), re.M)
 PLAN_FILE = "PLAN.md"
-PLAN_READY_LINE = re.compile(marker_line(r"PLAN READY: (\d+)"), re.M)
-PLAN_APPROVED_LINE = re.compile(marker_line(r"PLAN APPROVED: (\d+)"), re.M)
+PLAN_READY_LINE = re.compile(marker_line(r"PLAN READY: (\d{1,9})"), re.M)
+PLAN_APPROVED_LINE = re.compile(marker_line(r"PLAN APPROVED: (\d{1,9})"), re.M)
 RESEARCH_DIR = "research"
 RESEARCH_DONE_LINE = re.compile(marker_line("RESEARCH DONE"), re.M)
 RISK_LINE = re.compile(r"^[^\w\n]*Risk[*_`]*:[*_`]*[ \t]*(.*)$", re.M)
@@ -2371,10 +2373,27 @@ def board_record(f: dict, events: list[dict]) -> dict:
            "panes": panes, "pr": {"number": pr.get("number"), "state": pr.get("state")} if pr else None,
            "phase": phase, "last_event": newest_lane_event(events, f["path"], f.get("branch")),
            "blocked": first_note(status_md, "Blocked"), "next": first_note(status_md, r"Next steps?")}
-    if phase.startswith("plan ready") and f.get("dirty"):
-        out["warning"] = (f"{plural(f['dirty'], 'changed file')} outside {FLEET_DIR}/: a planner changes only "
-                          f"{PLAN_FILE}; approve-plan refuses")
+    if phase.startswith("plan ready"):
+        warning = plan_gate_note(f["path"])
+        if warning:
+            out["warning"] = warning
     return out
+
+
+def plan_gate_note(path: str) -> str | None:
+    """What makes `approve-plan` refuse in this lane, from the same checks, or None. Only for `plan ready`."""
+    paths = status_paths(path)
+    commits, why = lane_commits(path)
+    parts = []
+    if paths is None:
+        parts.append("git status failed")
+    elif outside_fleet(paths):
+        parts.append(f"{plural(len(outside_fleet(paths)), 'changed path')} outside {FLEET_DIR}/")
+    if commits is None:
+        parts.append("the lane's own commits cannot be counted" + (" (HEAD is detached)" if "detached" in why else ""))
+    elif commits:
+        parts.append(plural(len(commits), "lane commit"))
+    return f"{', '.join(parts)}: approve-plan refuses" if parts else None
 
 
 def open_research(home: Path) -> list[dict]:
@@ -3284,6 +3303,68 @@ def cmd_accounts(args: argparse.Namespace) -> int:
 # approve-plan: the gate between a planner and the implementer
 
 
+def git_text(path: str, *args: str, timeout: float = 15) -> str | None:
+    """stdout of a git command run in `path`, decoded with replacement (a path need not be UTF-8); None when git
+    fails or cannot run."""
+    try:
+        cp = subprocess.run(["git", "-C", path, *args], capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return cp.stdout.decode("utf-8", errors="replace") if cp.returncode == 0 else None
+
+
+def status_paths(path: str) -> list[str] | None:
+    """Every path that `git status` reports in the checkout at `path`, both sides of a rename or copy, with each
+    untracked file and each submodule listed whatever the user's git settings say. None when git fails.
+
+    `count_dirty`, which sweep and cleanup use, reads the plain porcelain form instead."""
+    out = git_text(path, "status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none")
+    if out is None:
+        return None
+    fields = out.split("\0")
+    paths: list[str] = []
+    i = 0
+    while i < len(fields):
+        entry = fields[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        paths.append(entry[3:])
+        if "R" in entry[:2] or "C" in entry[:2]:  # `XY <to>`, then `<from>` as the next field
+            if i < len(fields) and fields[i]:
+                paths.append(fields[i])
+            i += 1
+    return paths
+
+
+def outside_fleet(paths: list[str]) -> list[str]:
+    """The paths that are not in the lane's .fleet/."""
+    return [p for p in paths if not (p == FLEET_DIR or p.startswith(FLEET_DIR + "/"))]
+
+
+def lane_commits(path: str, base: str | None = None) -> tuple[list[str] | None, str | None]:
+    """(the commits that only this lane holds, newest first, as `<short sha> <subject>`; why they cannot be told).
+
+    With `base`: the commits of `<base>..HEAD`. Without it: the commits of HEAD that no other local branch, no
+    remote branch of another name and no tag holds. That needs no stored state: a fresh lane has none, and a
+    lane on a local feature branch neither. It needs a branch: a detached HEAD needs `base`."""
+    if base is not None:
+        sha = None if base.startswith("-") else git_text(path, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}")
+        if not sha or not sha.strip():
+            return None, f"--base {base} does not name a commit"
+        revs = [f"{sha.strip()}..HEAD"]
+    else:
+        branch = (git_text(path, "symbolic-ref", "--quiet", "--short", "HEAD") or "").strip()
+        if not branch:
+            return None, "HEAD is detached, so the lane's own commits cannot be told; pass --base <ref>"
+        # Each --exclude applies to the next --branches or --remotes only.
+        revs = ["HEAD", "--not", f"--exclude={branch}", "--branches", f"--exclude=*/{branch}", "--remotes", "--tags"]
+    out = git_text(path, "log", "--format=%h %s", *revs, "--")
+    if out is None:
+        return None, "git log failed, so the lane's own commits cannot be told"
+    return out.splitlines(), None
+
+
 def plan_rounds(text: str) -> tuple[list[int], set[int]]:
     """The rounds of a PLAN.md: those with a `PLAN READY: <n>` line, and those with a `PLAN APPROVED: <n>` line."""
     return ([int(n) for n in PLAN_READY_LINE.findall(text)], {int(n) for n in PLAN_APPROVED_LINE.findall(text)})
@@ -3304,8 +3385,8 @@ def plan_risk(text: str) -> tuple[str | None, bool]:
 
 def cmd_approve_plan(args: argparse.Namespace) -> int:
     """Append `PLAN APPROVED: <n> by <who> <date>` to the lane's PLAN.md. It refuses, and writes nothing, unless
-    round n is ready and not yet approved, the worktree has no change outside .fleet/, and the risk is `none`
-    or the user approves."""
+    round n is ready and not yet approved, the worktree has no change outside .fleet/, the lane has no commit
+    of its own, and the risk is `none` or the user approves. `--by user` overrides only the risk."""
     start = os.path.abspath(os.path.expanduser(args.dir or os.getcwd()))
     top = git_toplevel(start) if os.path.isdir(start) else None
     if not top:
@@ -3327,13 +3408,24 @@ def cmd_approve_plan(args: argparse.Namespace) -> int:
     out["round"] = n
     if n in approved:
         return refuse(**out, reason=f"round {n} of the plan is already approved")
-    status = run_git(top, "status", "--porcelain")
-    if status is None or status.returncode != 0:
+    paths = status_paths(top)
+    if paths is None:
         return refuse(**out, reason="git status failed, so the worktree cannot be checked")
-    dirty = count_dirty(status.stdout)
-    if dirty:
-        return refuse(**out, reason=f"the worktree has {plural(dirty, 'changed file')} outside {FLEET_DIR}/: a "
-                                    f"planner changes no file except {PLAN_FILE}", changes=dirty)
+    changed = outside_fleet(paths)
+    if changed:
+        return refuse(**out, reason=f"the worktree has {plural(len(changed), 'changed path')} outside {FLEET_DIR}/: "
+                                    f"a planner changes no file except {PLAN_FILE}",
+                      changes=len(changed), paths=changed[:5])
+    if args.base is not None:
+        out["base"] = args.base
+    commits, why = lane_commits(top, args.base)
+    if commits is None:
+        return refuse(**out, reason=why)
+    if commits:
+        return refuse(**out, reason=f"the lane has {plural(len(commits), 'commit')} of its own: a planner commits "
+                                    "nothing. When a commit predates the plan, or no branch, remote or tag holds the "
+                                    "lane's base, name the base with --base <ref>",
+                      lane_commits=len(commits), commits=commits[:5])
     risk, low = plan_risk(text)
     out["risk"] = risk
     if not low and args.by != "user":
@@ -3345,7 +3437,7 @@ def cmd_approve_plan(args: argparse.Namespace) -> int:
         fh.write(("" if not text or text.endswith("\n") else "\n") + line + "\n")
     branch = git_branch(top) or None
     record("plan_approved", top, lane=top, cwd=top, branch=branch, workspace=os.environ.get("HERDR_WORKSPACE_ID"),
-           round=n, approved_by=args.by, risk=risk)
+           round=n, approved_by=args.by, risk=risk, base=args.base)
     print(json.dumps({"ok": True, **out, "lane": top, "branch": branch, "line": line}, indent=2, ensure_ascii=False))
     return 0
 
@@ -3656,11 +3748,16 @@ def build_parser() -> argparse.ArgumentParser:
                         description="Appends 'PLAN APPROVED: <n> by <who> <date>' and records plan_approved. It "
                                     "refuses, changing nothing, when PLAN.md is missing, has no 'PLAN READY: <n>' "
                                     "line (for --round N), already approves round n, the worktree has changes "
-                                    "outside .fleet/, or the Risk: line is not 'none' and --by is not user.")
+                                    "outside .fleet/, the lane has commits of its own (or a detached HEAD without "
+                                    "--base), or the Risk: line is not 'none' and --by is not user. --by user "
+                                    "overrides only the risk.")
     ap.add_argument("dir", nargs="?", help="the lane's worktree (default: the git top of the current directory)")
     ap.add_argument("--by", choices=("orch", "user"), required=True,
                     help="who approves: user only after the user said yes; a risk other than none needs it")
     ap.add_argument("--round", type=int, metavar="N", help="the round to approve (default: the newest)")
+    ap.add_argument("--base", metavar="REF",
+                    help="the lane's base: its own commits are REF..HEAD (default: the commits of HEAD that no other "
+                         "branch, remote branch or tag holds); also allows a detached HEAD")
     ap.set_defaults(func=cmd_approve_plan)
 
     h = sub.add_parser("hook", help="hook handlers")

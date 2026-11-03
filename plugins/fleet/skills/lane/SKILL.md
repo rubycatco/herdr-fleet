@@ -78,7 +78,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --pane <pane_id> --role impl
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" approve-plan <cwd> --by orch
    ```
-   Any other risk: first ask the user, with the plan's approach and risks in a few lines. Pass `--by user` only after the user's yes. `approve-plan` refuses, and changes nothing, when the round is not ready or already approved, the worktree has changes outside `.fleet/` (a planner changes no file except PLAN.md), or the risk needs the user. Read its `reason`, fix the cause, and run it again.
+   Any other risk: first ask the user, with the plan's approach and risks in a few lines. Pass `--by user` only after the user's yes. `approve-plan` refuses, and changes nothing, when the round is not ready or already approved, the worktree has changes outside `.fleet/` or the lane has commits of its own (a planner changes and commits nothing but PLAN.md, which git does not track), or the risk needs the user. `--by user` overrides only the risk. Read its `reason` (with `paths` or `commits`), fix the cause, and run it again. When no branch, remote or tag holds the lane's base, or the lane had commits before the plan, pass `--base <ref>`.
 6. Exit the planner, keep the pane, and start the implementer in it:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" retire <pane_id>

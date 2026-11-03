@@ -1235,12 +1235,25 @@ class ApprovePlanTests(unittest.TestCase):
         home = fleet.project_for(str(self.repo))
         return [e for e in fleet.read_events([home]) if e["event"] == "plan_approved"]
 
-    def refused(self, *argv, reason, cwd=None):
-        before = self.plan.read_bytes() if self.plan.is_file() else None
+    def logs(self):
+        """The bytes of every event file under FLEET_HOME."""
+        return {str(p): p.read_bytes() for p in sorted((self.root / "home").rglob("*.jsonl"))}
+
+    def commit(self, path, name, text, message):
+        (path / name).write_text(text)
+        git("add", name, cwd=path)
+        git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", message, cwd=path)
+
+    def refused(self, *argv, reason, cwd=None, plan=None):
+        plan = plan or self.plan
+        before = plan.read_bytes() if plan.is_file() else None
+        fleet.record("send", str(self.repo), by=False, pane="w9:p9", text="an earlier event")
+        logs = self.logs()
         code, out = self.approve(*argv, cwd=cwd)
         self.assertEqual((code, out["ok"], out["changed"]), (2, False, "nothing"), out)
         self.assertIn(reason, out["reason"])
-        self.assertEqual(self.plan.read_bytes() if self.plan.is_file() else None, before)
+        self.assertEqual(plan.read_bytes() if plan.is_file() else None, before)
+        self.assertEqual(self.logs(), logs)
         self.assertEqual(self.approvals(), [])
         return out
 
@@ -1258,14 +1271,97 @@ class ApprovePlanTests(unittest.TestCase):
     def test_refuses_changes_outside_fleet(self):
         self.plan.write_text(self.PLAN)
         (self.lane / "app.py").write_text("x = 2\n")
-        out = self.refused("--by", "user", reason="1 changed file outside .fleet/")
-        self.assertEqual(out["changes"], 1)
+        out = self.refused("--by", "user", reason="1 changed path outside .fleet/")
+        self.assertEqual((out["changes"], out["paths"]), (1, ["app.py"]))
         git("checkout", "app.py", cwd=self.lane)
-        (self.lane / "new.py").write_text("")
-        self.refused("--by", "orch", reason="outside .fleet/")
-        (self.lane / "new.py").unlink()
+        (self.lane / "src").mkdir()
+        for i in range(7):
+            (self.lane / "src" / f"m{i}.py").write_text("")
+        out = self.refused("--by", "orch", reason="7 changed paths outside .fleet/")
+        self.assertEqual(out["paths"], [f"src/m{i}.py" for i in range(5)])  # each file, at most five
+        shutil.rmtree(self.lane / "src")
         (self.plan.parent / "notes.md").write_text("inside .fleet/ is fine")
         self.assertEqual(self.approve("--by", "orch")[0], 0)
+
+    def test_git_settings_cannot_hide_untracked_files(self):
+        self.plan.write_text(self.PLAN)
+        git("config", "status.showUntrackedFiles", "no", cwd=self.lane)
+        (self.lane / "new.py").write_text("")
+        plain = subprocess.run(["git", "status", "--porcelain"], cwd=self.lane, capture_output=True, text=True)
+        self.assertEqual(plain.stdout, "")  # what the gate read before
+        self.assertEqual(self.refused("--by", "user", reason="outside .fleet/")["paths"], ["new.py"])
+
+    def test_a_rename_out_of_fleet_is_a_change(self):
+        # A base that tracks a file in .fleet/; the lane moves it to a code path, staged, without a commit.
+        (self.repo / ".fleet").mkdir(exist_ok=True)
+        (self.repo / ".fleet" / "draft.py").write_text("print('x')\n")
+        git("add", "-f", ".fleet/draft.py", cwd=self.repo)
+        git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "draft", cwd=self.repo)
+        lane = self.root / "lane-r"
+        git("worktree", "add", "-q", "-b", "feat/r", str(lane), cwd=self.repo)
+        plan = Path(fleet.prep_dir(str(lane))["fleet_dir"]) / "PLAN.md"
+        plan.write_text(self.PLAN)
+        git("mv", ".fleet/draft.py", "app2.py", cwd=lane)
+        self.assertIn(" -> ", subprocess.run(["git", "status", "--porcelain"], cwd=lane, capture_output=True,
+                                             text=True).stdout)
+        self.assertEqual(fleet.count_dirty("R  .fleet/draft.py -> app2.py\n"), 0)  # sweep's reading, unchanged
+        self.assertEqual(fleet.status_paths(str(lane)), ["app2.py", ".fleet/draft.py"])
+        out = self.refused("--by", "user", reason="1 changed path outside .fleet/", cwd=lane, plan=plan)
+        self.assertEqual(out["paths"], ["app2.py"])
+        # A name with spaces and an arrow stays one path.
+        git("mv", "app2.py", "a -> b.py", cwd=lane)
+        self.assertEqual(fleet.outside_fleet(fleet.status_paths(str(lane))), ["a -> b.py"])
+
+    def test_refuses_commits_of_the_lane(self):
+        self.plan.write_text(self.PLAN)
+        self.commit(self.lane, "app.py", "x = 2\n", "planner wrote code")
+        out = self.refused("--by", "user", reason="1 commit of its own")
+        self.assertIn("--base", out["reason"])
+        self.assertEqual(len(out["commits"]), 1)
+        self.assertRegex(out["commits"][0], r"^[0-9a-f]{7,} planner wrote code$")
+        self.refused("--by", "user", "--base", "main", reason="1 commit of its own")
+        # A remote branch of the lane's own name does not hide it.
+        remote = self.root / "remote.git"
+        git("init", "-q", "--bare", str(remote), cwd=self.root)
+        git("remote", "add", "origin", str(remote), cwd=self.repo)
+        git("push", "-q", "origin", "main", "feat/lane", cwd=self.lane)
+        self.refused("--by", "orch", reason="1 commit of its own")
+        # A commit and its revert leave the tree as it was, and still count.
+        git("-c", "user.email=t@t", "-c", "user.name=t", "revert", "--no-edit", "HEAD", cwd=self.lane)
+        self.assertEqual(subprocess.run(["git", "diff", "main", "--stat"], cwd=self.lane, capture_output=True,
+                                        text=True).stdout, "")
+        self.assertEqual(self.refused("--by", "orch", reason="2 commits of its own")["lane_commits"], 2)
+        # --base names the start when a commit predates the plan.
+        code, out = self.approve("--by", "orch", "--base", "HEAD")
+        self.assertEqual((code, out["base"]), (0, "HEAD"))
+        self.assertEqual(self.approvals()[0]["base"], "HEAD")
+
+    def test_a_lane_on_a_feature_branch_or_ahead_of_origin_has_no_commits(self):
+        self.commit(self.repo, "lib.py", "", "main moves on, ahead of any remote")
+        git("branch", "feat/base", cwd=self.repo)
+        self.commit(self.repo, "more.py", "", "main moves again")
+        lane = self.root / "stacked"
+        git("worktree", "add", "-q", "-b", "feat/stacked", str(lane), "feat/base", cwd=self.repo)
+        plan = Path(fleet.prep_dir(str(lane))["fleet_dir"]) / "PLAN.md"
+        plan.write_text(self.PLAN)
+        self.assertEqual(fleet.lane_commits(str(lane)), ([], None))
+        self.assertEqual(self.approve("--by", "orch", cwd=lane)[0], 0)
+
+    def test_detached_head_and_a_bad_base(self):
+        self.plan.write_text(self.PLAN)
+        git("checkout", "-q", "--detach", cwd=self.lane)
+        self.refused("--by", "user", reason="HEAD is detached")
+        self.refused("--by", "orch", "--base", "no-such-ref", reason="--base no-such-ref does not name a commit")
+        self.refused("--by", "orch", "--base=--all", reason="does not name a commit")
+        self.assertEqual(self.approve("--by", "orch", "--base", "main")[0], 0)
+
+    def test_a_round_number_too_long_is_no_marker(self):
+        self.plan.write_text("Risk: none\nPLAN READY: " + "9" * 5000 + "\n")
+        self.refused("--by", "orch", reason="no PLAN READY line")
+        self.plan.write_text("Risk: none\nPLAN READY: 1234567890\n")
+        self.refused("--by", "orch", reason="no PLAN READY line")
+        self.plan.write_text("Risk: none\nPLAN READY: 123456789\nPLAN APPROVED: " + "1" * 5000 + "\n")
+        self.assertEqual(self.approve("--by", "orch")[1]["round"], 123456789)
 
     def test_risk_needs_the_user(self):
         for risk in (None, "none | migration | auth-payments | deletion | hotfix", "migration", "auth-payments",
@@ -1567,12 +1663,50 @@ class OrchTests(unittest.TestCase):
         # Without PLAN.md, a planner pane is never the implementer.
         self.assertEqual(self.phase(panes=planner("working")), "no agent")
 
+    def test_a_round_number_too_long_breaks_neither_board_nor_digest(self):
+        huge = "9" * 5000
+        a = self.add_lane("a", PLAN_md=f"Risk: none\nPLAN READY: {huge}\n")
+        b = self.add_lane("b", PLAN_md=f"Risk: none\nPLAN READY: 2\nPLAN APPROVED: {huge}\n")
+        c = self.add_lane("c", STATUS_md=f"## Log\n- x\n\nREADY FOR REVIEW: round {huge}\n")
+        d = self.add_lane("d", STATUS_md="READY FOR REVIEW: round 123456789\n")
+        idle = [{"pane": "w2:p1", "agent": "claude", "status": "idle"}]
+        lanes = [self.facts(a), self.facts(b), self.facts(c, panes=idle), self.facts(d, panes=idle)]
+        want = {"feat/a": "planning", "feat/b": "plan ready 2", "feat/c": "idle", "feat/d": "ready 123456789"}
+        for argv in (("board", "--json"), ("digest", "--peek", "--json")):
+            code, out = self.board(lanes, *argv)
+            self.assertEqual(code, 0, argv)
+            self.assertEqual({r["lane"]: r["phase"] for r in json.loads(out)["lanes"]}, want, argv)
+
+    def test_marker_sentences_now_count_as_notes(self):
+        """Approved change: a line that mentions a marker inside a sentence is no longer dropped as a marker."""
+        md = "## Blocked\n- Should I add READY FOR REVIEW: round 1 before the docs?\n"
+        self.assertEqual(self.phase(files={"STATUS.md": md},
+                                    panes=[{"pane": "w2:p1", "agent": "claude", "status": "idle", "role": "impl"}]),
+                         "blocked")
+        self.orch_setup(rules=("- Wait for READY FOR REVIEW: round 1 before review.",))
+        text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)}, env={"HERDR_PANE_ID": "w1:p1"})
+        self.assertIn("- Wait for READY FOR REVIEW: round 1 before review.", text)
+
+    def test_a_researcher_is_never_the_implementer(self):
+        """Approved change: without PLAN.md, a researcher alone is `no agent`; an implementer without a role still
+        decides the phase next to one."""
+        researcher = {"pane": "w2:p2", "agent": "claude", "status": "working", "role": "researcher"}
+        self.assertEqual(self.phase(panes=[researcher]), "no agent")
+        self.assertEqual(self.phase(panes=[researcher, {"pane": "w2:p1", "agent": "claude", "status": "working"}]),
+                         "working")
+        self.assertEqual(self.phase(panes=[researcher, {"pane": "w2:p1", "agent": "claude", "status": "done"}]),
+                         "idle")
+
     def test_board_plan_warning_and_open_research(self):
         a = self.add_lane("a", PLAN_md="Risk: none\nPLAN READY: 1\n", STATUS_md="## Next step\nWait.\n")
         b = self.add_lane("b", STATUS_md="## Next step\nGo.\n")
+        fleet.prep_dir(str(a))
         fleet.save_panes(a / ".fleet", {"w2:p1": {"role": "planner"}})
-        lanes = [{**self.facts(a, panes=[{"pane": "w2:p1", "agent": "claude", "status": "idle"}]), "dirty": 2},
-                 {**self.facts(b, panes=[{"pane": "w3:p1", "agent": "claude", "status": "working"}]), "dirty": 3}]
+        (a / "x.py").write_text("")
+        (a / "y.py").write_text("")
+        (b / "z.py").write_text("")
+        lanes = [self.facts(a, panes=[{"pane": "w2:p1", "agent": "claude", "status": "idle"}]),
+                 self.facts(b, panes=[{"pane": "w3:p1", "agent": "claude", "status": "working"}])]
         research = self.project / "research"
         research.mkdir()
         (research / "auth-flow.md").write_text("# Research: how does auth work?\n\n## Question\nx\n"
@@ -1582,21 +1716,25 @@ class OrchTests(unittest.TestCase):
         out = json.loads(self.board(lanes, "board", "--json")[1])
         recs = {r["lane"]: r for r in out["lanes"]}
         self.assertEqual(recs["feat/a"]["phase"], "plan ready 1")
-        self.assertIn("2 changed files outside .fleet/", recs["feat/a"]["warning"])
+        self.assertEqual(recs["feat/a"]["warning"], "2 changed paths outside .fleet/: approve-plan refuses")
         self.assertEqual(recs["feat/b"]["phase"], "working")
         self.assertNotIn("warning", recs["feat/b"])  # only at plan ready
         self.assertEqual(out["research"], [{"file": str(research / "auth-flow.md"),
                                             "title": "Research: how does auth work?"}])
         text = self.board(lanes, "board")[1]
-        self.assertRegex(text, r"feat/a\s+plan ready 1\s+-\s+planner:idle\s+-\s+2 changed files outside")
+        self.assertRegex(text, r"feat/a\s+plan ready 1\s+-\s+planner:idle\s+-\s+2 changed paths outside")
         self.assertIn("Open research (1, no RESEARCH DONE line yet):", text)
         self.assertIn("auth-flow.md  Research: how does auth work?", text)
         self.assertNotIn("cache.md", text)
-        # Clean worktree: no warning. No open research: no research block.
-        lanes[0]["dirty"] = 0
+        # The note counts the lane's commits too, like approve-plan; a clean lane has no note.
+        git("add", "x.py", "y.py", cwd=a)
+        git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "code", cwd=a)
+        recs = {r["lane"]: r for r in json.loads(self.board(lanes, "board", "--json")[1])["lanes"]}
+        self.assertEqual(recs["feat/a"]["warning"], "1 lane commit: approve-plan refuses")
+        git("reset", "-q", "--hard", "HEAD~1", cwd=a)
         (research / "auth-flow.md").write_text("# Research\n\n- RESEARCH DONE\n")
         text = self.board(lanes, "board")[1]
-        self.assertNotIn("outside .fleet", text)
+        self.assertNotIn("approve-plan refuses", text)
         self.assertNotIn("Open research", text)
 
     def test_status_notes(self):
