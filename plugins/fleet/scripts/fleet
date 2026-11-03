@@ -51,10 +51,11 @@ from pathlib import Path
 VERSION = "0.5.0"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 FLEET_DIR = ".fleet"
-LANE_FILES = ("BRIEF.md", "STATUS.md", "HANDOFF.md")
+LANE_FILES = ("BRIEF.md", "STATUS.md", "HANDOFF.md", "PLAN.md")
 ORCHESTRATOR_FILE = "FLEET.md"
 PANES_FILE = "panes.json"  # pane id -> role record, written by `fleet spawn --role`
-ROLES = ("impl", "critic", "orchestrator", "helper")
+ROLES = ("impl", "critic", "orchestrator", "helper", "planner", "researcher")
+TASK_ROLES = ("researcher", "helper")  # the roles whose re-brief points at their --task file
 ORCHESTRATOR_LINE = re.compile(r"^\s*Orchestrator:\s*pane\s+([A-Za-z0-9]+:[A-Za-z0-9]+)", re.M)
 SESSION_ID = re.compile(r"[0-9A-Za-z-]{8,64}")
 PROMPT_MAX = 500  # longer text, or any newline, is written to a file and sent as a pointer
@@ -586,6 +587,13 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     prompt = args.prompt
     if prompt and (len(prompt) > PROMPT_MAX or "\n" in prompt):
         raise FleetError(f"--prompt must be one line of at most {PROMPT_MAX} characters; write the task to a file and pass a pointer such as 'Read .fleet/BRIEF.md and execute it.'")
+    task = None
+    if args.task:
+        if not args.role:
+            raise FleetError("--task needs --role: the task file is kept with the pane's role in .fleet/panes.json")
+        task = os.path.abspath(os.path.expanduser(args.task))
+        if not os.path.isfile(task):
+            raise FleetError(f"--task: no such file: {task}")
     remuda = remuda_path()
     accounts = remuda_accounts(remuda) if remuda else None
     agent = args.agent or default_agent(args.account, accounts)
@@ -605,7 +613,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         raise FleetError(f"{who} cannot see session {args.resume} (no transcript under {launch['home']}/projects); "
                          "hand off with a handoff file instead")
     if args.dry_run:
-        print(json.dumps({"dry_run": True, **launch}, indent=2, ensure_ascii=False))
+        print(json.dumps({"dry_run": True, **launch, **({"task": task} if task else {})}, indent=2, ensure_ascii=False))
         return 0
     require_herdr()
     target = create_pane(args)
@@ -613,10 +621,11 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     if args.name:
         herdr_ok("pane", "rename", pane, args.name)
     if args.role and target.get("cwd"):
-        target["registry"] = register_pane(target["cwd"], pane, {
-            "role": args.role, "agent": agent, "account": launch["account"], "label": args.name,
-            "spawned_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "spawned_by": os.environ.get("HERDR_PANE_ID"),
-        })
+        entry = {"role": args.role, "agent": agent, "account": launch["account"], "label": args.name,
+                 "spawned_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "spawned_by": os.environ.get("HERDR_PANE_ID")}
+        if task:
+            entry["task"] = task
+        target["registry"] = register_pane(target["cwd"], pane, entry)
     run(["herdr", "pane", "run", pane, launch["command"]])
     # Record the launch now: the wait can take minutes, and the caller can stop the command during it.
     cwd = target.get("cwd")
@@ -624,7 +633,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
              "branch": (git_branch(cwd) or None) if cwd else None, "agent": agent, "role": args.role}
     record("spawn", cwd, **where, placement=target.get("placement"), account=launch["account"], model=args.model,
            effort=args.effort, permission_mode=args.permission_mode, label=args.name, prompt=prompt,
-           resume=args.resume)
+           resume=args.resume, task=task)
     if args.no_wait:
         result = {"ok": True, "status": "launched", "notes": ["did not wait for the agent"]}
     else:
@@ -633,7 +642,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         except FleetError as e:
             record("spawn_result", cwd, **where, ok=False, reason=str(e))
             raise
-    out = {**result, **target, **launch, "label": args.name, "role": args.role}
+    out = {**result, **target, **launch, "label": args.name, "role": args.role, **({"task": task} if task else {})}
     try:
         session = session_id_of(pane_info(pane)) if result["ok"] else None
     except FleetError:
@@ -2266,8 +2275,9 @@ def round_files(d: Path, n: int, requests: dict[int, Path], reviews: dict[int, l
 
 
 def implementer_pane(panes: list[dict]) -> dict | None:
-    """The lane's implementer: the agent pane with role impl, else the first that is not a critic, else any."""
-    agents = [p for p in panes if p.get("agent")]
+    """The lane's implementer: the agent pane with role impl, else the first that is not a critic, else any.
+    A planner or researcher pane never counts."""
+    agents = [p for p in panes if p.get("agent") and p.get("role") not in ("planner", "researcher")]
     return (next((p for p in agents if p.get("role") == "impl"), None)
             or next((p for p in agents if p.get("role") != "critic"), None)
             or (agents[0] if agents else None))
@@ -3232,6 +3242,25 @@ def latest_review_request(d: Path) -> Path | None:
     return found[-1] if found else None
 
 
+def task_rebrief(role: str | None, entry: dict, d: Path, pane: str, what: str) -> str | None:
+    """The re-brief of a planner, and of a researcher or helper with a task file; None for any other pane, which
+    gets the text it got before these roles existed. It names files and reads none: a researcher's task file
+    lives in the project home, and a researcher can work in a checkout without lane files."""
+    if role == "planner":
+        return (f"Fleet lane: your context was just {what}. You plan this lane (pane {pane}); you do not implement "
+                f"it. Re-read {d / 'BRIEF.md'} and your {d / 'PLAN.md'}, change no file except PLAN.md, and continue "
+                "the plan. When it is done, end PLAN.md with the next PLAN READY line and stop.")
+    task = entry.get("task") if role in TASK_ROLES and isinstance(entry, dict) else None
+    if not isinstance(task, str) or not task:
+        return None
+    if role == "researcher":
+        return (f"Fleet research: your context was just {what}. You research one question (pane {pane}); you do "
+                f"not implement anything. Re-read your task file {task} and continue it. Write only to that file, "
+                "and end it with the line RESEARCH DONE once the answer is complete.")
+    return (f"Fleet helper: your context was just {what}. You are a helper (pane {pane}). Re-read your task file "
+            f"{task} and continue that task.")
+
+
 def session_start_context(data: dict, env: dict | None = None) -> str | None:
     """Text for a session that was just cleared or compacted in a fleet checkout.
 
@@ -3263,7 +3292,10 @@ def session_start_context(data: dict, env: dict | None = None) -> str | None:
     role = (panes.get(pane) or {}).get("role") if pane else None
     what = "cleared" if source == "clear" else "compacted"
     parts = []
-    if present:
+    rebrief = task_rebrief(role, panes.get(pane) or {}, d, pane, what)
+    if rebrief:
+        parts.append(rebrief)
+    elif present:
         files = ", ".join(str(d / f) for f in present)
         other_impl = any((r or {}).get("role") == "impl" for p, r in panes.items() if p != pane)
         if role == "impl":
@@ -3400,6 +3432,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--permission-mode", help="claude --permission-mode")
     s.add_argument("--name", help="pane label, and the claude session name")
     s.add_argument("--role", choices=ROLES, help="record the pane's role in .fleet/panes.json (the hook reads it)")
+    s.add_argument("--task", metavar="FILE",
+                   help="the pane's task file, kept as an absolute path with its role; after /clear or compaction "
+                        "the hook tells a researcher or helper to re-read it (needs --role)")
     s.add_argument("--resume", metavar="SESSION_ID",
                    help="claude only: resume (fork) this session, e.g. on another account that can see it")
     s.add_argument("--prompt", help=f"one-line first prompt (max {PROMPT_MAX} chars), passed as argv")

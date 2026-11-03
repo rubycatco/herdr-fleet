@@ -232,6 +232,58 @@ class LaunchTests(unittest.TestCase):
             self.assertIn("one line", err.getvalue())
 
 
+    def test_spawn_task_needs_a_role_and_a_file(self):
+        from contextlib import redirect_stderr
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"FLEET_NO_REMUDA": "1"}):
+            task = Path(tmp) / "q.md"
+            for argv, msg in ((["--task", str(task)], "needs --role"),
+                              (["--role", "researcher", "--task", str(task)], "no such file")):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    rc = fleet.main(["spawn", "--dry-run", *argv])
+                self.assertEqual(rc, 1)
+                self.assertIn(msg, err.getvalue())
+            task.write_text("q")
+            buf = io.StringIO()
+            with chdir(tmp), redirect_stdout(buf):
+                rc = fleet.main(["spawn", "--dry-run", "--role", "researcher", "--task", "q.md"])
+            self.assertEqual((rc, json.loads(buf.getvalue())["task"]), (0, str(task.resolve())))
+
+    def test_spawn_keeps_the_task_with_the_role(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(os.path.realpath(tmp)) / "repo"
+            repo.mkdir()
+            git("init", "-q", "-b", "main", cwd=repo)
+            task = Path(os.path.realpath(tmp)) / "research.md"
+            task.write_text("q")
+            herdr_calls = []
+
+            def fake_run(cmd, *a, **k):
+                if cmd[0] == "herdr":
+                    herdr_calls.append(cmd)
+                    return subprocess.CompletedProcess(cmd, 0, "{}", "")
+                return _guarded_run(cmd, *a, **k)
+            target = {"pane_id": "w2:p5", "cwd": str(repo), "workspace_id": "w2", "placement": "split"}
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, {"FLEET_NO_REMUDA": "1"}), mock.patch.object(fleet, "run", fake_run), \
+                    mock.patch.object(fleet, "require_herdr"), mock.patch.object(fleet, "create_pane", return_value=target), \
+                    mock.patch.object(fleet, "pane_info", return_value={}), redirect_stdout(buf):
+                rc = fleet.main(["spawn", "--role", "researcher", "--task", str(task), "--no-wait",
+                                 "--prompt", f"Read {task} and follow it."])
+            self.assertEqual(rc, 0)
+            entry = fleet.load_panes(repo / ".fleet")["w2:p5"]
+            self.assertEqual((entry["role"], entry["task"]), ("researcher", str(task)))
+            self.assertEqual(json.loads(buf.getvalue())["task"], str(task))
+            self.assertTrue(any(c[:3] == ["herdr", "pane", "run"] for c in herdr_calls))
+            # Without --task, the entry has no task key, as before.
+            target["pane_id"] = "w2:p6"
+            with mock.patch.dict(os.environ, {"FLEET_NO_REMUDA": "1"}), mock.patch.object(fleet, "run", fake_run), \
+                    mock.patch.object(fleet, "require_herdr"), mock.patch.object(fleet, "create_pane", return_value=target), \
+                    mock.patch.object(fleet, "pane_info", return_value={}), redirect_stdout(io.StringIO()):
+                fleet.main(["spawn", "--role", "impl", "--no-wait"])
+            self.assertNotIn("task", fleet.load_panes(repo / ".fleet")["w2:p6"])
+
+
 class ScreenTests(unittest.TestCase):
     def test_claude_composer_and_sent_count(self):
         lines = fleet.clean_lines(CLAUDE_SCREEN)
@@ -938,6 +990,67 @@ class FilesTests(unittest.TestCase):
         self.lane({"w1:p1": {"role": "impl"}})
         self.assertIsNone(fleet.session_start_context({"source": "clear", "cwd": str(self.repo)},
                                                      env={"HERDR_PANE_ID": "w9:p9"}))
+
+    def test_session_start_old_roles_byte_for_byte(self):
+        """The texts of the roles that existed before planner and researcher, exactly as before."""
+        d = self.lane({"w1:p1": {"role": "impl"}, "w1:p2": {"role": "critic"}, "w1:p3": {"role": "helper"},
+                       "w1:p5": {"role": "researcher"}})
+        d = Path(os.path.realpath(d))  # git prints the real path
+        files = f"{d / 'BRIEF.md'}, {d / 'STATUS.md'}"
+
+        def text(pane, source="clear"):
+            return fleet.session_start_context({"source": source, "cwd": str(self.repo)},
+                                               env={"HERDR_PANE_ID": pane} if pane else {})
+        self.assertEqual(text("w1:p1"), (
+            "Fleet lane: your context was just cleared. You implement this lane (pane w1:p1). Before you act, "
+            f"read {files}, then run `git status` and `git log --oneline -15`. Continue from the next step in "
+            "STATUS.md; HANDOFF.md, when present, is newer than STATUS.md. Keep STATUS.md current: the next "
+            "session resumes from it."))
+        self.assertEqual(text("w1:p2", "compact"), (
+            "Fleet lane: your context was just compacted. You review this lane (pane w1:p2); you do not implement "
+            f"it. Before you act, re-read {d / 'BRIEF.md'} and wait for a review request. Write findings only to "
+            "the review file the request names, and do not edit code."))
+        generic = ("Fleet lane: your context was just cleared. You are this lane's {} (pane {}). "
+                   f"Its files are {files}; re-read the ones your task needs before you act.")
+        self.assertEqual(text("w1:p3"), generic.format("helper", "w1:p3"))
+        self.assertEqual(text("w1:p5"), generic.format("researcher", "w1:p5"))  # no task: the generic text
+        self.assertIsNone(text("w9:p9"))
+        fleet.save_panes(d, {})
+        self.assertEqual(text(None), (
+            f"Fleet lane: your context was just cleared. This worktree has fleet lane files: {files}. If you "
+            "implement this lane, read them, run `git status` and `git log --oneline -15`, and continue from "
+            "the next step in STATUS.md. If you have another role here, re-read the file that defines your "
+            "task before you act."))
+
+    def test_session_start_planner_researcher_and_helper(self):
+        d = self.lane({"w1:p1": {"role": "impl"}, "w1:p4": {"role": "planner"},
+                       "w1:p5": {"role": "researcher", "task": "/home/x/research/q.md"},
+                       "w1:p6": {"role": "helper", "task": "/home/x/task.md"},
+                       "w1:p7": {"role": "impl", "task": "/home/x/ignored.md"}})
+        d = Path(os.path.realpath(d))
+
+        def text(pane, cwd=None):
+            return fleet.session_start_context({"source": "compact", "cwd": str(cwd or self.repo)},
+                                               env={"HERDR_PANE_ID": pane})
+        self.assertEqual(text("w1:p4"), (
+            "Fleet lane: your context was just compacted. You plan this lane (pane w1:p4); you do not implement it. "
+            f"Re-read {d / 'BRIEF.md'} and your {d / 'PLAN.md'}, change no file except PLAN.md, and continue the "
+            "plan. When it is done, end PLAN.md with the next PLAN READY line and stop."))
+        research = text("w1:p5")
+        self.assertIn("Re-read your task file /home/x/research/q.md", research)
+        self.assertIn("RESEARCH DONE", research)
+        self.assertNotIn("implement this lane", research)
+        self.assertIn("Re-read your task file /home/x/task.md", text("w1:p6"))
+        self.assertIn("You implement this lane", text("w1:p7"))  # only a researcher or helper uses its task
+        # The impl re-brief names PLAN.md once the lane has one.
+        self.assertNotIn("PLAN.md", text("w1:p1"))
+        (self.repo / ".fleet" / "PLAN.md").write_text("# Plan")
+        self.assertIn(f"{d / 'STATUS.md'}, {d / 'PLAN.md'}", text("w1:p1"))
+        # A researcher in a checkout without lane files still gets its task.
+        for name in ("BRIEF.md", "STATUS.md", "PLAN.md"):
+            (self.repo / ".fleet" / name).unlink()
+        self.assertIn("/home/x/research/q.md", text("w1:p5"))
+        self.assertIsNone(text("w1:p1"))
 
     def test_session_start_orchestrator_context(self):
         d = self.repo / ".fleet"
