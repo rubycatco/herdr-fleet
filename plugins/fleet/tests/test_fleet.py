@@ -1967,6 +1967,15 @@ class DocsTests(unittest.TestCase):
         self.assertEqual(fleet.plan_risk(plan), ("none | migration | auth-payments | deletion | hotfix", False))
         self.assertEqual(fleet.plan_risk(plan.replace("none | migration | auth-payments | deletion | hotfix",
                                                       "none")), ("none", True))
+        self.assertEqual((fleet.plan_files(plan), fleet.plan_files(plan, every_line=True)), ([], []))
+        self.assertEqual(fleet.plan_categories(plan, fleet.risk_patterns(None)[0]), set())
+        with tempfile.TemporaryDirectory() as tmp:  # the PROJECT.md template adds no pattern and no error
+            (Path(tmp) / "PROJECT.md").write_text(self.template("PROJECT.md"))
+            self.assertEqual(fleet.risk_patterns(Path(tmp))[1], None)
+            self.assertEqual(len(fleet.risk_patterns(Path(tmp))[0]), len(fleet.BUILTIN_RISK_PATTERNS))
+        self.assertIn("## High-risk paths", self.template("PROJECT.md"))
+        self.assertIn("High-risk paths:", self.template("REVIEW-REQUEST"))
+        self.assertIsNone(fleet.RISK_APPROVED_LINE.search(self.template("BRIEF.md")))
         research = self.template("RESEARCH")
         self.assertIn("RESEARCH DONE", research)  # the researcher learns the marker from the file
         self.assertIsNone(fleet.RESEARCH_DONE_LINE.search(research))
@@ -1986,6 +1995,27 @@ class DocsTests(unittest.TestCase):
             self.assertIn(role, (self.PLUGIN / "skills" / "fleet" / "SKILL.md").read_text())
         manifest = json.loads((self.PLUGIN / ".claude-plugin" / "plugin.json").read_text())
         self.assertEqual(manifest["version"], fleet.VERSION)
+
+    def test_docs_name_the_risk_gates(self):
+        skill = (self.PLUGIN / "skills" / "fleet" / "SKILL.md").read_text()
+        templates = (self.PLUGIN / "skills" / "fleet" / "references" / "templates.md").read_text()
+        readme = (self.PLUGIN.parent.parent / "README.md").read_text()
+        for text in ("`risk [DIR]", "`approve-risk [DIR] --by user", "## High-risk paths", "RISK.md"):
+            self.assertIn(text, skill)
+        for doc in (templates, readme):
+            for text in ("## High-risk paths", "RISK.md", "approve-risk", "RISK APPROVED", "**/migrate/**"):
+                self.assertIn(text, doc)
+        for _, pattern in fleet.BUILTIN_RISK_PATTERNS:
+            self.assertIn(f"`{pattern}`", templates)
+            self.assertIn(f"`{pattern}`", readme)
+        self.assertIn("risk_approved", readme)
+        self.assertIn("fleet risk", (self.PLUGIN / "skills" / "review" / "SKILL.md").read_text())
+        lane = (self.PLUGIN / "skills" / "lane" / "SKILL.md").read_text()
+        planner = lane.split('--prompt "Read .fleet/BRIEF.md and write the plan', 1)[1].split('"', 1)[0]
+        self.assertIn("list every file", planner)
+        self.assertLessEqual(len("Read .fleet/BRIEF.md and write the plan" + planner), fleet.PROMPT_MAX)
+        self.assertIn('changed: "nothing"', lane)
+        self.assertIn("high-risk pattern", (self.PLUGIN / "defaults" / "conventions.md").read_text())
 
 
 class OrchTests(unittest.TestCase):

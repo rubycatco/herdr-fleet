@@ -19,7 +19,8 @@
 - Plan first for a high-risk change (a migration, auth or payments, deletion logic, an incident hotfix), a change that spans subsystems, or a brief that cannot name its files. Otherwise the implementer plans in .fleet/STATUS.md.
 - Planner: the strongest model available, with high effort. It writes only .fleet/PLAN.md, then stops.
 - Researcher: the implementer settings. It writes only its research file.
-- Approval: the user approves a high-risk plan (any Risk other than none); the orchestrator approves the others.
+- Approval: the user approves a high-risk plan; the orchestrator approves the others. A plan is high risk when its Risk is not none, or when a path under its ## Files matches a high-risk pattern (the built-in migration directories, or the project's ## High-risk paths in PROJECT.md).
+- Before merge, the lane's real diff is checked against the same patterns. A risky path that the user did not approve (in a plan that showed its category, or with fleet approve-risk) needs the user's yes.
 
 ## Context and handoff
 - Reset a lane (/clear, then re-brief from .fleet/) at its next commit once its context passes about 60 %.

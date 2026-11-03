@@ -11,7 +11,8 @@ Commands:
   fleet accounts [--live]                 remuda accounts and usage (cached unless --live)
   fleet prep [DIR] [--handoff]            create <git top>/.fleet and keep it out of git
   fleet worktree BRANCH [--base REF]      herdr worktree + workspace for a lane, .fleet/ ready
-  fleet spawn [options] [-- ARGS...]      open a pane and start an agent in it
+  fleet spawn [options] [-- ARGS...]      open a pane and start an agent in it (an implementer waits for an
+                                          approved .fleet/PLAN.md when the lane has one)
   fleet send PANE (--text T | --file F)   submit a prompt to an agent and verify it landed
   fleet watch PANE [--marker M]           wait for a file marker, or for the agent to stop or block
   fleet reset PANE [--compact [FOCUS]]    /clear (or /compact) a claude lane, then resume it
@@ -24,7 +25,10 @@ Commands:
   fleet orch [show|claim|release]         the project's orchestrator pane, in its project home
   fleet board [--json]                    one row per lane of this project, with its phase
   fleet digest [--peek] [--json]          phase changes and events since the last digest
-  fleet approve-plan [DIR] --by orch|user approve the lane's .fleet/PLAN.md (refuses on changes or a risk)
+  fleet approve-plan [DIR] --by orch|user approve the lane's .fleet/PLAN.md (refuses on changes or a risk;
+                                          high-risk paths under ## Files need the user)
+  fleet risk [DIR] [--json]               the lane's changed paths that match a high-risk pattern (reads only)
+  fleet approve-risk [DIR] --by user      record the user's yes for them in .fleet/RISK.md
   fleet hook session-start|session-end    hooks: record fleet sessions; re-brief the orch, and a lane after /clear
 
 Python 3.8+, standard library only.
@@ -49,7 +53,7 @@ from contextlib import ExitStack, contextmanager
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 FLEET_DIR = ".fleet"
 LANE_FILES = ("BRIEF.md", "STATUS.md", "HANDOFF.md", "PLAN.md")

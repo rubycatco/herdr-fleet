@@ -67,7 +67,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --pane <pane_id> --role impl
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --pane <pane_id> --role planner --name <label>-plan \
      --agent <agent> [--model <model>] [--effort <effort>] [--account <account>] --accept-trust \
-     --prompt "Read .fleet/BRIEF.md and write the plan in .fleet/PLAN.md. Change no other file. End with the line PLAN READY: 1 and stop."
+     --prompt "Read .fleet/BRIEF.md and write the plan in .fleet/PLAN.md. Change no other file. The Risk line is your reading; the paths under ## Files decide, so list every file. End with the line PLAN READY: 1 and stop."
    ```
 3. Watch for the plan, in the background: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" watch <pane_id> --marker "PLAN READY: 1" --file .fleet/PLAN.md`.
 4. Read PLAN.md. To ask for changes, send them to the same planner, and watch for the next number:
@@ -78,7 +78,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --pane <pane_id> --role impl
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" approve-plan <cwd> --by orch
    ```
-   Any other risk: first ask the user, with the plan's approach and risks in a few lines. Pass `--by user` only after the user's yes. `approve-plan` refuses, and changes nothing, when the round is not ready or already approved, the worktree has changes outside `.fleet/` or the lane has commits of its own (a planner changes and commits nothing but PLAN.md, which git does not track), or the risk needs the user. `--by user` overrides only the risk. Read its `reason` (with `paths` or `commits`), fix the cause, and run it again. When no branch, remote or tag holds the lane's base, or the lane had commits before the plan, pass `--base <ref>`.
+   Any other risk: first ask the user, with the plan's approach and risks in a few lines. Pass `--by user` only after the user's yes. `approve-plan` refuses, and changes nothing, when the round is not ready or already approved, the worktree has changes outside `.fleet/` or the lane has commits of its own (a planner changes and commits nothing but PLAN.md, which git does not track), or the risk needs the user. A path under `## Files` that matches a high-risk pattern makes the plan high risk whatever its `Risk:` line says: `--by orch` then refuses and names the matches (`high_risk`), so ask the user. `--by orch` also refuses a plan whose `## Files` lists no path: send it back to the planner, or ask the user. `--by user` is the only override, and it overrides only the risk and the missing files. When the project's patterns in PROJECT.md cannot be read, both refuse: fix the line that the reason names. Read its `reason` (with `paths` or `commits`), fix the cause, and run it again. When no branch, remote or tag holds the lane's base, or the lane had commits before the plan, pass `--base <ref>`.
 6. Exit the planner, keep the pane, and start the implementer in it:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" retire <pane_id>
@@ -86,7 +86,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --pane <pane_id> --role impl
      --agent <agent> [--model <model>] [--effort <effort>] [--permission-mode <mode>] [--account <account>] --accept-trust \
      --prompt "Read .fleet/BRIEF.md and .fleet/PLAN.md and execute them."
    ```
-   The implementer's STATUS.md Plan section points to PLAN.md and lists only deviations from it. Go on with step 5.
+   The implementer's STATUS.md Plan section points to PLAN.md and lists only deviations from it. `spawn --role impl` (and a spawn without `--role`) refuses while the newest `PLAN READY: <n>` round has no `PLAN APPROVED: <n>` line. Exit code 2 with `changed: "nothing"` is that refusal, not a failed start: nothing was created, so approve the plan (step 5) and run the same command again. Go on with step 5.
 
 The board shows `planning`, `plan ready <n>` and `plan approved <n>` for the lane until the implementer runs.
 

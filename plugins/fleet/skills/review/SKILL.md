@@ -22,12 +22,14 @@ allowed-tools:
 1. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" conventions`. Use its critic rules and stop rule.
 2. Find the lane with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" board` (its phase is `ready <n>`), or with `status`. Round `<n>` is the number on the newest `READY FOR REVIEW: round <n>` line in the lane's STATUS.md.
 3. Read STATUS.md. Verification results must be real: no `PLACEHOLDER`, nothing "still running". The work must be committed (`git -C <worktree> status --short` is empty). If not, send the implementer one request to finish, and watch again.
+4. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" risk <worktree>`. It lists the lane's changed paths that match a high-risk pattern and who covers each. Put its result in the request. A path that needs the user does not stop the review, but it stops the merge until the user said yes (the finish step in `/fleet:fleet`); tell the user now, so the answer is ready.
 
 ## 2. Write the request
 
 Write `<worktree>/.fleet/REVIEW-REQUEST-<n>.md` from the template in `${CLAUDE_PLUGIN_ROOT}/skills/fleet/references/templates.md`:
 - Base, branch and diff range. From round 2, give the commits since the last review and point at the dispositions in STATUS.md.
 - Focus: the acceptance criteria in BRIEF.md, plus the risks you see in the diff.
+- High-risk paths: the matches from `fleet risk`, with their category and what covers them. Ask the critic to look hardest at those paths.
 - The round rule. Apply the stop rule from the conventions here.
 - The output file: `.fleet/REVIEW-<n>.md`. With two critics, give each its own file (`REVIEW-<n>-codex.md`, `REVIEW-<n>-claude.md`). Name every output file in the request by its exact name: `fleet board` counts the round as reviewed only when each named file has a `VERDICT:` line.
 
