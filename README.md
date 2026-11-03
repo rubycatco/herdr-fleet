@@ -11,7 +11,7 @@ A Claude Code plugin for running fleets of coding-agent lanes in [Herdr](https:/
 
 ## Install
 
-From GitHub (you need read access to `rubycatco/herdr-fleet`):
+From GitHub:
 
 ```bash
 claude plugin marketplace add rubycatco/herdr-fleet
@@ -64,3 +64,7 @@ python3 -m unittest discover -s plugins/fleet/tests
 claude plugin validate plugins/fleet
 claude plugin validate .
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
