@@ -1710,6 +1710,135 @@ class RiskPatternTests(unittest.TestCase):
                          [("app/auth/x.py", "deletion"), ("app/a.py", "deletion")])
 
 
+class RiskDiffTests(unittest.TestCase):
+    """The lane's real changes against the high-risk patterns: which paths count, who covers a match, and the
+    commands risk and approve-risk."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.patch = mock.patch.dict(os.environ, {"FLEET_HOME": str(self.root / "home")})
+        self.patch.start()
+        self.repo = self.root / "app"
+        self.repo.mkdir()
+        git("init", "-q", "-b", "main", cwd=self.repo)
+        self.commit(self.repo, "app.py", "x = 1\n", "init")
+        self.lane = self.root / "lane"
+        git("worktree", "add", "-q", "-b", "feat/lane", str(self.lane), cwd=self.repo)
+        self.fleet_dir = Path(fleet.prep_dir(str(self.lane))["fleet_dir"])
+        self.home = fleet.project_for(str(self.repo))
+
+    def tearDown(self):
+        self.patch.stop()
+        self.tmp.cleanup()
+
+    def commit(self, path, name, text, message):
+        (path / name).parent.mkdir(parents=True, exist_ok=True)
+        (path / name).write_text(text)
+        git("add", name, cwd=path)
+        git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", message, cwd=path)
+
+    def changed(self, base=None, lane=None):
+        return fleet.lane_changed_paths(str(lane or self.lane), base)
+
+    def state(self, base=None):
+        return fleet.risk_state(str(self.lane), self.home, base)
+
+    def test_changed_paths(self):
+        self.assertEqual(self.changed(), ([], None))
+        self.commit(self.lane, "db/migrate/001.sql", "create\n", "a migration")
+        (self.lane / "notes.txt").write_text("")  # uncommitted
+        (self.fleet_dir / "STATUS.md").write_text("in .fleet/: never counts")
+        self.assertEqual(self.changed(), (["db/migrate/001.sql", "notes.txt"], None))
+        # A commit and its revert leave the tree as it was; both are listed, once.
+        self.commit(self.lane, "jobs/purge.py", "x\n", "purge")
+        git("-c", "user.email=t@t", "-c", "user.name=t", "revert", "--no-edit", "HEAD", cwd=self.lane)
+        self.assertEqual(self.changed()[0], ["db/migrate/001.sql", "jobs/purge.py", "notes.txt"])
+        # A merge from a main that moved brings none of main's files.
+        self.commit(self.repo, "main_only.py", "", "main moves on")
+        git("-c", "user.email=t@t", "-c", "user.name=t", "merge", "-q", "--no-edit", "main", cwd=self.lane)
+        self.assertNotIn("main_only.py", self.changed()[0])
+        # A committed rename lists both sides.
+        git("mv", "app.py", "core.py", cwd=self.lane)
+        git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "rename", cwd=self.lane)
+        self.assertTrue({"app.py", "core.py"} <= set(self.changed()[0]))
+        # --base: the commits of base..HEAD (a lane that merged main lists main's files too: a known gap).
+        self.assertIn("main_only.py", self.changed("main@{1}")[0])
+        self.assertEqual(self.changed("no-such-ref"), (None, "--base no-such-ref does not name a commit"))
+
+    def test_a_staged_rename_out_of_fleet(self):
+        (self.repo / ".fleet").mkdir(exist_ok=True)
+        (self.repo / ".fleet" / "draft.sql").write_text("drop\n")
+        git("add", "-f", ".fleet/draft.sql", cwd=self.repo)
+        git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "draft", cwd=self.repo)
+        lane = self.root / "lane-r"
+        git("worktree", "add", "-q", "-b", "feat/r", str(lane), cwd=self.repo)
+        (lane / "db" / "migrate").mkdir(parents=True)
+        git("mv", ".fleet/draft.sql", "db/migrate/002.sql", cwd=lane)
+        self.assertEqual(self.changed(lane=lane), (["db/migrate/002.sql"], None))
+
+    def test_errors_fail_closed(self):
+        git("checkout", "-q", "--detach", cwd=self.lane)
+        paths, why = self.changed()
+        self.assertEqual((paths, why), (None, "HEAD is detached, so the lane's changes cannot be told; pass --base <ref>"))
+        state = self.state()
+        self.assertEqual((state["error"], fleet.needs_user(state)), (why, True))
+        self.assertEqual(self.changed("main"), ([], None))
+        git("checkout", "-q", "feat/lane", cwd=self.lane)
+        real = fleet.git_text
+
+        def failing(path, *args, **kw):
+            return None if args[:1] == ("status",) else real(path, *args, **kw)
+        with mock.patch.object(fleet, "git_text", failing):
+            self.assertEqual(self.changed(), (None, "git status failed, so the lane's changes cannot be told"))
+
+        def failing_log(path, *args, **kw):
+            return None if args[:1] == ("log",) else real(path, *args, **kw)
+        with mock.patch.object(fleet, "git_text", failing_log):
+            self.assertEqual(self.changed(), (None, "git log failed, so the lane's changes cannot be told"))
+        (self.home / "PROJECT.md").write_text("## High-risk paths\n- migrations: db/\n")
+        state = self.state()
+        self.assertIn("the project's high-risk paths cannot be read", state["error"])
+        self.assertTrue(fleet.needs_user(state))
+
+    def test_coverage(self):
+        self.assertFalse(fleet.needs_user(self.state()))  # nothing changed
+        self.commit(self.lane, "db/migrate/001.sql", "create\n", "a migration")
+        state = self.state()
+        self.assertEqual([(m["category"], m["path"], m["covered_by"]) for m in state["needs_user"]],
+                         [("migration", "db/migrate/001.sql", None)])
+        self.assertTrue(fleet.needs_user(state))
+        plan = self.fleet_dir / "PLAN.md"
+        # A plan that the orch approved covers nothing.
+        plan.write_text("Risk: none\n## Files\n- app.py\nPLAN READY: 1\nPLAN APPROVED: 1 by orch 2026\n")
+        self.assertEqual(len(self.state()["needs_user"]), 1)
+        # A plan that the user approved covers the categories it shows: by its Risk line, or by its files.
+        for text in ("Risk: migration\n## Files\n- app.py\n", "Risk: none\n## Files\n- db/migrate/<new>.sql\n"):
+            plan.write_text(text + "PLAN READY: 1\nPLAN APPROVED: 1 by user 2026\n")
+            state = self.state()
+            self.assertEqual((state["needs_user"], state["plan_categories"], state["plan_approved_by"]),
+                             ([], ["migration"], "user"), text)
+            self.assertEqual(state["covered"][0]["covered_by"], "plan round 1, approved by the user")
+        # Not a category that the plan did not show.
+        plan.write_text("Risk: deletion\n## Files\n- jobs/purge.py\nPLAN READY: 1\nPLAN APPROVED: 1 by user\n")
+        self.assertEqual(len(self.state()["needs_user"]), 1)
+        # The newest round counts: a round 2 that is not approved yet covers nothing.
+        plan.write_text("Risk: migration\nPLAN READY: 1\nPLAN APPROVED: 1 by user\nPLAN READY: 2\n")
+        self.assertEqual(len(self.state()["needs_user"]), 1)
+        plan.unlink()
+        # A RISK.md line covers its category and path; a new risky path needs a new yes.
+        (self.fleet_dir / "RISK.md").write_text("# Risk approvals: feat/lane\n\n"
+                                                "RISK APPROVED: migration db/migrate/001.sql by user 2026-11-03T10:00:00+00:00\n"
+                                                "RISK APPROVED: deletion db/migrate/002.sql by user 2026\n"
+                                                "Then RISK APPROVED: migration db/migrate/002.sql by user x\n")
+        self.assertEqual(fleet.risk_approvals(self.fleet_dir),
+                         {("migration", "db/migrate/001.sql"), ("deletion", "db/migrate/002.sql")})
+        state = self.state()
+        self.assertEqual((state["needs_user"], state["covered"][0]["covered_by"]), ([], "RISK.md"))
+        (self.lane / "db" / "migrate" / "002.sql").write_text("alter\n")
+        self.assertEqual([m["path"] for m in self.state()["needs_user"]], ["db/migrate/002.sql"])
+
+
 class DocsTests(unittest.TestCase):
     """The templates and skills that the plan and research flow relies on match the code."""
 

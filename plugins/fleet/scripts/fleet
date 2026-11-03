@@ -3517,11 +3517,11 @@ def outside_fleet(paths: list[str]) -> list[str]:
     return [p for p in paths if not (p == FLEET_DIR or p.startswith(FLEET_DIR + "/"))]
 
 
-def lane_commits(path: str, base: str | None = None) -> tuple[list[str] | None, str | None]:
-    """(the commits that only this lane holds, newest first, as `<short sha> <subject>`; why they cannot be told).
+def lane_revs(path: str, base: str | None = None) -> tuple[list[str] | None, str | None]:
+    """(the `git log` revision arguments for the commits that only this lane holds; why they cannot be told).
 
-    With `base`: the commits of `<base>..HEAD`. Without it: the commits of HEAD that no other local branch, no
-    remote branch other than `<remote>/<branch>` and no tag holds. That needs no stored state: a fresh lane has none, and a
+    With `base`: `<base>..HEAD`. Without it: HEAD minus every other local branch, every remote branch other than
+    `<remote>/<branch>` and every tag. That needs no stored state: a fresh lane has no commit of its own, and a
     lane on a local feature branch neither. It needs a branch: a detached HEAD needs `base`."""
     if base is not None:
         sha = None if base.startswith("-") else git_text(path, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}")
@@ -3543,10 +3543,38 @@ def lane_commits(path: str, base: str | None = None) -> tuple[list[str] | None, 
         # match <remote>/team/<branch>, so each remote gets its own exact exclusion.
         revs = ["HEAD", "--not", f"--exclude={branch}", "--branches",
                 *[f"--exclude={r}/{branch}" for r in remotes.split("\n") if r], "--remotes", "--tags"]
+    return revs, None
+
+
+def lane_commits(path: str, base: str | None = None) -> tuple[list[str] | None, str | None]:
+    """(the commits that only this lane holds, newest first, as `<short sha> <subject>`; why they cannot be told).
+    `lane_revs` says which commits those are."""
+    revs, why = lane_revs(path, base)
+    if revs is None:
+        return None, why
     out = git_text(path, "log", "--format=%h %s", *revs, "--")
     if out is None:
         return None, "git log failed, so the lane's own commits cannot be told"
     return out.splitlines(), None
+
+
+def lane_changed_paths(path: str, base: str | None = None) -> tuple[list[str] | None, str | None]:
+    """(every path that the lane changed, sorted; why that cannot be told): the paths that the lane's own commits
+    touched (the commits of `lane_revs`, both sides of a rename) and the paths of `git status`, outside .fleet/.
+
+    A merge commit lists nothing, so a merge from the default branch brings none of its files. Known gaps: an
+    edit made while resolving a conflict inside a merge commit is not listed; with `base`, a lane that merged
+    (not rebased) the default branch lists that branch's files too."""
+    revs, why = lane_revs(path, base)
+    if revs is None:
+        return None, why.replace("own commits", "changes")
+    out = git_text(path, "log", "--format=", "--name-only", "-z", "--no-renames", "--no-show-signature", *revs, "--")
+    if out is None:
+        return None, "git log failed, so the lane's changes cannot be told"
+    status = status_paths(path)
+    if status is None:
+        return None, "git status failed, so the lane's changes cannot be told"
+    return sorted(set(outside_fleet([p for p in out.split("\0") if p] + status))), None
 
 
 def plan_rounds(text: str) -> tuple[list[int], set[int]]:
@@ -3695,6 +3723,63 @@ def cmd_approve_plan(args: argparse.Namespace) -> int:
            high_risk=[{"category": m["category"], "path": m["path"]} for m in high_risk])
     print(json.dumps({"ok": True, **out, "lane": top, "branch": branch, "line": line}, indent=2, ensure_ascii=False))
     return 0
+
+
+# --------------------------------------------------------------------------
+# risk: the lane's real changes against the high-risk patterns, and the user's yes for them
+
+RISK_FILE = "RISK.md"
+RISK_APPROVED_LINE = re.compile(marker_line(r"RISK APPROVED: (migration|auth-payments|deletion|hotfix) (.+?) by user "
+                                            r"(\S+)") + r"[ \t]*$", re.M)
+
+
+def risk_approvals(fleet_dir: Path) -> set[tuple[str, str]]:
+    """The (category, path) pairs that the lane's .fleet/RISK.md approves, one `RISK APPROVED:` line each."""
+    return {(c, p) for c, p, _ in RISK_APPROVED_LINE.findall(read_text(Path(fleet_dir) / RISK_FILE))}
+
+
+def risk_state(top: str, home: Path | None, base: str | None = None) -> dict:
+    """The lane's changed paths matched against the project's high-risk patterns, and who covers each match.
+
+    A match is covered by the newest plan round when the user approved it and the plan shows the match's
+    category (`plan_categories`), else by a `RISK APPROVED` line in RISK.md for the same category and path. The
+    rest needs the user. `error` says why the changes or the patterns cannot be told; the lane then needs the
+    user as well (fail closed)."""
+    d = Path(top) / FLEET_DIR
+    out = {"lane": top, "base": base, "paths": None, "matches": [], "covered": [], "needs_user": [],
+           "plan_round": None, "plan_approved_by": None, "plan_categories": [], "error": None}
+    patterns, error = risk_patterns(home)
+    if error:
+        out["error"] = f"the project's high-risk paths cannot be read ({error})"
+        return out
+    paths, why = lane_changed_paths(top, base)
+    if paths is None:
+        out["error"] = why
+        return out
+    out["paths"] = len(paths)
+    text = read_text(d / PLAN_FILE) if (d / PLAN_FILE).is_file() else ""
+    ready, _ = plan_rounds(text)
+    if ready:
+        out["plan_round"] = max(ready)
+        out["plan_approved_by"] = plan_approver(text, max(ready))
+    categories = plan_categories(text, patterns) if out["plan_approved_by"] == "user" else set()
+    out["plan_categories"] = sorted(categories)
+    approved = risk_approvals(d)
+    for m in match_risk(paths, patterns):
+        if m["category"] in categories:
+            m["covered_by"] = f"plan round {out['plan_round']}, approved by the user"
+        elif (m["category"], m["path"]) in approved:
+            m["covered_by"] = RISK_FILE
+        else:
+            m["covered_by"] = None
+        out["matches"].append(m)
+        (out["covered"] if m["covered_by"] else out["needs_user"]).append(m)
+    return out
+
+
+def needs_user(state: dict) -> bool:
+    """True when the lane's changes need the user's yes before merge: a match nobody covers, or no answer."""
+    return bool(state.get("needs_user") or state.get("error"))
 
 
 # --------------------------------------------------------------------------
