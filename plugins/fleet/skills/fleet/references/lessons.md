@@ -34,7 +34,7 @@ Lessons from fleet runs that each cost hours. `fleet spawn`, `fleet send` and `f
 ## Context and handoff
 
 - **Reset long lanes at a commit boundary.** A lane past about 60 % context, or one that has compacted, gets slower and loses detail. At its next commit, make sure STATUS.md is current, then `fleet reset <pane>` (`/clear` plus a resume prompt). The SessionStart hook points the fresh session at `.fleet/`.
-- **Keep the orchestrator's state in FLEET.md.** An orchestrator that compacts loses pane ids and decisions unless FLEET.md has them.
+- **Keep the orchestrator's state outside its context.** An orchestrator that compacts loses pane ids and decisions unless a file has them. The lanes are derived (`fleet board`, the event log); decisions, follow-ups and the user's rules go to the project's PROJECT.md, which the SessionStart hook shows to the orchestrator pane. Older fleets kept all of it in a hand-written FLEET.md, which drifted from the truth.
 - **Switching accounts means a new pane.** An agent's account is fixed at launch. To move a lane or yourself to another account, write HANDOFF.md and start a successor (`/fleet:handoff`).
 
 ## Cleanup

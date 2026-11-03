@@ -2667,7 +2667,9 @@ def orch_rebrief(data: dict, env) -> str | None:
     source = data.get("source")
     what = {"clear": "Your context was just cleared.", "compact": "Your context was just compacted.",
             "resume": "This session was resumed.", "startup": "This session just started."}.get(source, "")
-    script = shlex.quote(str(Path(__file__).resolve()))
+    # The skills allow `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" ...`; the hook runs with that variable set.
+    script = ('"${CLAUDE_PLUGIN_ROOT}/scripts/fleet"' if text_or_none(env.get("CLAUDE_PLUGIN_ROOT"))
+              else shlex.quote(str(Path(__file__).resolve())))
     project_md = home / PROJECT_MD
     text = read_text(project_md)
     head = [f"Fleet orchestrator: you orchestrate project {home.name} (pane {pane}). {what}".rstrip(),

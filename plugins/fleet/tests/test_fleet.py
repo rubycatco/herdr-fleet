@@ -1423,6 +1423,12 @@ class OrchTests(unittest.TestCase):
             self.assertIn("digest` first, then load the fleet:fleet skill.", text)
         self.assertIn("just cleared", fleet.session_start_context({"source": "clear", "cwd": str(self.repo)},
                                                                   env={"HERDR_PANE_ID": "w1:p1"}))
+        # The command matches the skills' allowed-tools when the hook knows the plugin root.
+        text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)},
+                                           env={"HERDR_PANE_ID": "w1:p1", "CLAUDE_PLUGIN_ROOT": "/plugins/fleet"})
+        self.assertIn('Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" digest` first', text)
+        self.assertIn(f"Run `python3 {SCRIPT.resolve()} digest` first", fleet.session_start_context(
+            {"source": "clear", "cwd": str(self.repo)}, env={"HERDR_PANE_ID": "w1:p1"}))
         # In a checkout of another project, the orch pane is not briefed as this project's orch.
         other = self.root / "other"
         other.mkdir()

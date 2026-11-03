@@ -43,9 +43,9 @@ Find a session id with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" status --j
      --prompt "Read <handoff_path> and continue the work it describes. You replace pane <your pane id>."
    ```
    To resume instead: `spawn --split auto --name <label> --account <account> --accept-trust --resume <your session id> --prompt "You now run on <account> in a new pane. Continue where this conversation stopped."`
-   If you orchestrate, pass `--role orchestrator`. Folder trust is kept per account, so another account can stop at the trust dialog; `--accept-trust` answers it, which is right here because this session already works in that folder.
+   If you orchestrate, pass `--role orchestrator`, and end the prompt with "Then run `fleet orch show` and `fleet digest`, and load the fleet:fleet skill.": the successor starts before step 6 moves the registration, so its first session start gets no project re-brief. Folder trust is kept per account, so another account can stop at the trust dialog; `--accept-trust` answers it, which is right here because this session already works in that folder.
 5. Check the result: `ok: true` and status `working`. Read the new pane once to see that it reads the handoff or continues the work.
-6. If you orchestrate, move the registration to the successor: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" orch claim --pane <new pane_id> --replace`. The SessionStart hook then re-briefs the successor from the project home, not this pane, and the successor's first `digest` shows what happened since your last one. With an old FLEET.md, set its `Orchestrator:` line to the new `pane_id` instead.
+6. If you orchestrate, move the registration to the successor: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" orch claim --pane <new pane_id> --replace`. From then on, the SessionStart hook re-briefs the successor from the project home at each session start, not this pane, and the successor's first `digest` shows what happened since your last one. With an old FLEET.md, set its `Orchestrator:` line to the new `pane_id` instead.
 7. Tell the user: the new pane, account, model and handoff file. Then stop. Do no more work here: two sessions in one checkout conflict. Do not close this pane; the user closes it (`/exit`).
 
 ## Lane
@@ -64,4 +64,4 @@ Find a session id with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" status --j
      --prompt "Read .fleet/HANDOFF.md, then .fleet/BRIEF.md and .fleet/STATUS.md, and continue this lane."
    ```
    Account change only, with healthy context: skip steps 1 to 3. Note the lane's `session_id` from `status --json`, retire it, then `spawn --pane <pane> --role impl --account <account> --accept-trust --resume <session id> --prompt "Continue this lane from where you stopped."`.
-6. Update the lane's row in FLEET.md: pane, account, model.
+6. Nothing to record by hand: the log holds the retire and the new spawn with its account and model, and `fleet board` shows the new pane. With an old FLEET.md, update the lane's row there: pane, account, model.
