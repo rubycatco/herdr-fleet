@@ -2182,6 +2182,9 @@ what nothing else knows. Keep each entry to one line.
 
 ## Notes
 - none
+
+## High-risk paths
+- none
 """
 REVIEW_REQUEST_FILE = re.compile(r"^REVIEW-REQUEST-(\d+)\.md$")
 REVIEW_FILE = re.compile(r"^REVIEW-(\d+)(?:-[^/]+)?\.md$")  # REVIEW-<n>.md, or REVIEW-<n>-<critic>.md
@@ -2204,6 +2207,12 @@ RESEARCH_DIR = "research"
 RESEARCH_DONE_LINE = re.compile(marker_line("RESEARCH DONE"), re.M)
 RISK_LINE = re.compile(r"^[^\w\n]*Risk[*_`]*:[*_`]*[ \t]*(.*)$", re.M)
 RISKS = ("none", "migration", "auth-payments", "deletion", "hotfix")  # only `none` is low risk
+RISK_CATEGORIES = RISKS[1:]
+# Built in, for every project: common migration directories. Project-specific paths go in PROJECT.md.
+BUILTIN_RISK_PATTERNS = (("migration", "**/migrations/**"), ("migration", "**/migration/**"),
+                         ("migration", "**/migrate/**"), ("migration", "**/alembic/**"))
+RISK_SECTION = "High-risk paths"
+RISK_PATTERN_LINE = re.compile(r"^[-*+]\s+([A-Za-z-]+):\s*(.*?)\s*$")
 EMPTY_NOTE = re.compile(r"^(?:[-*]\s*)?(?:none\.?|<[^>]*>)?$", re.I)  # "-", "none", "- none", a template "<...>"
 HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 
@@ -3297,6 +3306,117 @@ def cmd_accounts(args: argparse.Namespace) -> int:
             return cp.returncode
         print()
     return 0
+
+
+# --------------------------------------------------------------------------
+# high-risk paths: the patterns of a project, and the paths that match them
+
+
+def glob_regex(pattern: str) -> re.Pattern:
+    """A regex for a path pattern, matched against a path relative to the git top. `*` and `?` stay inside one
+    directory, `**` crosses directories, `[...]` is a character class (`[!...]` negates). A pattern without `/`
+    (a trailing `/` aside) matches at any depth; a pattern that ends in `/` means `<pattern>**`; a pattern also
+    matches everything under the directory it names. Case-sensitive. Raises re.error on a bad pattern."""
+    p = pattern.strip()
+    while p.startswith("./"):
+        p = p[2:]
+    if not p.strip("/"):
+        raise re.error("an empty pattern")
+    anchored = "/" in p.rstrip("/")
+    p = p.lstrip("/")
+    if p.endswith("/"):
+        p += "**"
+    if not anchored:
+        p = "**/" + p
+    out: list[str] = []
+    i, n = 0, len(p)
+    while i < n:
+        c = p[i]
+        if p.startswith("**", i):
+            j = i + 2
+            after_slash = i == 0 or p[i - 1] == "/"
+            if after_slash and p.startswith("/", j):  # `**/`: no directory or any number of them
+                out.append("(?:.*/)?")
+                i = j + 1
+            elif after_slash and j == n and out and out[-1] == "/":  # a final `/**`: the directory and all in it
+                out[-1] = "(?:/.*)?"
+                i = j
+            else:
+                out.append(".*")
+                i = j
+            continue
+        if c == "*":
+            out.append("[^/]*")
+        elif c == "?":
+            out.append("[^/]")
+        elif c == "[":
+            j = i + 1
+            if j < n and p[j] in "!^":
+                j += 1
+            if j < n and p[j] == "]":
+                j += 1
+            while j < n and p[j] != "]":
+                j += 1
+            if j >= n:  # no closing bracket: a plain `[`
+                out.append(re.escape(c))
+                i += 1
+                continue
+            body = p[i + 1:j]
+            negate = body[:1] in ("!", "^")
+            body = body[1:] if negate else body
+            for ch in "\\[&~|":
+                body = body.replace(ch, "\\" + ch)
+            out.append("(?!/)[" + ("^" if negate else "") + body + "]")
+            i = j + 1
+            continue
+        else:
+            out.append(re.escape(c))
+        i += 1
+    return re.compile("(?:" + "".join(out) + r")(?:/.*)?\Z", re.S)
+
+
+def risk_patterns(home: Path | None) -> tuple[list[dict], str | None]:
+    """(the high-risk path patterns of the project at `home`, why they cannot be read). The built-ins always
+    apply; PROJECT.md adds the lines of its `## High-risk paths` section, `- <category>: <pattern>`. No home, no
+    PROJECT.md or no section: the built-ins only. A line of another form, an unknown category, a pattern that
+    does not compile or a PROJECT.md that cannot be read is an error: the caller fails closed."""
+    patterns = [{"category": c, "pattern": g, "source": "builtin", "regex": glob_regex(g)}
+                for c, g in BUILTIN_RISK_PATTERNS]
+    if home is None:
+        return patterns, None
+    path = Path(home) / PROJECT_MD
+    if not path.exists():
+        return patterns, None
+    try:
+        text = path.read_text(errors="replace")
+    except OSError as e:
+        return patterns, f"{path} cannot be read: {e.strerror or e}"
+    for line in section_text(text, re.escape(RISK_SECTION)):
+        m = RISK_PATTERN_LINE.match(line.strip())
+        category = m.group(1).lower() if m else None
+        glob_text = m.group(2).strip("`").strip() if m else ""
+        if category not in RISK_CATEGORIES or not glob_text:
+            return patterns, (f"{PROJECT_MD}, ## {RISK_SECTION}: {line.strip()!r} is not "
+                              f"'- <category>: <pattern>' with a category of {', '.join(RISK_CATEGORIES)}")
+        try:
+            regex = glob_regex(glob_text)
+        except re.error as e:
+            return patterns, f"{PROJECT_MD}, ## {RISK_SECTION}: the pattern {glob_text!r} is not valid: {e}"
+        patterns.append({"category": category, "pattern": glob_text, "source": PROJECT_MD, "regex": regex})
+    return patterns, None
+
+
+def match_risk(paths: list[str], patterns: list[dict]) -> list[dict]:
+    """One `{path, category, pattern, source}` per path that a pattern matches, in the order of the paths; the
+    first pattern that matches a path wins."""
+    found = []
+    for path in paths:
+        for pat in patterns:
+            if pat["regex"].match(path):
+                found.append({"path": path, "category": pat["category"], "pattern": pat["pattern"],
+                              "source": pat["source"]})
+                break
+    return found
 
 
 # --------------------------------------------------------------------------

@@ -1450,6 +1450,82 @@ class ApprovePlanTests(unittest.TestCase):
         self.assertEqual([e["round"] for e in self.approvals()], [1, 2])
 
 
+class RiskPatternTests(unittest.TestCase):
+    """The high-risk path patterns: the glob rules, the built-ins, and the PROJECT.md section."""
+
+    def matches(self, pattern, path):
+        return fleet.glob_regex(pattern).match(path) is not None
+
+    def test_glob_rules(self):
+        for pattern, path, want in (
+                ("db/*.sql", "db/x.sql", True), ("db/*.sql", "db/a/x.sql", False),  # `*` stops at `/`
+                ("db/**/*.sql", "db/a/b/x.sql", True), ("db/**/*.sql", "db/x.sql", True),  # `**` crosses
+                ("a**", "ab/c", True), ("a/?.py", "a/b.py", True), ("a/?.py", "a/bc.py", False),
+                ("*.sql", "a/b/x.sql", True), ("schema.rb", "db/schema.rb", True),  # no `/`: at any depth
+                ("db/*.sql", "x/db/x.sql", False), ("/secrets", "x/secrets", False),  # a `/` anchors at the top
+                ("/secrets", "secrets/a", True), ("migrate/", "db/migrate/1.sql", True),  # a trailing `/` does not
+                ("app/auth/", "app/auth/x.py", True), ("app/auth/", "app/auth", True),  # `<pattern>**`
+                ("app/auth/", "app/authx.py", False), ("app/auth", "app/auth/z/y.py", True),  # a directory prefix
+                ("app/auth", "app/author.py", False),
+                ("db/[!x]*.rb", "db/a.rb", True), ("db/[!x]*.rb", "db/x.rb", False),  # a character class
+                ("db/[ab].rb", "db/b.rb", True), ("a/[/]b", "a//b", False), ("a[b", "a[b", True),
+                ("db/schema.rb", "DB/schema.rb", False),  # case-sensitive
+                ("./db/x", "db/x", True)):
+            self.assertEqual(self.matches(pattern, path), want, (pattern, path))
+        for bad in ("[z-a]", "", "/"):
+            with self.assertRaises(fleet.re.error):
+                fleet.glob_regex(bad)
+
+    def test_builtins(self):
+        patterns, error = fleet.risk_patterns(None)
+        self.assertIsNone(error)
+        self.assertEqual([(p["category"], p["pattern"], p["source"]) for p in patterns],
+                         [("migration", g, "builtin") for _, g in fleet.BUILTIN_RISK_PATTERNS])
+        paths = ["db/migrate/001.sql", "migrations/0001_init.py", "app/alembic/env.py", "src/migration/x.go",
+                 "app/migrate.py", "db/schema.rb", "app/migrations.py"]
+        self.assertEqual([m["path"] for m in fleet.match_risk(paths, patterns)], paths[:4])
+
+    def test_project_section(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self.assertEqual(len(fleet.risk_patterns(home)[0]), 4)  # no PROJECT.md
+            md = home / "PROJECT.md"
+            md.write_text(fleet.PROJECT_TEMPLATE.format(name="acme"))  # the template's section is empty
+            patterns, error = fleet.risk_patterns(home)
+            self.assertEqual((len(patterns), error), (4, None))
+            md.write_text("# Project: acme\n\n## Rules\n- none\n")  # a PROJECT.md from 0.6.0
+            self.assertEqual(fleet.risk_patterns(home)[1], None)
+            md.write_text("# Project: acme\n\n## High-risk paths\n- auth-payments: app/auth/\n"
+                          "* deletion: `jobs/purge_*.py`\n- hotfix: hotfix/\n- migration: db/schema.rb\n\n"
+                          "## Notes\n- deletion: not/a/pattern\n")
+            patterns, error = fleet.risk_patterns(home)
+            self.assertIsNone(error)
+            self.assertEqual([(p["category"], p["pattern"], p["source"]) for p in patterns[4:]],
+                             [("auth-payments", "app/auth/", "PROJECT.md"), ("deletion", "jobs/purge_*.py", "PROJECT.md"),
+                              ("hotfix", "hotfix/", "PROJECT.md"), ("migration", "db/schema.rb", "PROJECT.md")])
+            found = fleet.match_risk(["app/auth/login.py", "jobs/purge_old.py", "README.md", "db/schema.rb",
+                                      "db/migrate/1.sql"], patterns)
+            self.assertEqual([(m["path"], m["category"], m["source"]) for m in found],
+                             [("app/auth/login.py", "auth-payments", "PROJECT.md"),
+                              ("jobs/purge_old.py", "deletion", "PROJECT.md"),
+                              ("db/schema.rb", "migration", "PROJECT.md"),
+                              ("db/migrate/1.sql", "migration", "builtin")])
+            for line, why in (("- payments: app/pay/", "is not '- <category>: <pattern>'"),
+                              ("app/auth/", "is not '- <category>: <pattern>'"),
+                              ("- deletion:", "is not '- <category>: <pattern>'"),
+                              ("- deletion: [z-a]", "the pattern '[z-a]' is not valid")):
+                md.write_text(f"## High-risk paths\n- hotfix: hotfix/\n{line}\n")
+                patterns, error = fleet.risk_patterns(home)
+                self.assertIn(why, error or "", line)
+
+    def test_first_pattern_wins_and_order_of_paths(self):
+        patterns = [{"category": c, "pattern": g, "source": "PROJECT.md", "regex": fleet.glob_regex(g)}
+                    for c, g in (("deletion", "app/"), ("auth-payments", "app/auth/"))]
+        found = fleet.match_risk(["z.py", "app/auth/x.py", "app/a.py"], patterns)
+        self.assertEqual([(m["path"], m["category"]) for m in found],
+                         [("app/auth/x.py", "deletion"), ("app/a.py", "deletion")])
+
+
 class DocsTests(unittest.TestCase):
     """The templates and skills that the plan and research flow relies on match the code."""
 
