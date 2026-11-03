@@ -607,7 +607,9 @@ class ProjectLogTests(unittest.TestCase):
 
     def test_normalize_remote(self):
         same = ["git@github.com:Acme/App.git", "https://github.com/acme/app", "https://github.com/acme/app.git/",
-                "ssh://git@github.com:22/acme/app.git", "https://user:secret@github.com/acme/app.git"]
+                "ssh://git@github.com:22/acme/app.git", "https://user:secret@github.com/acme/app.git",
+                "git@github.com:/acme/app.git", "https://user:p@ss@github.com/acme/app.git",
+                "https://github.com/acme/app.git?token=abc#top"]
         self.assertEqual({fleet.normalize_remote(u) for u in same}, {"github.com/acme/app"})
         self.assertEqual(fleet.normalize_remote("git@git.example.com:group/sub/app.git"), "git.example.com/group/sub/app")
         for local in ("/srv/git/app.git", "file:///srv/git/app.git", "", "C:/repos/app"):
@@ -616,7 +618,8 @@ class ProjectLogTests(unittest.TestCase):
     def test_one_project_per_repository(self):
         home = fleet.project_for(str(self.repo))
         self.assertEqual(home, self.home / "projects" / "app")
-        self.assertEqual(fleet.read_json(home / "project.json")["remotes"], ["github.com/acme/app"])
+        self.assertEqual(fleet.read_json(home / "project.json")["keys"],
+                         ["github.com/acme/app", f"local:{os.path.realpath(self.repo)}"])
         # Another clone (HTTPS remote) and a linked worktree share the project.
         clone = self.repo_with_remote("app-copy", "https://github.com/acme/app")
         self.assertEqual(fleet.project_for(str(clone)), home)
@@ -631,6 +634,18 @@ class ProjectLogTests(unittest.TestCase):
         self.assertIsNone(fleet.project_for(str(self.repo_with_remote("new", "git@example.com:x/new.git")), create=False))
         self.assertEqual([p.name for p in fleet.project_dirs()], ["app", "beta-app", "solo"])
 
+    def test_remote_added_later_keeps_the_project(self):
+        solo = self.repo_with_remote("solo", None)
+        home = fleet.project_for(str(solo))
+        git("remote", "add", "origin", "git@github.com:acme/solo.git", cwd=solo)
+        self.assertEqual(fleet.project_for(str(solo)), home)
+        self.assertIn("github.com/acme/solo", fleet.read_json(home / "project.json")["keys"])
+        # A clone elsewhere now finds the project by its remote.
+        self.assertEqual(fleet.project_for(str(self.repo_with_remote("solo-2", "https://github.com/acme/solo"))), home)
+        # A project.json of 0.4.0 has "remotes" instead of "keys".
+        fleet.write_json(home / "project.json", {"name": "solo", "remotes": ["github.com/acme/solo"]})
+        self.assertEqual(fleet.find_project(["github.com/acme/solo"]), home)
+
     def test_record(self):
         env = {"HERDR_PANE_ID": "w1:p1", "CLAUDE_CODE_SESSION_ID": "orch-1", "CLAUDECODE": "1"}
         with mock.patch.dict(os.environ, env):
@@ -644,6 +659,12 @@ class ProjectLogTests(unittest.TestCase):
         self.assertNotIn("exited", e)
         # Outside a repository, the event goes to the home's own log.
         self.assertEqual(Path(fleet.record("handoff", str(self.root), path="/h.md")).parent, self.home / "events")
+        # Only the user can open the home; a home made with the default mode is made private.
+        self.assertEqual(self.home.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(Path(path).stat().st_mode & 0o777, 0o600)
+        os.chmod(self.home, 0o755)
+        fleet.record("send", str(self.repo), pane="w2:p1")
+        self.assertEqual(self.home.stat().st_mode & 0o777, 0o700)
         # A broken home never fails the command.
         with mock.patch.dict(os.environ, {"FLEET_HOME": path}):
             self.assertIsNone(fleet.record("send", str(self.repo), pane="w2:p1"))
@@ -670,6 +691,109 @@ class ProjectLogTests(unittest.TestCase):
         self.assertEqual([(e["event"], e["session"]) for e in events[-2:]],
                          [("session_end", "s-1"), ("session_start", "s-2")])
         self.assertEqual(events[-2]["reason"], "prompt_input_exit")
+        # Fields of the wrong type are not recorded.
+        bad = {"session_id": {"a": 1}, "source": ["x"], "cwd": str(self.repo), "transcript_path": 7, "model": {"id": "m"}}
+        e = self.last_event(fleet.hook_session_event("session_start", bad, env))
+        self.assertEqual((e.get("session"), e.get("source"), e.get("transcript"), e["model"]), (None, None, None, "m"))
+        # A failing record does not cost the re-brief.
+        (self.repo / ".fleet" / "HANDOFF.md").write_text("handoff")
+        buf = io.StringIO()
+        payload = io.StringIO(json.dumps({"source": "compact", "cwd": str(self.repo)}))
+        with mock.patch.object(fleet, "hook_session_event", side_effect=RuntimeError), \
+                mock.patch.dict(os.environ, env), mock.patch.object(sys, "stdin", payload), redirect_stdout(buf):
+            self.assertEqual(fleet.main(["hook", "session-start"]), 0)
+        self.assertIn("HANDOFF.md", json.loads(buf.getvalue())["hookSpecificOutput"]["additionalContext"])
+
+    def test_hooks_skip_sessions_outside_herdr(self):
+        hooks = json.loads((SCRIPT.parent.parent / "hooks" / "hooks.json").read_text())["hooks"]
+        entries = [(event, h.get("matcher"), c["command"]) for event, hs in hooks.items() for h in hs for c in h["hooks"]]
+        self.assertEqual({(e, m) for e, m, _ in entries},
+                         {("SessionStart", "clear|compact"), ("SessionStart", "startup|resume"), ("SessionEnd", None)})
+        (self.repo / ".fleet").mkdir()
+        env = {k: v for k, v in os.environ.items() if not k.startswith("HERDR_")}
+        env["CLAUDE_PLUGIN_ROOT"] = str(SCRIPT.parent.parent)
+        for event, matcher, command in entries:
+            if matcher == "clear|compact":
+                continue  # the re-brief also runs outside Herdr
+            self.assertTrue(command.startswith('[ -n "$HERDR_PANE_ID" ] || exit 0;'), command)
+            cp = subprocess.run(["sh", "-c", command], cwd=self.repo, capture_output=True, text=True, timeout=20,
+                                input=json.dumps({"session_id": "s-1", "source": "startup", "cwd": str(self.repo)}),
+                                env=env)
+            self.assertEqual((cp.returncode, cp.stdout, cp.stderr), (0, "", ""))
+        self.assertFalse((self.home / "projects").exists())
+
+    def test_commands_record_their_lane(self):
+        lane = str(self.root / "lane")
+        git("worktree", "add", "-q", "-b", "feat/x", lane, cwd=self.repo)
+        (Path(lane) / ".fleet").mkdir()
+        info = {"pane_id": "w2:p1", "agent": "claude", "agent_status": "idle", "cwd": lane, "workspace_id": "w2",
+                "agent_session": {"value": "s-1"}}
+        target = {"pane_id": "w2:p1", "workspace_id": "w2", "cwd": lane, "placement": "split"}
+        quiet = redirect_stdout(io.StringIO())
+        err = mock.patch.object(sys, "stderr", io.StringIO())
+        real_run = fleet.run
+
+        def run(cmd, *args, **kwargs):  # git runs for real; herdr does not run
+            return subprocess.CompletedProcess(cmd, 0, "", "") if cmd[0] == "herdr" else real_run(cmd, *args, **kwargs)
+        with mock.patch.dict(os.environ, {"FLEET_NO_REMUDA": "1", "HERDR_PANE_ID": "w1:p1"}), \
+                mock.patch.object(fleet, "require_herdr"), mock.patch.object(fleet, "pane_info", return_value=info), \
+                mock.patch.object(fleet, "create_pane", return_value=target), mock.patch.object(fleet, "run", run), \
+                mock.patch.object(fleet, "wait_for_start", side_effect=fleet.FleetError("pane w2:p1 closed")), \
+                mock.patch.object(fleet, "wait_not_working", return_value=True), \
+                mock.patch.object(fleet, "submit_prompt", return_value={"ok": True, "status": "working"}), \
+                mock.patch.object(fleet, "exit_agent", return_value=True), \
+                mock.patch.object(fleet, "herdr", side_effect=fleet.FleetError("no such pane")), quiet, err:
+            # The launch is recorded although the wait fails.
+            self.assertEqual(fleet.main(["spawn", "--agent", "claude", "--name", "impl-x", "--role", "impl",
+                                         "--prompt", "Read .fleet/BRIEF.md and execute it."]), 1)
+            self.assertEqual(fleet.main(["send", "w2:p1", "--text", "Fix the test."]), 0)
+            # The agent exited, but the pane did not close.
+            self.assertEqual(fleet.main(["retire", "w2:p1", "--close"]), 1)
+        events = fleet.read_events([fleet.project_for(lane)])
+        self.assertEqual([(e["event"], e.get("ok")) for e in events],
+                         [("spawn", None), ("spawn_result", False), ("send", True), ("retire", True)])
+        for e in events:
+            self.assertEqual((e["branch"], e["workspace"], e["cwd"], e["by"]["pane"]), ("feat/x", "w2", lane, "w1:p1"))
+        self.assertEqual(events[0]["prompt"], "Read .fleet/BRIEF.md and execute it.")
+        self.assertEqual((events[1]["reason"], events[3]["closed"], events[3]["error"]),
+                         ("pane w2:p1 closed", False, "no such pane"))
+        for lane_name in ("feat/x", "w2", "impl-x", lane):
+            self.assertEqual(len(json.loads(self.log("app", "--json", "--lane", lane_name)[1])), 4, lane_name)
+        text = self.log("app")[1]
+        self.assertIn("did not start  FAILED: pane w2:p1 closed", text)
+        self.assertIn("could not close the pane: no such pane", text)
+        self.assertEqual([(r["session"], r["ended"]) for r in json.loads(self.log("app", "--sessions", "--json")[1])],
+                         [("s-1", "retired")])
+
+    def test_session_rows(self):
+        def ev(kind, session, **fields):
+            return {"ts": "2026-01-02T03:04:05+00:00", "event": kind, "session": session, **fields}
+        rows = fleet.session_rows([
+            ev("session_start", "s-1", source="startup"), ev("session_end", "s-1", reason="other"),
+            ev("session_start", "s-1", source="resume"),
+            ev("session_start", "s-2", source="startup"), ev("retire", "s-2", ok=False, reason="still running"),
+            ev("session_start", "s-3", source="startup"), ev("retire", "s-3", ok=True),
+        ])
+        self.assertEqual([(r["session"], r["ended"]) for r in rows], [("s-1", None), ("s-2", None), ("s-3", "retired")])
+
+    def test_log_skips_fields_of_the_wrong_type(self):
+        d = fleet.project_for(str(self.repo))
+        (d / "events").mkdir(exist_ok=True)
+        bad = [{"ts": "2026-01-02T03:04:05+00:00", "event": "session_start", "session": {"a": 1}, "source": ["x"],
+                "pane": "w2:p1"},
+               {"ts": "2026-01-02T03:04:06+00:00", "event": "cleanup", "lane": 5, "exited": 7, "by": "w1:p1"},
+               {"ts": "2026-01-02T03:04:07+00:00", "event": "retire", "session": 9, "agent": "claude",
+                "exited": [{"pane": 1, "session": "s-1"}, "x"], "by": {"pane": ["w1:p1"]}, "ok": "yes"},
+               {"ts": 5, "event": ["send"], "pane": {"p": 1}}]
+        with open(d / "events" / "2026-01.jsonl", "a") as fh:
+            fh.write("".join(json.dumps(e) + "\n" for e in bad))
+        for argv in ([], ["--sessions"], ["--pane", "w2:p1"], ["--lane", "feat/x"], ["--sessions", "--pane", "w1:p1"]):
+            code, out = self.log("app", "--limit", "0", *argv)
+            self.assertEqual(code, 0, argv)
+        events = json.loads(self.log("app", "--json", "--limit", "0")[1])
+        self.assertEqual([sorted(e) for e in events],  # the event without a valid time sorts first
+                         [[], ["event", "pane", "ts"], ["event", "ts"], ["agent", "by", "event", "exited", "ts"]])
+        self.assertEqual((events[3]["by"], events[3]["exited"]), ({}, [{"session": "s-1"}]))
 
     def test_log(self):
         lane = str(self.root / "lane")
@@ -677,10 +801,12 @@ class ProjectLogTests(unittest.TestCase):
         fleet.record("worktree", lane, lane=lane, branch="feat/x", base="origin/main", workspace="w2", pane="w2:p1")
         fleet.record("spawn", lane, pane="w2:p1", cwd=lane, branch="feat/x", agent="claude", model="opus",
                      role="impl", session="s-1", prompt="Read .fleet/BRIEF.md and execute it.", ok=True)
-        fleet.record("send", lane, pane="w2:p1", cwd=lane, text="Fix the test.", ok=False, reason="busy")
-        fleet.record("session_start", lane, by=False, pane="w2:p1", cwd=lane, agent="claude", role="impl",
-                     session="s-2", source="clear", transcript="/t/s-2.jsonl")
-        fleet.record("reset", lane, pane="w2:p1", cwd=lane, command="/clear", session_before="s-1", session="s-2", ok=True)
+        fleet.record("send", lane, pane="w2:p1", cwd=lane, branch="feat/x", workspace="w2", text="Fix the test.",
+                     ok=False, reason="busy")
+        fleet.record("session_start", lane, by=False, pane="w2:p1", cwd=lane, branch="feat/x", workspace="w2",
+                     agent="claude", role="impl", session="s-2", source="clear", transcript="/t/s-2.jsonl")
+        fleet.record("reset", lane, pane="w2:p1", cwd=lane, branch="feat/x", workspace="w2", command="/clear",
+                     session_before="s-1", session="s-2", ok=True)
         fleet.record("cleanup", str(self.repo), lane=lane, branch="feat/x", removed=True, branch_result="deleted feat/x",
                      exited=[{"pane": "w2:p1", "agent": "claude", "session": "s-2"}], ok=True)
         old = {"ts": "2026-01-02T03:04:05+00:00", "event": "send", "pane": "w9:p1", "text": "old"}
@@ -695,7 +821,7 @@ class ProjectLogTests(unittest.TestCase):
         self.assertEqual(len(json.loads(self.log("app", "--json", "--limit", "2")[1])), 2)
         self.assertEqual([e["event"] for e in json.loads(self.log("app", "--json", "--event", "spawn,reset")[1])],
                          ["spawn", "reset"])
-        self.assertEqual(len(json.loads(self.log("app", "--json", "--lane", "feat/x")[1])), 3)
+        self.assertEqual(len(json.loads(self.log("app", "--json", "--lane", "feat/x")[1])), 6)
         self.assertEqual(len(json.loads(self.log("app", "--json", "--lane", lane)[1])), 6)
         self.assertEqual(len(json.loads(self.log("app", "--json", "--pane", "w9:p1")[1])), 1)
         text = self.log("app")[1]

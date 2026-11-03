@@ -614,21 +614,28 @@ def cmd_spawn(args: argparse.Namespace) -> int:
             "spawned_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "spawned_by": os.environ.get("HERDR_PANE_ID"),
         })
     run(["herdr", "pane", "run", pane, launch["command"]])
+    # Record the launch now: the wait can take minutes, and the caller can stop the command during it.
+    cwd = target.get("cwd")
+    where = {"pane": pane, "workspace": target.get("workspace_id"), "cwd": cwd,
+             "branch": (git_branch(cwd) or None) if cwd else None, "agent": agent, "role": args.role}
+    record("spawn", cwd, **where, placement=target.get("placement"), account=launch["account"], model=args.model,
+           effort=args.effort, permission_mode=args.permission_mode, label=args.name, prompt=prompt,
+           resume=args.resume)
     if args.no_wait:
         result = {"ok": True, "status": "launched", "notes": ["did not wait for the agent"]}
     else:
-        result = wait_for_start(pane, agent, prompt, args.accept_trust, args.timeout)
+        try:
+            result = wait_for_start(pane, agent, prompt, args.accept_trust, args.timeout)
+        except FleetError as e:
+            record("spawn_result", cwd, **where, ok=False, reason=str(e))
+            raise
     out = {**result, **target, **launch, "label": args.name, "role": args.role}
     try:
         session = session_id_of(pane_info(pane)) if result["ok"] else None
     except FleetError:
         session = None
-    cwd = target.get("cwd")
-    record("spawn", cwd, pane=pane, workspace=target.get("workspace_id"), placement=target.get("placement"),
-           cwd=cwd, branch=(git_branch(cwd) or None) if cwd else None, agent=agent, account=launch["account"],
-           model=args.model, effort=args.effort, permission_mode=args.permission_mode, role=args.role,
-           label=args.name, prompt=prompt, resume=args.resume, session=session, ok=result["ok"],
-           status=result.get("status"), reason=result.get("reason"))
+    record("spawn_result", cwd, **where, session=session, ok=result["ok"], status=result.get("status"),
+           reason=result.get("reason"))
     print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0 if result["ok"] else 2
 
@@ -720,8 +727,9 @@ def cmd_send(args: argparse.Namespace) -> int:
         return 3
     out = submit_prompt(pane, info["agent"], text)
     out["file"] = str(sent_file) if sent_file else None
-    record("send", info.get("cwd"), pane=pane, agent=info["agent"], cwd=info.get("cwd"), text=text, file=out["file"],
-           session=session_id_of(info), ok=out["ok"], status=out.get("status"), reason=out.get("reason"))
+    record("send", info.get("cwd"), pane=pane, agent=info["agent"], **pane_lane_fields(info), text=text,
+           file=out["file"], session=session_id_of(info), ok=out["ok"], status=out.get("status"),
+           reason=out.get("reason"))
     print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0 if out["ok"] else 2
 
@@ -859,7 +867,7 @@ def cmd_reset(args: argparse.Namespace) -> int:
         time.sleep(1.0)
         out["resume"] = submit_prompt(pane, "claude", message)
         out["ok"] = ok = out["resume"]["ok"]
-    record("reset", info.get("cwd"), pane=pane, agent="claude", cwd=info.get("cwd"), command=command,
+    record("reset", info.get("cwd"), pane=pane, agent="claude", **pane_lane_fields(info), command=command,
            session_before=session_id_of(info), session=out["session_id"],
            text=(out.get("resume") or {}).get("sent"), ok=ok, reason=out.get("reason"))
     print(json.dumps(out, indent=2, ensure_ascii=False))
@@ -901,17 +909,21 @@ def cmd_retire(args: argparse.Namespace) -> int:
             time.sleep(1.5)
         if not exit_agent(pane, agent, args.timeout):
             reason = f"{agent} still running after {EXIT_COMMAND[agent]}"
-            record("retire", info.get("cwd"), pane=pane, agent=agent, cwd=info.get("cwd"),
+            record("retire", info.get("cwd"), pane=pane, agent=agent, **pane_lane_fields(info),
                    session=session_id_of(info), ok=False, reason=reason)
             print(json.dumps({"ok": False, "pane_id": pane, "reason": reason}, indent=2, ensure_ascii=False))
             return 2
     unregistered = bool(info.get("cwd")) and unregister_pane(info["cwd"], pane)
+    fields = {"pane": pane, "agent": agent, **pane_lane_fields(info), "session": session_id_of(info), "ok": True}
     closed = False
     if args.close:
-        herdr("pane", "close", pane)
+        try:
+            herdr("pane", "close", pane)
+        except FleetError as e:
+            record("retire", info.get("cwd"), **fields, closed=False, error=str(e))
+            raise
         closed = True
-    record("retire", info.get("cwd"), pane=pane, agent=agent, cwd=info.get("cwd"), session=session_id_of(info),
-           closed=closed, ok=True)
+    record("retire", info.get("cwd"), **fields, closed=closed)
     print(json.dumps({"ok": True, "pane_id": pane, "exited": agent, "closed": closed,
                       "unregistered": unregistered}, indent=2, ensure_ascii=False))
     return 0
@@ -1035,11 +1047,26 @@ def cmd_status(args: argparse.Namespace) -> int:
 PROJECTS_DIR = "projects"
 EVENTS_DIR = "events"
 PROJECT_FILE = "project.json"
-LOG_EVENTS = ("worktree", "spawn", "send", "reset", "retire", "cleanup", "handoff", "session_start", "session_end")
+LOG_EVENTS = ("worktree", "spawn", "spawn_result", "send", "reset", "retire", "cleanup", "handoff",
+              "session_start", "session_end")
+HOOK_GIT_TIMEOUT = 1  # seconds for each git call in a hook; SessionEnd has 5 s in all, SessionStart 10 s
+# Types of the event fields that are not text. `fleet log` drops a field of another type, so one damaged
+# line cannot break it. Add each new field that is not text here.
+EVENT_FIELD_TYPES = {"ok": bool, "closed": bool, "removed": bool, "by": dict, "exited": list, "reasons": list}
 
 
 def fleet_home() -> Path:
     return Path(os.environ.get("FLEET_HOME") or "~/.fleet").expanduser()
+
+
+def ensure_home() -> Path:
+    """The fleet home, which only the user can open: it holds prompts and copies of lane files."""
+    home = fleet_home()
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    st = home.stat()
+    if st.st_mode & 0o077 and st.st_uid == os.getuid():
+        os.chmod(home, 0o700)
+    return home
 
 
 def now_iso() -> str:
@@ -1060,37 +1087,73 @@ def write_json(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
+def text_or_none(value) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
 def normalize_remote(url: str) -> str | None:
-    """host/path of a git remote URL in lower case, so that its SSH and HTTPS forms match. None for a local path."""
+    """host/path of a git remote URL in lower case, so that its SSH and HTTPS forms match. None for a local path.
+
+    The user name, password, port, query and fragment are dropped.
+    """
     url = (url or "").strip()
-    m = (re.match(r"^[a-z][a-z0-9+.-]*://(?:[^@/]*@)?([^/:]+)(?::\d*)?/(.+)$", url, re.I)
-         or re.match(r"^(?:[^@/]+@)?([^/:]{2,}):(?!/)(.+)$", url))
+    m = (re.match(r"^[a-z][a-z0-9+.-]*://(?:[^/]*@)?([^/:@?#]+)(?::\d*)?(/[^?#]*)", url, re.I)
+         or re.match(r"^(?:[^@/]+@)?([^/:@]{2,}):(?!//)([^?#]+)", url))
     if not m:
         return None
     path = re.sub(r"\.git$", "", m.group(2).strip("/")).strip("/")
     return f"{m.group(1)}/{path}".lower() if path else None
 
 
-def repo_identity(path: str) -> dict | None:
-    """The repository at `path`: its key (the normalized URL of origin, else local:<main checkout>) and main checkout."""
-    lines = (git_out(path, "rev-parse", "--git-common-dir", "--show-toplevel") or "").splitlines()
+def repo_identity(path: str, timeout: float = 15) -> dict | None:
+    """The repository at `path`: its keys, main checkout and top.
+
+    `key` is the normalized URL of origin (else of the first remote), or local:<main checkout> without a
+    remote. `keys` also holds the local key, so that a project keeps its clones when a remote is added later.
+    """
+    lines = (git_out(path, "rev-parse", "--git-common-dir", "--show-toplevel", timeout=timeout) or "").splitlines()
     if len(lines) < 2:
         return None
     common = os.path.realpath(os.path.join(path, lines[0]))
     main_root = os.path.dirname(common) if os.path.basename(common) == ".git" else common
-    url = git_out(path, "config", "--get", "remote.origin.url")
-    if url is None:
-        names = (git_out(path, "remote") or "").split()
-        url = git_out(path, "config", "--get", f"remote.{names[0]}.url") if names else None
-    return {"key": normalize_remote(url or "") or f"local:{main_root}", "main_root": main_root, "top": lines[1]}
+    urls: dict[str, str] = {}
+    for line in (git_out(path, "config", "--get-regexp", r"^remote\..*\.url$", timeout=timeout) or "").splitlines():
+        name, _, url = line.partition(" ")
+        urls.setdefault(name[len("remote."):-len(".url")], url.strip())
+    remote = normalize_remote(urls.get("origin") or next(iter(urls.values()), ""))
+    local = f"local:{main_root}"
+    return {"key": remote or local, "keys": [remote, local] if remote else [local], "main_root": main_root,
+            "top": lines[1]}
 
 
 def project_dirs() -> list[Path]:
     return sorted(p.parent for p in (fleet_home() / PROJECTS_DIR).glob(f"*/{PROJECT_FILE}"))
 
 
-def find_project(key: str) -> Path | None:
-    return next((d for d in project_dirs() if key in (read_json(d / PROJECT_FILE).get("remotes") or [])), None)
+def project_keys(data: dict) -> list[str]:
+    keys = data.get("keys") or data.get("remotes") or []  # "remotes": project.json files of the first 0.4.0
+    return [k for k in keys if isinstance(k, str)] if isinstance(keys, list) else []
+
+
+def find_project(keys: list[str], learn: bool = False) -> Path | None:
+    """The home of the project that knows one of these keys, tried in order.
+
+    With `learn`, the project also stores the keys that it lacks: a new clone, or a remote that was added to a
+    repository without one.
+    """
+    projects = [(d, read_json(d / PROJECT_FILE)) for d in project_dirs()]
+    for key in keys:
+        for d, data in projects:
+            known = project_keys(data)
+            if key not in known:
+                continue
+            missing = [k for k in keys if k not in known]
+            if learn and missing:
+                data.pop("remotes", None)
+                data["keys"] = known + missing
+                write_json(d / PROJECT_FILE, data)
+            return d
+    return None
 
 
 def project_names(key: str) -> list[str]:
@@ -1101,41 +1164,42 @@ def project_names(key: str) -> list[str]:
     return names + [f"{parts[-1]}-{i}" for i in range(2, 100)]
 
 
-def ensure_project(key: str) -> Path | None:
-    """The home of the project with this key. The first call creates it."""
-    found = find_project(key)
+def ensure_project(keys: list[str]) -> Path | None:
+    """The home of the project with these keys; keys[0] names a new one. The first call creates it."""
+    found = find_project(keys, learn=True)
     if found:
         return found
-    root = fleet_home() / PROJECTS_DIR
-    root.mkdir(parents=True, exist_ok=True)
-    for name in project_names(key):
+    root = ensure_home() / PROJECTS_DIR
+    root.mkdir(exist_ok=True)
+    for name in project_names(keys[0]):
         d = root / name
         try:
             d.mkdir()
         except FileExistsError:
             # Another process can have created this project a moment ago: give it time to write project.json.
-            remotes = None
+            known: list[str] = []
             for _ in range(20):
-                remotes = read_json(d / PROJECT_FILE).get("remotes")
-                if remotes is not None:
+                data = read_json(d / PROJECT_FILE)
+                if data:
+                    known = project_keys(data)
                     break
                 time.sleep(0.05)
-            if key in (remotes or []):
+            if any(k in known for k in keys):
                 return d
             continue
-        write_json(d / PROJECT_FILE, {"name": name, "remotes": [key], "created": now_iso()})
+        write_json(d / PROJECT_FILE, {"name": name, "keys": list(keys), "created": now_iso()})
         return d
     return None
 
 
-def project_for(path: str | None, create: bool = True) -> Path | None:
+def project_for(path: str | None, create: bool = True, timeout: float = 15) -> Path | None:
     """The home of the project that holds `path`, or None outside a repository."""
     if not path or not os.path.isdir(path):
         return None
-    ident = repo_identity(path)
+    ident = repo_identity(path, timeout)
     if not ident:
         return None
-    return ensure_project(ident["key"]) if create else find_project(ident["key"])
+    return ensure_project(ident["keys"]) if create else find_project(ident["keys"])
 
 
 def caller() -> dict:
@@ -1146,10 +1210,14 @@ def caller() -> dict:
     return {k: v for k, v in who.items() if v}
 
 
-def record(event: str, where: str | None, by: bool = True, **fields) -> str | None:
-    """Append one event to the log of the project that holds `where`. Returns the log file, or None. Never raises."""
+def record(event: str, where: str | None, by: bool = True, home: Path | None = None, **fields) -> str | None:
+    """Append one event to the log of the project that holds `where` (or to `home`).
+
+    Returns the log file, or None. Never raises, and gives up after about 1 s on a locked log.
+    """
     try:
-        home = project_for(where)
+        ensure_home()
+        home = home or project_for(where)
         entry = {"ts": now_iso(), "event": event}
         if home:
             entry["project"] = home.name
@@ -1161,7 +1229,14 @@ def record(event: str, where: str | None, by: bool = True, **fields) -> str | No
         path = d / f"{time.strftime('%Y-%m')}.jsonl"
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            for _ in range(20):
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(0.05)
+            else:
+                return None
             os.write(fd, (json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n").encode())
         finally:
             os.close(fd)
@@ -1170,22 +1245,41 @@ def record(event: str, where: str | None, by: bool = True, **fields) -> str | No
         return None
 
 
+def pane_lane_fields(info: dict) -> dict:
+    """cwd, workspace and branch of a pane, so that `fleet log --lane` finds the event."""
+    cwd = info.get("cwd")
+    return {"cwd": cwd, "workspace": info.get("workspace_id"), "branch": (git_branch(cwd) or None) if cwd else None}
+
+
 def hook_session_event(event: str, data: dict, env: dict | None = None) -> str | None:
-    """Record a Claude session that starts or ends in a Herdr pane, in a checkout that has .fleet/."""
+    """Record a Claude session that starts or ends in a Herdr pane, in a checkout that has .fleet/.
+
+    Each of its three git calls gets HOOK_GIT_TIMEOUT, so that it ends well within the hook's time.
+    """
     env = os.environ if env is None else env
-    pane = env.get("HERDR_PANE_ID")
+    pane = text_or_none(env.get("HERDR_PANE_ID"))
     if not pane:
         return None
-    cwd = data.get("cwd") or os.getcwd()
-    top = git_toplevel(cwd)
-    if not top or not (Path(top) / FLEET_DIR).is_dir():
+    cwd = text_or_none(data.get("cwd")) or os.getcwd()
+    ident = repo_identity(cwd, HOOK_GIT_TIMEOUT)
+    if not ident or not (Path(ident["top"]) / FLEET_DIR).is_dir():
+        return None
+    top = ident["top"]
+    try:
+        home = ensure_project(ident["keys"])
+    except OSError:
         return None
     role = (load_panes(Path(top) / FLEET_DIR).get(pane) or {}).get("role")
     model = data.get("model")
-    return record(event, top, by=False, pane=pane, workspace=env.get("HERDR_WORKSPACE_ID"), cwd=cwd,
-                  branch=git_branch(top) or None, agent="claude", role=role, session=data.get("session_id"),
-                  transcript=data.get("transcript_path"), source=data.get("source"), reason=data.get("reason"),
-                  model=model if isinstance(model, str) else None, config_dir=env.get("CLAUDE_CONFIG_DIR"))
+    model = model.get("id") if isinstance(model, dict) else model
+    return record(event, top, by=False, home=home, pane=pane,
+                  workspace=text_or_none(env.get("HERDR_WORKSPACE_ID")), cwd=cwd,
+                  branch=git_out(top, "rev-parse", "--abbrev-ref", "HEAD", timeout=HOOK_GIT_TIMEOUT),
+                  agent="claude", role=text_or_none(role), session=text_or_none(data.get("session_id")),
+                  transcript=text_or_none(data.get("transcript_path")), source=text_or_none(data.get("source")),
+                  reason=text_or_none(data.get("reason")), model=text_or_none(model),
+                  config_dir=text_or_none(env.get("CLAUDE_CONFIG_DIR")),
+                  entrypoint=text_or_none(env.get("CLAUDE_CODE_ENTRYPOINT")))
 
 
 def event_time(e: dict) -> float:
@@ -1205,8 +1299,24 @@ def parse_since(text: str) -> float:
         raise FleetError(f"--since takes a duration (30m, 12h, 7d, 2w) or a date such as 2026-11-01, not {text!r}")
 
 
+def clean_event(e: dict) -> dict:
+    """The event without the fields whose type is wrong (see EVENT_FIELD_TYPES; other fields are text)."""
+    out = {}
+    for key, value in e.items():
+        want = EVENT_FIELD_TYPES.get(key, str)
+        if not isinstance(value, want):
+            continue
+        if want is dict:
+            value = {k: v for k, v in value.items() if isinstance(v, str)}
+        elif want is list:
+            value = ([{k: v for k, v in x.items() if isinstance(v, str)} for x in value if isinstance(x, dict)]
+                     if key == "exited" else [x for x in value if isinstance(x, str)])
+        out[key] = value
+    return out
+
+
 def read_events(dirs: list[Path]) -> list[dict]:
-    """Every event in these homes, oldest first. A damaged line is skipped."""
+    """Every event in these homes, oldest first. A damaged line or field is skipped."""
     events = []
     for d in dirs:
         for f in sorted((Path(d) / EVENTS_DIR).glob("*.jsonl")):
@@ -1220,7 +1330,7 @@ def read_events(dirs: list[Path]) -> list[dict]:
                 except ValueError:
                     continue
                 if isinstance(e, dict):
-                    events.append(e)
+                    events.append(clean_event(e))
     events.sort(key=event_time)
     return events
 
@@ -1231,6 +1341,12 @@ def lane_matches(e: dict, lane: str) -> bool:
         return True
     want = os.path.expanduser(lane)
     return any(isinstance(p, str) and inside(os.path.expanduser(p), want) for p in (e.get("lane"), e.get("cwd")))
+
+
+def lane_events(events: list[dict], lane: str) -> list[dict]:
+    """The events of one lane. A label is recorded only at worktree and spawn, so it also selects their branch."""
+    branches = {e["branch"] for e in events if e.get("label") == lane and e.get("branch")}
+    return [e for e in events if lane_matches(e, lane) or e.get("branch") in branches]
 
 
 def pane_matches(e: dict, pane: str) -> bool:
@@ -1251,13 +1367,16 @@ def describe_event(e: dict) -> str:
         text = " ".join(x for x in (e.get("role"), setup, e.get("account"),
                                     f"session {short_id(e.get('session'))}" if e.get("session") else None) if x)
         text += f'  "{e["prompt"]}"' if e.get("prompt") else ""
+    elif kind == "spawn_result":
+        text = f"started, session {short_id(e.get('session'))}" if e.get("ok") else "did not start"
     elif kind == "send":
         text = f'"{e.get("text") or ""}"'
     elif kind == "reset":
         text = f"{e.get('command')}  session {short_id(e.get('session_before'))} -> {short_id(e.get('session'))}"
     elif kind == "retire":
         text = (f"exited {e.get('agent') or 'no agent'} (session {short_id(e.get('session'))})"
-                + (", closed the pane" if e.get("closed") else ""))
+                + (", closed the pane" if e.get("closed") else "")
+                + (f"; could not close the pane: {e['error']}" if e.get("error") and e.get("ok") else ""))
     elif kind == "cleanup":
         text = (f"{short_path(e.get('lane') or '')} " + ("removed" if e.get("removed") else "kept")
                 + f"; branch: {e.get('branch_result') or '-'}"
@@ -1301,9 +1420,11 @@ def session_rows(events: list[dict]) -> list[dict]:
         r = touch(e.get("session"), e)
         if r and e.get("transcript"):
             r["transcript"] = e["transcript"]
+        if r and kind == "session_start":
+            r["ended"] = None  # resumed
         if r and kind == "session_end":
             r["ended"] = e.get("reason") or "ended"
-        if r and kind == "retire":
+        if r and kind == "retire" and e.get("ok") is not False:
             r["ended"] = "retired"
         if kind == "reset":
             before = touch(e.get("session_before"), e)
@@ -1375,7 +1496,7 @@ def cmd_log(args: argparse.Namespace) -> int:
         kinds = {k.strip() for k in args.event.split(",") if k.strip()}
         events = [e for e in events if e.get("event") in kinds]
     if args.lane:
-        events = [e for e in events if lane_matches(e, args.lane)]
+        events = lane_events(events, args.lane)
     if args.pane:
         events = [e for e in events if pane_matches(e, args.pane)]
     if args.sessions:
@@ -1437,9 +1558,9 @@ def run_git(path: str, *args: str, timeout: float = 15) -> subprocess.CompletedP
         return None
 
 
-def git_out(path: str, *args: str) -> str | None:
+def git_out(path: str, *args: str, timeout: float = 15) -> str | None:
     """Stripped stdout of a git command, or None when it fails."""
-    cp = run_git(path, *args)
+    cp = run_git(path, *args, timeout=timeout)
     return cp.stdout.strip() if cp is not None and cp.returncode == 0 else None
 
 
@@ -1933,7 +2054,11 @@ def clean_lane(f: dict, timeout: float) -> dict:
                 return out
             out["exited"].append(p["pane"])
             sessions.append({"pane": p["pane"], "agent": p["agent"], "session": session_id_of(info)})
-        out["archive"] = archive_lane_files(f["path"], f.get("repo"), f.get("branch"))
+        try:
+            out["archive"] = archive_lane_files(f["path"], f.get("repo"), f.get("branch"))
+        except OSError as e:
+            out["error"] = f"could not archive .fleet/ ({e}); the worktree stays"
+            return out
         if f.get("workspace"):
             herdr("worktree", "remove", "--workspace", f["workspace"], "--json", timeout=120)
         else:
@@ -2033,7 +2158,8 @@ def cmd_prep(args: argparse.Namespace) -> int:
     if args.handoff:
         out["handoff_path"] = str(handoff_path(fleet_dir))
         record("handoff", str(fleet_dir.parent), path=out["handoff_path"], role=out["pane_role"],
-               lane=str(fleet_dir.parent) if out["lane"] else None)
+               lane=str(fleet_dir.parent) if out["lane"] else None, cwd=str(fleet_dir.parent),
+               branch=git_branch(str(fleet_dir.parent)) or None, workspace=os.environ.get("HERDR_WORKSPACE_ID"))
     print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0
 
@@ -2432,18 +2558,18 @@ def cmd_hook(args: argparse.Namespace) -> int:
         return 0
     if not isinstance(data, dict):
         return 0
+    if args.event == "session-start":
+        try:
+            context = session_start_context(data)
+        except Exception:
+            context = None
+        if context:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}))
+            sys.stdout.flush()
     try:
         hook_session_event("session_start" if args.event == "session-start" else "session_end", data)
     except Exception:
         pass
-    if args.event != "session-start":
-        return 0
-    try:
-        context = session_start_context(data)
-    except Exception:
-        return 0
-    if context:
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}))
     return 0
 
 

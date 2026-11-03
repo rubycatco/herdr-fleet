@@ -1,12 +1,23 @@
 {
-  "description": "Record fleet sessions in the project's event log, and re-brief a fleet lane or orchestrator from its .fleet/ files after /clear or compaction.",
+  "description": "Re-brief a fleet lane or orchestrator from its .fleet/ files after /clear or compaction, and record the Claude sessions of Herdr panes in the project's event log.",
   "hooks": {
     "SessionStart": [
       {
+        "matcher": "clear|compact",
         "hooks": [
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/fleet\" hook session-start",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$HERDR_PANE_ID\" ] || exit 0; python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/fleet\" hook session-start",
             "timeout": 10
           }
         ]
@@ -17,8 +28,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/fleet\" hook session-end",
-            "timeout": 10
+            "command": "[ -n \"$HERDR_PANE_ID\" ] || exit 0; python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/fleet\" hook session-end",
+            "timeout": 5
           }
         ]
       }
