@@ -39,7 +39,7 @@ Show the groups in a short table. Then ask with AskUserQuestion. Name the lanes 
 
 1. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" cleanup <target> [<target> ...]`. Targets are the workspace ids and paths that the sweep printed. Add `--unmerged` only for lanes that the user chose under that option.
    - It checks every target again before it changes anything. When a target is no longer ready, it changes nothing and prints `refused` with the reasons. Show them, and sweep again.
-   - For each lane in turn, it exits the agents, copies `.fleet/` (without `panes.json`) to the archive path that it prints (by default under `~/.local/state/fleet/archive/`), removes the worktree (Herdr closes the workspace and its panes), and deletes the local branch only when the merge holds every commit. It never pushes, and never deletes a remote branch.
+   - For each lane in turn, it exits the agents, copies `.fleet/` (without `panes.json`) to the archive path that it prints (the `lanes/` folder of the project home, `~/.fleet/projects/<project>/`), removes the worktree (Herdr closes the workspace and its panes), and deletes the local branch only when the merge holds every commit. It never pushes, and never deletes a remote branch.
    - An agent that does not exit stops its lane, and that worktree stays. Read the pane with `herdr pane read <pane> --source recent-unwrapped --lines 80`, and tell the user.
 2. Run each project cleanup command that the user agreed to, in the folder that the conventions name.
 

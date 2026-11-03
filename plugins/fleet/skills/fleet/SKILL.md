@@ -44,6 +44,7 @@ Run every command as `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" <command> ..
 | `sweep` | Every lane on this machine with a verdict, ready, waiting or keep, and the reason (text; `--json`). It only reads. |
 | `cleanup TARGET... [--unmerged] [--dry-run]` | Remove lanes: exit their agents, archive `.fleet/`, remove the worktree, delete the local branch when the merge holds every commit. It checks every target first and changes nothing when one is not ready. |
 | `prep [DIR] [--handoff]` | Create `.fleet/` and keep it out of git. `--handoff` also returns where a handoff file goes. |
+| `log [PROJECT] [--lane L] [--pane P] [--event E] [--since 7d] [--sessions]` | The project's event log (text; `--json`): the commands above that change something, and each Claude session in a fleet checkout. `--sessions`: one row per agent session, with its transcript. It only reads. |
 
 `spawn` options:
 - Placement: `--pane P` (an existing shell pane), `--worktree BRANCH --base REF`, `--tab`, `--new-workspace`, or a split (`--split auto|right|down`, `--from PANE`; default: split the calling pane). A split starts in the directory of the pane it splits unless you pass `--cwd`.
@@ -71,6 +72,7 @@ Run every command as `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" <command> ..
 - One implementer per worktree. Critics work in the lane's worktree, write only their review file, and never edit code.
 - Dispatch with `send`, `spawn --prompt` or files. Use `herdr pane run` or `send-keys` only to answer a dialog.
 - Watch files and git, not scrollback. Each marker carries a round number. Never reuse a number.
+- To recall what a lane was told and which sessions worked on it, read `log --lane <branch>` or `log --sessions`, not old scrollback.
 - `done` does not mean finished. Before a review, check that STATUS.md has real verification results and no `PLACEHOLDER`.
 - The helper refuses to drive your own pane. For yourself, use `/fleet:context` or `/fleet:handoff`.
 - Close only panes, tabs and workspaces that you created. Never delete a branch or worktree that holds unmerged work.

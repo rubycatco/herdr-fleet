@@ -20,7 +20,8 @@ Commands:
   fleet sweep [--json]                    every lane with a cleanup verdict: ready, waiting or keep (reads only)
   fleet cleanup TARGET... [--unmerged]    remove lanes: exit agents, archive .fleet/, remove the worktree,
                                           delete the local branch when its merge holds every commit
-  fleet hook session-start                SessionStart hook: re-brief after /clear or compaction
+  fleet log [PROJECT] [--sessions]        the project's event log, or its agent sessions (reads only)
+  fleet hook session-start|session-end    hooks: record fleet sessions; re-brief after /clear or compaction
 
 Python 3.8+, standard library only.
 """
@@ -28,6 +29,7 @@ Python 3.8+, standard library only.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import glob
 import json
 import os
@@ -39,9 +41,10 @@ import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 FLEET_DIR = ".fleet"
 LANE_FILES = ("BRIEF.md", "STATUS.md", "HANDOFF.md")
@@ -445,9 +448,12 @@ def create_worktree(branch: str, base: str | None, repo: str | None, label: str 
         cmd += ["--label", label]
     result = herdr(*cmd, timeout=120)
     path = (result.get("worktree") or {}).get("path") or (result.get("root_pane") or {}).get("cwd")
-    return {"pane_id": find_pane_id(result), "tab_id": (result.get("tab") or {}).get("tab_id"),
-            "workspace_id": (result.get("workspace") or {}).get("workspace_id"),
-            "cwd": path, "branch": branch, "placement": f"worktree {branch}"}
+    out = {"pane_id": find_pane_id(result), "tab_id": (result.get("tab") or {}).get("tab_id"),
+           "workspace_id": (result.get("workspace") or {}).get("workspace_id"),
+           "cwd": path, "branch": branch, "placement": f"worktree {branch}"}
+    record("worktree", path, lane=path, branch=branch, base=base, label=label, workspace=out["workspace_id"],
+           pane=out["pane_id"])
+    return out
 
 
 def cmd_worktree(args: argparse.Namespace) -> int:
@@ -613,6 +619,16 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     else:
         result = wait_for_start(pane, agent, prompt, args.accept_trust, args.timeout)
     out = {**result, **target, **launch, "label": args.name, "role": args.role}
+    try:
+        session = session_id_of(pane_info(pane)) if result["ok"] else None
+    except FleetError:
+        session = None
+    cwd = target.get("cwd")
+    record("spawn", cwd, pane=pane, workspace=target.get("workspace_id"), placement=target.get("placement"),
+           cwd=cwd, branch=(git_branch(cwd) or None) if cwd else None, agent=agent, account=launch["account"],
+           model=args.model, effort=args.effort, permission_mode=args.permission_mode, role=args.role,
+           label=args.name, prompt=prompt, resume=args.resume, session=session, ok=result["ok"],
+           status=result.get("status"), reason=result.get("reason"))
     print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0 if result["ok"] else 2
 
@@ -704,6 +720,8 @@ def cmd_send(args: argparse.Namespace) -> int:
         return 3
     out = submit_prompt(pane, info["agent"], text)
     out["file"] = str(sent_file) if sent_file else None
+    record("send", info.get("cwd"), pane=pane, agent=info["agent"], cwd=info.get("cwd"), text=text, file=out["file"],
+           session=session_id_of(info), ok=out["ok"], status=out.get("status"), reason=out.get("reason"))
     print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0 if out["ok"] else 2
 
@@ -841,6 +859,9 @@ def cmd_reset(args: argparse.Namespace) -> int:
         time.sleep(1.0)
         out["resume"] = submit_prompt(pane, "claude", message)
         out["ok"] = ok = out["resume"]["ok"]
+    record("reset", info.get("cwd"), pane=pane, agent="claude", cwd=info.get("cwd"), command=command,
+           session_before=session_id_of(info), session=out["session_id"],
+           text=(out.get("resume") or {}).get("sent"), ok=ok, reason=out.get("reason"))
     print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0 if ok else 2
 
@@ -879,14 +900,18 @@ def cmd_retire(args: argparse.Namespace) -> int:
             send_keys(pane, "Escape")
             time.sleep(1.5)
         if not exit_agent(pane, agent, args.timeout):
-            print(json.dumps({"ok": False, "pane_id": pane, "reason": f"{agent} still running after {EXIT_COMMAND[agent]}"},
-                             indent=2, ensure_ascii=False))
+            reason = f"{agent} still running after {EXIT_COMMAND[agent]}"
+            record("retire", info.get("cwd"), pane=pane, agent=agent, cwd=info.get("cwd"),
+                   session=session_id_of(info), ok=False, reason=reason)
+            print(json.dumps({"ok": False, "pane_id": pane, "reason": reason}, indent=2, ensure_ascii=False))
             return 2
     unregistered = bool(info.get("cwd")) and unregister_pane(info["cwd"], pane)
     closed = False
     if args.close:
         herdr("pane", "close", pane)
         closed = True
+    record("retire", info.get("cwd"), pane=pane, agent=agent, cwd=info.get("cwd"), session=session_id_of(info),
+           closed=closed, ok=True)
     print(json.dumps({"ok": True, "pane_id": pane, "exited": agent, "closed": closed,
                       "unregistered": unregistered}, indent=2, ensure_ascii=False))
     return 0
@@ -995,6 +1020,391 @@ def cmd_status(args: argparse.Namespace) -> int:
     widths = [max(len(str(r[i])) for r in table) for i in range(len(header))]
     for r in table:
         print("  ".join(str(c).ljust(widths[i]) for i, c in enumerate(r)).rstrip())
+    return 0
+
+
+# --------------------------------------------------------------------------
+# project home and event log
+#
+# A project is a repository, known by its normalized remote URL, so all its
+# clones share one home: ~/.fleet/projects/<name>/ (FLEET_HOME moves the root).
+# The helper and the SessionStart and SessionEnd hooks append events to
+# <home>/events/YYYY-MM.jsonl; events outside a repository go to
+# ~/.fleet/events/. Writing an event never fails a command.
+
+PROJECTS_DIR = "projects"
+EVENTS_DIR = "events"
+PROJECT_FILE = "project.json"
+LOG_EVENTS = ("worktree", "spawn", "send", "reset", "retire", "cleanup", "handoff", "session_start", "session_end")
+
+
+def fleet_home() -> Path:
+    return Path(os.environ.get("FLEET_HOME") or "~/.fleet").expanduser()
+
+
+def now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def read_json(path: Path) -> dict:
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_json(path: Path, data: dict) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
+def normalize_remote(url: str) -> str | None:
+    """host/path of a git remote URL in lower case, so that its SSH and HTTPS forms match. None for a local path."""
+    url = (url or "").strip()
+    m = (re.match(r"^[a-z][a-z0-9+.-]*://(?:[^@/]*@)?([^/:]+)(?::\d*)?/(.+)$", url, re.I)
+         or re.match(r"^(?:[^@/]+@)?([^/:]{2,}):(?!/)(.+)$", url))
+    if not m:
+        return None
+    path = re.sub(r"\.git$", "", m.group(2).strip("/")).strip("/")
+    return f"{m.group(1)}/{path}".lower() if path else None
+
+
+def repo_identity(path: str) -> dict | None:
+    """The repository at `path`: its key (the normalized URL of origin, else local:<main checkout>) and main checkout."""
+    lines = (git_out(path, "rev-parse", "--git-common-dir", "--show-toplevel") or "").splitlines()
+    if len(lines) < 2:
+        return None
+    common = os.path.realpath(os.path.join(path, lines[0]))
+    main_root = os.path.dirname(common) if os.path.basename(common) == ".git" else common
+    url = git_out(path, "config", "--get", "remote.origin.url")
+    if url is None:
+        names = (git_out(path, "remote") or "").split()
+        url = git_out(path, "config", "--get", f"remote.{names[0]}.url") if names else None
+    return {"key": normalize_remote(url or "") or f"local:{main_root}", "main_root": main_root, "top": lines[1]}
+
+
+def project_dirs() -> list[Path]:
+    return sorted(p.parent for p in (fleet_home() / PROJECTS_DIR).glob(f"*/{PROJECT_FILE}"))
+
+
+def find_project(key: str) -> Path | None:
+    return next((d for d in project_dirs() if key in (read_json(d / PROJECT_FILE).get("remotes") or [])), None)
+
+
+def project_names(key: str) -> list[str]:
+    """Folder names to try for a new project: the repository's name, then owner-name, then numbered."""
+    parts = [re.sub(r"[^a-z0-9._-]+", "-", p.lower()).strip("-.") for p in re.split(r"[/:]", key)]
+    parts = [p for p in parts if p] or ["project"]
+    names = [parts[-1]] + (["-".join(parts[-2:])] if len(parts) > 1 else [])
+    return names + [f"{parts[-1]}-{i}" for i in range(2, 100)]
+
+
+def ensure_project(key: str) -> Path | None:
+    """The home of the project with this key. The first call creates it."""
+    found = find_project(key)
+    if found:
+        return found
+    root = fleet_home() / PROJECTS_DIR
+    root.mkdir(parents=True, exist_ok=True)
+    for name in project_names(key):
+        d = root / name
+        try:
+            d.mkdir()
+        except FileExistsError:
+            # Another process can have created this project a moment ago: give it time to write project.json.
+            remotes = None
+            for _ in range(20):
+                remotes = read_json(d / PROJECT_FILE).get("remotes")
+                if remotes is not None:
+                    break
+                time.sleep(0.05)
+            if key in (remotes or []):
+                return d
+            continue
+        write_json(d / PROJECT_FILE, {"name": name, "remotes": [key], "created": now_iso()})
+        return d
+    return None
+
+
+def project_for(path: str | None, create: bool = True) -> Path | None:
+    """The home of the project that holds `path`, or None outside a repository."""
+    if not path or not os.path.isdir(path):
+        return None
+    ident = repo_identity(path)
+    if not ident:
+        return None
+    return ensure_project(ident["key"]) if create else find_project(ident["key"])
+
+
+def caller() -> dict:
+    """Who runs this command: the Herdr pane and, inside Claude Code, the session."""
+    env = os.environ
+    who = {"pane": env.get("HERDR_PANE_ID"), "session": env.get("CLAUDE_CODE_SESSION_ID"),
+           "agent": "claude" if env.get("CLAUDECODE") == "1" else None}
+    return {k: v for k, v in who.items() if v}
+
+
+def record(event: str, where: str | None, by: bool = True, **fields) -> str | None:
+    """Append one event to the log of the project that holds `where`. Returns the log file, or None. Never raises."""
+    try:
+        home = project_for(where)
+        entry = {"ts": now_iso(), "event": event}
+        if home:
+            entry["project"] = home.name
+        entry.update((k, v) for k, v in fields.items() if v is not None and v != [])
+        if by and caller():
+            entry["by"] = caller()
+        d = (home or fleet_home()) / EVENTS_DIR
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"{time.strftime('%Y-%m')}.jsonl"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            os.write(fd, (json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n").encode())
+        finally:
+            os.close(fd)
+        return str(path)
+    except Exception:
+        return None
+
+
+def hook_session_event(event: str, data: dict, env: dict | None = None) -> str | None:
+    """Record a Claude session that starts or ends in a Herdr pane, in a checkout that has .fleet/."""
+    env = os.environ if env is None else env
+    pane = env.get("HERDR_PANE_ID")
+    if not pane:
+        return None
+    cwd = data.get("cwd") or os.getcwd()
+    top = git_toplevel(cwd)
+    if not top or not (Path(top) / FLEET_DIR).is_dir():
+        return None
+    role = (load_panes(Path(top) / FLEET_DIR).get(pane) or {}).get("role")
+    model = data.get("model")
+    return record(event, top, by=False, pane=pane, workspace=env.get("HERDR_WORKSPACE_ID"), cwd=cwd,
+                  branch=git_branch(top) or None, agent="claude", role=role, session=data.get("session_id"),
+                  transcript=data.get("transcript_path"), source=data.get("source"), reason=data.get("reason"),
+                  model=model if isinstance(model, str) else None, config_dir=env.get("CLAUDE_CONFIG_DIR"))
+
+
+def event_time(e: dict) -> float:
+    try:
+        return datetime.fromisoformat(e.get("ts") or "").timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def parse_since(text: str) -> float:
+    m = re.fullmatch(r"\s*(\d+)\s*([mhdw])\s*", text or "")
+    if m:
+        return time.time() - int(m.group(1)) * {"m": 60, "h": 3600, "d": 86400, "w": 604800}[m.group(2)]
+    try:
+        return datetime.fromisoformat((text or "").strip()).timestamp()
+    except ValueError:
+        raise FleetError(f"--since takes a duration (30m, 12h, 7d, 2w) or a date such as 2026-11-01, not {text!r}")
+
+
+def read_events(dirs: list[Path]) -> list[dict]:
+    """Every event in these homes, oldest first. A damaged line is skipped."""
+    events = []
+    for d in dirs:
+        for f in sorted((Path(d) / EVENTS_DIR).glob("*.jsonl")):
+            try:
+                text = f.read_text(errors="replace")
+            except OSError:
+                continue
+            for line in text.splitlines():
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(e, dict):
+                    events.append(e)
+    events.sort(key=event_time)
+    return events
+
+
+def lane_matches(e: dict, lane: str) -> bool:
+    """LANE is a branch, a workspace id, a label, or a path at or above the lane's checkout."""
+    if lane in (e.get("branch"), e.get("workspace"), e.get("label")):
+        return True
+    want = os.path.expanduser(lane)
+    return any(isinstance(p, str) and inside(os.path.expanduser(p), want) for p in (e.get("lane"), e.get("cwd")))
+
+
+def pane_matches(e: dict, pane: str) -> bool:
+    exited = [x for x in e.get("exited") or [] if isinstance(x, dict)]
+    return pane in (e.get("pane"), (e.get("by") or {}).get("pane")) or any(x.get("pane") == pane for x in exited)
+
+
+def short_id(session: str | None) -> str:
+    return (session or "")[:8] or "-"
+
+
+def describe_event(e: dict) -> str:
+    kind = e.get("event")
+    if kind == "worktree":
+        text = f"{e.get('branch')} from {e.get('base') or '-'} at {short_path(e.get('lane') or '')}"
+    elif kind == "spawn":
+        setup = "/".join(x for x in (e.get("agent"), e.get("model"), e.get("effort")) if x)
+        text = " ".join(x for x in (e.get("role"), setup, e.get("account"),
+                                    f"session {short_id(e.get('session'))}" if e.get("session") else None) if x)
+        text += f'  "{e["prompt"]}"' if e.get("prompt") else ""
+    elif kind == "send":
+        text = f'"{e.get("text") or ""}"'
+    elif kind == "reset":
+        text = f"{e.get('command')}  session {short_id(e.get('session_before'))} -> {short_id(e.get('session'))}"
+    elif kind == "retire":
+        text = (f"exited {e.get('agent') or 'no agent'} (session {short_id(e.get('session'))})"
+                + (", closed the pane" if e.get("closed") else ""))
+    elif kind == "cleanup":
+        text = (f"{short_path(e.get('lane') or '')} " + ("removed" if e.get("removed") else "kept")
+                + f"; branch: {e.get('branch_result') or '-'}"
+                + (f"; archive {short_path(e['archive'])}" if e.get("archive") else ""))
+    elif kind == "handoff":
+        text = f"handoff file {short_path(e.get('path') or '')}"
+    elif kind in ("session_start", "session_end"):
+        text = " ".join(x for x in (e.get("source") or e.get("reason"), e.get("agent"), e.get("role"),
+                                    f"session {e.get('session') or '-'}") if x)
+    else:
+        text = json.dumps({k: v for k, v in e.items() if k not in ("ts", "event", "project", "by")}, ensure_ascii=False)
+    if e.get("ok") is False:
+        text += f"  FAILED: {e.get('reason') or e.get('error') or e.get('status') or 'see --json'}"
+    return text
+
+
+def clock(e: dict) -> str:
+    t = event_time(e)
+    return datetime.fromtimestamp(t).strftime("%m-%d %H:%M") if t else "?"
+
+
+def session_rows(events: list[dict]) -> list[dict]:
+    """One row per agent session that the events name, in the order the sessions first appear."""
+    rows: dict[str, dict] = {}
+
+    def touch(sid: str | None, e: dict, **known) -> dict | None:
+        if not sid:
+            return None
+        r = rows.setdefault(sid, {"session": sid, "first": e.get("ts"), "ended": None, "transcript": None})
+        r["last"] = e.get("ts")
+        for key in ("project", "agent", "pane", "role", "branch"):
+            value = known.get(key) or e.get(key)
+            if value and not r.get(key):
+                r[key] = value
+        if not r.get("lane") and (e.get("lane") or e.get("cwd")):
+            r["lane"] = e.get("lane") or e.get("cwd")
+        return r
+
+    for e in events:
+        kind = e.get("event")
+        r = touch(e.get("session"), e)
+        if r and e.get("transcript"):
+            r["transcript"] = e["transcript"]
+        if r and kind == "session_end":
+            r["ended"] = e.get("reason") or "ended"
+        if r and kind == "retire":
+            r["ended"] = "retired"
+        if kind == "reset":
+            before = touch(e.get("session_before"), e)
+            if before and e.get("session_before") != e.get("session"):
+                before["ended"] = before["ended"] or "clear"
+        if kind == "cleanup":
+            for x in e.get("exited") or []:
+                if isinstance(x, dict):
+                    done = touch(x.get("session"), e, pane=x.get("pane"), agent=x.get("agent"))
+                    if done:
+                        done["ended"] = done["ended"] or "cleanup"
+    return list(rows.values())
+
+
+def agent_homes() -> dict[str, list[str]]:
+    """Config dirs to search for transcripts: remuda's accounts, the caller's, and the defaults."""
+    homes: dict[str, list[str]] = {a: [] for a in AGENTS}
+    remuda = remuda_path()
+    try:
+        accounts = remuda_accounts(remuda) if remuda else []
+    except FleetError:
+        accounts = []
+    candidates = [(a["provider"], account_home(a["provider"], a)) for a in accounts if a["provider"] in AGENTS]
+    for agent in AGENTS:
+        candidates += [(agent, os.environ.get(HOME_VAR[agent]) or ""), (agent, os.path.expanduser(DEFAULT_HOME[agent]))]
+    seen: set[str] = set()
+    for agent, home in candidates:
+        if home and os.path.isdir(home) and os.path.realpath(home) not in seen:
+            seen.add(os.path.realpath(home))
+            homes[agent].append(home)
+    return homes
+
+
+def find_transcript(agent: str | None, session: str, homes: dict[str, list[str]]) -> str | None:
+    if agent not in AGENTS or not SESSION_ID.fullmatch(session or ""):
+        return None
+    for home in homes.get(agent, []):
+        if agent == "claude":
+            pattern = os.path.join(glob.escape(home), "projects", "*", f"{glob.escape(session)}.jsonl")
+        else:
+            pattern = os.path.join(glob.escape(home), "sessions", "*", "*", "*", f"rollout-*{glob.escape(session)}.jsonl")
+        hits = glob.glob(pattern)
+        if hits:
+            return hits[0]
+    return None
+
+
+def log_dirs(args: argparse.Namespace) -> list[Path]:
+    known = ", ".join(p.name for p in project_dirs()) or "none yet"
+    if args.all:
+        return project_dirs() + [fleet_home()]
+    if args.project:
+        d = fleet_home() / PROJECTS_DIR / args.project
+        if not (d / PROJECT_FILE).is_file():
+            raise FleetError(f"no project {args.project!r}. Projects: {known}")
+        return [d]
+    d = project_for(os.getcwd(), create=False)
+    if not d:
+        raise FleetError(f"this directory is in no fleet project; pass a project name or --all. Projects: {known}")
+    return [d]
+
+
+def cmd_log(args: argparse.Namespace) -> int:
+    events = read_events(log_dirs(args))
+    if args.since:
+        since = parse_since(args.since)
+        events = [e for e in events if event_time(e) >= since]
+    if args.event:
+        kinds = {k.strip() for k in args.event.split(",") if k.strip()}
+        events = [e for e in events if e.get("event") in kinds]
+    if args.lane:
+        events = [e for e in events if lane_matches(e, args.lane)]
+    if args.pane:
+        events = [e for e in events if pane_matches(e, args.pane)]
+    if args.sessions:
+        rows = session_rows(events)
+        rows = rows[-args.limit:] if args.limit > 0 else rows
+        homes = agent_homes() if any(not r.get("transcript") for r in rows) else {}
+        for r in rows:
+            r["transcript"] = r.get("transcript") or find_transcript(r.get("agent"), r["session"], homes)
+        if args.json:
+            print(json.dumps(rows, indent=2, ensure_ascii=False))
+            return 0
+        table = [["STARTED", "PANE", "ROLE", "AGENT", "SESSION", "ENDED", "TRANSCRIPT"]]
+        table += [[clock({"ts": r["first"]}), r.get("pane") or "-", r.get("role") or "-", r.get("agent") or "-",
+                   r["session"], r.get("ended") or "-", short_path(r["transcript"]) if r.get("transcript") else "-"]
+                  for r in rows]
+    else:
+        events = events[-args.limit:] if args.limit > 0 else events
+        if args.json:
+            print(json.dumps(events, indent=2, ensure_ascii=False))
+            return 0
+        table = [["TIME"] + (["PROJECT"] if args.all else []) + ["EVENT", "PANE", "WHAT"]]
+        table += [[clock(e)] + ([e.get("project") or "-"] if args.all else [])
+                  + [e.get("event") or "?", e.get("pane") or "-", describe_event(e)] for e in events]
+    if len(table) == 1:
+        print("no events")
+        return 0
+    widths = [max(len(str(r[i])) for r in table) for i in range(len(table[0]) - 1)]
+    for r in table:
+        print("  ".join([str(c).ljust(widths[i]) for i, c in enumerate(r[:-1])] + [str(r[-1])]).rstrip())
     return 0
 
 
@@ -1463,18 +1873,16 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     return 0
 
 
-def state_dir() -> Path:
-    return Path(os.environ.get("XDG_STATE_HOME") or "~/.local/state").expanduser() / "fleet"
-
-
 def archive_lane_files(path: str, repo: str | None, branch: str | None) -> str | None:
-    """Copy the lane's .fleet/ records (not panes.json): removing the worktree deletes them."""
+    """Copy the lane's .fleet/ records (not panes.json) to its project's lanes/: removing the worktree deletes them."""
     src = Path(path) / FLEET_DIR
     files = [p for p in sorted(src.rglob("*")) if p.is_file() and p.name != PANES_FILE] if src.is_dir() else []
     if not files:
         return None
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", branch or Path(path).name).strip("-.") or "lane"
-    dest = state_dir() / "archive" / (repo or "unknown") / f"{slug}-{time.strftime('%Y%m%d-%H%M%S')}"
+    home = project_for(path)
+    base = home / "lanes" if home else fleet_home() / "archive" / (repo or "unknown")
+    dest = base / f"{slug}-{time.strftime('%Y%m%d-%H%M%S')}"
     for f in files:
         target = dest / f.relative_to(src)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1510,11 +1918,13 @@ def finish_branch(f: dict) -> str:
 def clean_lane(f: dict, timeout: float) -> dict:
     """Exit the lane's agents, archive its .fleet/, remove its worktree, then delete its branch when merged."""
     out: dict = {"target": f["target"], "path": f["path"], "ok": False, "exited": []}
+    sessions: list[dict] = []
     try:
         for p in f["panes"]:
             if not p.get("agent"):
                 continue
-            status = pane_info(p["pane"]).get("agent_status")
+            info = pane_info(p["pane"])
+            status = info.get("agent_status")
             if status in ACTIVE_STATUSES:
                 out["error"] = f"{p['agent']} in {p['pane']} is {status} now; the worktree stays"
                 return out
@@ -1522,6 +1932,7 @@ def clean_lane(f: dict, timeout: float) -> dict:
                 out["error"] = f"{p['agent']} in {p['pane']} did not exit; the worktree stays"
                 return out
             out["exited"].append(p["pane"])
+            sessions.append({"pane": p["pane"], "agent": p["agent"], "session": session_id_of(info)})
         out["archive"] = archive_lane_files(f["path"], f.get("repo"), f.get("branch"))
         if f.get("workspace"):
             herdr("worktree", "remove", "--workspace", f["workspace"], "--json", timeout=120)
@@ -1541,6 +1952,11 @@ def clean_lane(f: dict, timeout: float) -> dict:
         out["ok"] = True
     except FleetError as e:
         out["error"] = str(e)
+    finally:
+        record("cleanup", f.get("main_root"), lane=f["path"], workspace=f.get("workspace"), branch=f.get("branch"),
+               verdict=f.get("verdict"), reasons=f.get("reasons"), exited=sessions, archive=out.get("archive"),
+               removed=bool(out.get("removed")), branch_result=out.get("branch"), ok=out["ok"],
+               error=out.get("error"))
     return out
 
 
@@ -1616,6 +2032,8 @@ def cmd_prep(args: argparse.Namespace) -> int:
     out["pane_role"] = (load_panes(fleet_dir).get(os.environ.get("HERDR_PANE_ID") or "") or {}).get("role")
     if args.handoff:
         out["handoff_path"] = str(handoff_path(fleet_dir))
+        record("handoff", str(fleet_dir.parent), path=out["handoff_path"], role=out["pane_role"],
+               lane=str(fleet_dir.parent) if out["lane"] else None)
     print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0
 
@@ -1850,6 +2268,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "hooks": hook_report(herdr_bin, homes, env) if herdr_bin else [],
         "git": shutil.which("git"),
         "conventions": {"path": str(conv), "exists": conv.is_file()},
+        "home": {"path": str(fleet_home()), "projects": [p.name for p in project_dirs()]},
     }
     if args.json:
         print(json.dumps(report, indent=2, ensure_ascii=False))
@@ -1877,6 +2296,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         state = h["status"] or "unknown"
         show("herdr hooks" if i == 0 else "", f"{who:<16} {state}" + ("" if h["ok"] else f"  fix: {h['fix']}"))
     show("conventions", f"{conv}" + ("" if conv.is_file() else "  (missing: run /fleet:onboard)"))
+    projects = report["home"]["projects"]
+    show("home", short_path(str(fleet_home())) + (f"  projects: {', '.join(projects)}" if projects else
+                                                  "  (no project yet: the first lane event creates one)"))
     return 0
 
 
@@ -2002,11 +2424,21 @@ def session_start_context(data: dict, env: dict | None = None) -> str | None:
 
 
 def cmd_hook(args: argparse.Namespace) -> int:
-    if args.event != "session-start":
-        return 0
+    """SessionStart: record the session, and re-brief after /clear or compaction. SessionEnd: record the end."""
     try:
         raw = sys.stdin.read() if not sys.stdin.isatty() else ""
         data = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    try:
+        hook_session_event("session_start" if args.event == "session-start" else "session_end", data)
+    except Exception:
+        pass
+    if args.event != "session-start":
+        return 0
+    try:
         context = session_start_context(data)
     except Exception:
         return 0
@@ -2133,8 +2565,20 @@ def build_parser() -> argparse.ArgumentParser:
     cl.add_argument("--timeout", type=float, default=30, help="seconds to wait for each agent to exit")
     cl.set_defaults(func=cmd_cleanup)
 
+    lg = sub.add_parser("log", help="the project's event log, or its agent sessions with transcripts (reads only)")
+    lg.add_argument("project", nargs="?", help="a project name (default: the project of this directory)")
+    lg.add_argument("--all", action="store_true", help="every project, and the events outside a project")
+    lg.add_argument("--lane", help="a branch, workspace id or label, or a path at or above the lane's checkout")
+    lg.add_argument("--pane", help="events of this pane, or run from it")
+    lg.add_argument("--event", help="event kinds, comma-separated: " + ",".join(LOG_EVENTS))
+    lg.add_argument("--since", help="30m, 12h, 7d, 2w, or a date such as 2026-11-01")
+    lg.add_argument("--limit", type=int, default=50, help="the newest N rows (default 50; 0 for all)")
+    lg.add_argument("--sessions", action="store_true", help="one row per agent session, with its transcript")
+    lg.add_argument("--json", action="store_true")
+    lg.set_defaults(func=cmd_log)
+
     h = sub.add_parser("hook", help="hook handlers")
-    h.add_argument("event", choices=("session-start",))
+    h.add_argument("event", choices=("session-start", "session-end"))
     h.set_defaults(func=cmd_hook)
     return p
 

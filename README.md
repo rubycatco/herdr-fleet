@@ -108,9 +108,23 @@ Each lane keeps its state in `.fleet/` at the top of its worktree. The helper ad
 | `panes.json` | `fleet spawn --role` | The role of each pane (impl, critic, orchestrator). |
 | `FLEET.md` | orchestrator | Lane table, decisions, next actions (in the orchestrator's checkout). |
 
-`fleet cleanup` copies a lane's `.fleet/` (without `panes.json`) to `~/.local/state/fleet/archive/<repo>/` before it removes the worktree.
+`fleet cleanup` copies a lane's `.fleet/` (without `panes.json`) to the `lanes/` folder of its project home before it removes the worktree.
 
-A SessionStart hook runs after `/clear` and compaction. It re-briefs a pane from these files by its role: the implementer from BRIEF, STATUS and HANDOFF; a critic from its newest review request; the orchestrator from FLEET.md when its `Orchestrator: pane <id>` line names that pane. Other sessions in the same checkout get nothing.
+After `/clear` and compaction, the SessionStart hook re-briefs a pane from these files by its role: the implementer from BRIEF, STATUS and HANDOFF; a critic from its newest review request; the orchestrator from FLEET.md when its `Orchestrator: pane <id>` line names that pane. Other sessions in the same checkout get nothing.
+
+## Project home
+
+Each repository is a project. The project is known by its normalized remote URL, so all clones of a repository share one home: `~/.fleet/projects/<name>/` (`$FLEET_HOME` moves the root).
+
+| Path | Holds |
+|---|---|
+| `project.json` | The project's name and remote keys. |
+| `events/YYYY-MM.jsonl` | The event log, one JSON object per line. |
+| `lanes/<branch>-<time>/` | The `.fleet/` files of each lane that `fleet cleanup` removed. |
+
+The helper records each command that changes something: `worktree`, `spawn` (agent, account, model, effort, role, prompt), `send` (the prompt), `reset`, `retire`, `cleanup` (the result, and the last session of each agent) and `prep --handoff`. Each event also names who ran the command: the Herdr pane and, inside Claude Code, the session. The SessionStart and SessionEnd hooks record each Claude session in a Herdr pane of a checkout that has `.fleet/`: the session id, the transcript path, the role, and why the session ended. Events outside a repository go to `~/.fleet/events/`. The log stays on this machine. It can hold prompts, so only you can read its files.
+
+`fleet log` prints the log of the project that holds the current directory (`--all`: every project). Filter with `--lane` (a branch, workspace, label or path), `--pane`, `--event` and `--since 7d`. `--sessions` prints one row per agent session, with its transcript. `--json` prints the events.
 
 ## Helper CLI
 

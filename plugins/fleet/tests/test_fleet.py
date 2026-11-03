@@ -19,6 +19,14 @@ _spec = importlib.util.spec_from_loader("fleet_cli", _loader)
 fleet = importlib.util.module_from_spec(_spec)
 _loader.exec_module(fleet)
 
+# No test writes to the real ~/.fleet, also not through a subprocess.
+_FLEET_HOME = tempfile.TemporaryDirectory()
+os.environ["FLEET_HOME"] = _FLEET_HOME.name
+
+
+def tearDownModule():
+    _FLEET_HOME.cleanup()
+
 REMUDA_LIST = """\
 ACCOUNT         EMAIL                  ORG                            PLAN  HOME
 claude:default  a@example.com          a@example.com's Organization   max   default
@@ -441,14 +449,15 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(fleet.busy_from_process_info(job), "node")
 
     def test_archive_lane_files(self):
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"XDG_STATE_HOME": tmp + "/state"}):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"FLEET_HOME": tmp + "/home"}):
             lane = Path(tmp) / "lane"
             (lane / ".fleet" / "inbox").mkdir(parents=True)
             (lane / ".fleet" / "STATUS.md").write_text("log")
             (lane / ".fleet" / "inbox" / "1.md").write_text("task")
             (lane / ".fleet" / "panes.json").write_text("{}")
             dest = Path(fleet.archive_lane_files(str(lane), "repo", "fix/a b"))
-            self.assertEqual(dest.parent, Path(tmp) / "state" / "fleet" / "archive" / "repo")
+            # Outside a repository there is no project: the archive goes under the home.
+            self.assertEqual(dest.parent, Path(tmp) / "home" / "archive" / "repo")
             self.assertTrue(dest.name.startswith("fix-a-b-"))
             self.assertEqual(sorted(p.relative_to(dest).as_posix() for p in dest.rglob("*") if p.is_file()),
                              ["STATUS.md", "inbox/1.md"])
@@ -546,12 +555,172 @@ class LaneGitTests(unittest.TestCase):
         f = self.facts(pr={"number": 6, "state": "OPEN", "headRefOid": "d" * 40})
         self.assertEqual((f["verdict"], f["reasons"]), ("waiting", ["PR #6 open"]))
 
+    def test_lane_archive_goes_to_its_project(self):
+        (self.lane_path / ".fleet").mkdir()
+        (self.lane_path / ".fleet" / "BRIEF.md").write_text("brief")
+        home = Path(self.tmp.name) / "home"
+        with mock.patch.dict(os.environ, {"FLEET_HOME": str(home)}):
+            dest = Path(fleet.archive_lane_files(str(self.lane_path), "repo", "lane-a"))
+        self.assertEqual(dest.parent, home / "projects" / "repo" / "lanes")
+        self.assertTrue((dest / "BRIEF.md").is_file())
+
     def test_detached_checkout(self):
         self.git(self.lane_path, "checkout", "-q", "--detach")
         f = self.facts()
         self.assertEqual((f["verdict"], f["delete_branch"]), ("ready", False))
         self.git(self.lane_path, "commit", "-q", "--allow-empty", "-m", "only here")
         self.assertEqual(self.facts()["reasons"], ["detached HEAD with 1 commit on no branch"])
+
+
+class ProjectLogTests(unittest.TestCase):
+    """Project homes, the event log, the session hooks and `fleet log`, in a temporary FLEET_HOME."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.home = self.root / "home"
+        self.patch = mock.patch.dict(os.environ, {"FLEET_HOME": str(self.home)})
+        self.patch.start()
+        self.repo = self.repo_with_remote("app", "git@github.com:Acme/App.git")
+        git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init", cwd=self.repo)
+
+    def tearDown(self):
+        self.patch.stop()
+        self.tmp.cleanup()
+
+    def repo_with_remote(self, name, url):
+        path = self.root / name
+        path.mkdir()
+        git("init", "-q", "-b", "main", cwd=path)
+        if url:
+            git("remote", "add", "origin", url, cwd=path)
+        return path
+
+    def last_event(self, path):
+        return json.loads(Path(path).read_text().splitlines()[-1])
+
+    def log(self, *argv):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = fleet.main(["log", *argv])
+        return code, buf.getvalue()
+
+    def test_normalize_remote(self):
+        same = ["git@github.com:Acme/App.git", "https://github.com/acme/app", "https://github.com/acme/app.git/",
+                "ssh://git@github.com:22/acme/app.git", "https://user:secret@github.com/acme/app.git"]
+        self.assertEqual({fleet.normalize_remote(u) for u in same}, {"github.com/acme/app"})
+        self.assertEqual(fleet.normalize_remote("git@git.example.com:group/sub/app.git"), "git.example.com/group/sub/app")
+        for local in ("/srv/git/app.git", "file:///srv/git/app.git", "", "C:/repos/app"):
+            self.assertIsNone(fleet.normalize_remote(local), local)
+
+    def test_one_project_per_repository(self):
+        home = fleet.project_for(str(self.repo))
+        self.assertEqual(home, self.home / "projects" / "app")
+        self.assertEqual(fleet.read_json(home / "project.json")["remotes"], ["github.com/acme/app"])
+        # Another clone (HTTPS remote) and a linked worktree share the project.
+        clone = self.repo_with_remote("app-copy", "https://github.com/acme/app")
+        self.assertEqual(fleet.project_for(str(clone)), home)
+        git("worktree", "add", "-q", "-b", "lane", str(self.root / "lane"), cwd=self.repo)
+        self.assertEqual(fleet.project_for(str(self.root / "lane")), home)
+        # Another owner's repository with the same name gets owner-name.
+        other = self.repo_with_remote("other", "git@github.com:beta/app.git")
+        self.assertEqual(fleet.project_for(str(other)).name, "beta-app")
+        # Without a remote, the main checkout is the key.
+        self.assertEqual(fleet.project_for(str(self.repo_with_remote("solo", None))).name, "solo")
+        self.assertIsNone(fleet.project_for(str(self.root)))
+        self.assertIsNone(fleet.project_for(str(self.repo_with_remote("new", "git@example.com:x/new.git")), create=False))
+        self.assertEqual([p.name for p in fleet.project_dirs()], ["app", "beta-app", "solo"])
+
+    def test_record(self):
+        env = {"HERDR_PANE_ID": "w1:p1", "CLAUDE_CODE_SESSION_ID": "orch-1", "CLAUDECODE": "1"}
+        with mock.patch.dict(os.environ, env):
+            path = fleet.record("spawn", str(self.repo), pane="w2:p1", role="impl", prompt="Read .fleet/BRIEF.md",
+                                ok=True, model=None, exited=[])
+        e = self.last_event(path)
+        self.assertEqual(Path(path).parent, self.home / "projects" / "app" / "events")
+        self.assertEqual((e["event"], e["project"], e["pane"], e["ok"]), ("spawn", "app", "w2:p1", True))
+        self.assertEqual(e["by"], {"pane": "w1:p1", "session": "orch-1", "agent": "claude"})
+        self.assertNotIn("model", e)
+        self.assertNotIn("exited", e)
+        # Outside a repository, the event goes to the home's own log.
+        self.assertEqual(Path(fleet.record("handoff", str(self.root), path="/h.md")).parent, self.home / "events")
+        # A broken home never fails the command.
+        with mock.patch.dict(os.environ, {"FLEET_HOME": path}):
+            self.assertIsNone(fleet.record("send", str(self.repo), pane="w2:p1"))
+
+    def test_session_hook_records_fleet_sessions_only(self):
+        data = {"session_id": "s-1", "transcript_path": "/t/s-1.jsonl", "cwd": str(self.repo), "source": "startup"}
+        env = {"HERDR_PANE_ID": "w2:p1", "HERDR_WORKSPACE_ID": "w2", "CLAUDE_CONFIG_DIR": "/c"}
+        self.assertIsNone(fleet.hook_session_event("session_start", data, env))  # no .fleet/
+        (self.repo / ".fleet").mkdir()
+        fleet.save_panes(self.repo / ".fleet", {"w2:p1": {"role": "impl"}})
+        self.assertIsNone(fleet.hook_session_event("session_start", data, {}))  # not in Herdr
+        e = self.last_event(fleet.hook_session_event("session_start", data, env))
+        self.assertEqual((e["event"], e["pane"], e["role"], e["session"], e["transcript"], e["source"], e["branch"]),
+                         ("session_start", "w2:p1", "impl", "s-1", "/t/s-1.jsonl", "startup", "main"))
+        self.assertNotIn("by", e)
+        # The hook command: SessionEnd prints nothing; SessionStart after startup prints no context.
+        for event, payload in (("session-end", {"session_id": "s-1", "reason": "prompt_input_exit"}),
+                               ("session-start", {"session_id": "s-2", "source": "startup"})):
+            cp = subprocess.run([sys.executable, str(SCRIPT), "hook", event], cwd=self.repo, capture_output=True,
+                                text=True, timeout=20, input=json.dumps({**payload, "cwd": str(self.repo)}),
+                                env={**os.environ, **env})
+            self.assertEqual((cp.returncode, cp.stdout), (0, ""))
+        events = fleet.read_events([self.home / "projects" / "app"])
+        self.assertEqual([(e["event"], e["session"]) for e in events[-2:]],
+                         [("session_end", "s-1"), ("session_start", "s-2")])
+        self.assertEqual(events[-2]["reason"], "prompt_input_exit")
+
+    def test_log(self):
+        lane = str(self.root / "lane")
+        git("worktree", "add", "-q", "-b", "feat/x", lane, cwd=self.repo)
+        fleet.record("worktree", lane, lane=lane, branch="feat/x", base="origin/main", workspace="w2", pane="w2:p1")
+        fleet.record("spawn", lane, pane="w2:p1", cwd=lane, branch="feat/x", agent="claude", model="opus",
+                     role="impl", session="s-1", prompt="Read .fleet/BRIEF.md and execute it.", ok=True)
+        fleet.record("send", lane, pane="w2:p1", cwd=lane, text="Fix the test.", ok=False, reason="busy")
+        fleet.record("session_start", lane, by=False, pane="w2:p1", cwd=lane, agent="claude", role="impl",
+                     session="s-2", source="clear", transcript="/t/s-2.jsonl")
+        fleet.record("reset", lane, pane="w2:p1", cwd=lane, command="/clear", session_before="s-1", session="s-2", ok=True)
+        fleet.record("cleanup", str(self.repo), lane=lane, branch="feat/x", removed=True, branch_result="deleted feat/x",
+                     exited=[{"pane": "w2:p1", "agent": "claude", "session": "s-2"}], ok=True)
+        old = {"ts": "2026-01-02T03:04:05+00:00", "event": "send", "pane": "w9:p1", "text": "old"}
+        with open(fleet.project_for(str(self.repo)) / "events" / "2026-01.jsonl", "a") as fh:
+            fh.write(json.dumps(old) + "\nnot json\n")
+        code, out = self.log("app", "--json", "--limit", "0")
+        events = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual([e["event"] for e in events],
+                         ["send", "worktree", "spawn", "send", "session_start", "reset", "cleanup"])
+        self.assertEqual(len(json.loads(self.log("app", "--json", "--since", "1d")[1])), 6)
+        self.assertEqual(len(json.loads(self.log("app", "--json", "--limit", "2")[1])), 2)
+        self.assertEqual([e["event"] for e in json.loads(self.log("app", "--json", "--event", "spawn,reset")[1])],
+                         ["spawn", "reset"])
+        self.assertEqual(len(json.loads(self.log("app", "--json", "--lane", "feat/x")[1])), 3)
+        self.assertEqual(len(json.loads(self.log("app", "--json", "--lane", lane)[1])), 6)
+        self.assertEqual(len(json.loads(self.log("app", "--json", "--pane", "w9:p1")[1])), 1)
+        text = self.log("app")[1]
+        self.assertIn('impl claude/opus session s-1  "Read .fleet/BRIEF.md and execute it."', text)
+        self.assertIn('"Fix the test."  FAILED: busy', text)
+        self.assertIn("removed; branch: deleted feat/x", text)
+        rows = json.loads(self.log("app", "--sessions", "--json")[1])
+        self.assertEqual([(r["session"], r["ended"], r.get("transcript")) for r in rows],
+                         [("s-1", "clear", None), ("s-2", "cleanup", "/t/s-2.jsonl")])
+        self.assertIn("/t/s-2.jsonl", self.log("app", "--sessions")[1])
+        # The project of the current directory is the default; elsewhere the command names the projects.
+        cwd = os.getcwd()
+        try:
+            os.chdir(lane)
+            self.assertEqual(len(json.loads(self.log("--json", "--limit", "0")[1])), 7)
+            os.chdir(self.root)
+            err = io.StringIO()
+            with mock.patch.object(sys, "stderr", err):
+                self.assertEqual(self.log()[0], 1)
+            self.assertIn("Projects: app", err.getvalue())
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(self.log("--all", "--event", "worktree")[1].splitlines()[1].split()[2], "app")
+        with self.assertRaises(fleet.FleetError):
+            fleet.parse_since("yesterday")
 
 
 class FilesTests(unittest.TestCase):

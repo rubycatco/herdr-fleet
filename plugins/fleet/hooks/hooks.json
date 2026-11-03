@@ -1,13 +1,23 @@
 {
-  "description": "Re-brief a fleet lane or orchestrator from its .fleet/ files after /clear or compaction.",
+  "description": "Record fleet sessions in the project's event log, and re-brief a fleet lane or orchestrator from its .fleet/ files after /clear or compaction.",
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "clear|compact",
         "hooks": [
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/fleet\" hook session-start",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/fleet\" hook session-end",
             "timeout": 10
           }
         ]
