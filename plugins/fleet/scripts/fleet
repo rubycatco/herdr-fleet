@@ -2523,22 +2523,44 @@ def cmd_orch(args: argparse.Namespace) -> int:
     return 0
 
 
-def digest_base(home: Path) -> tuple[float | None, dict[str, dict]]:
-    """The digest's cursor (a timestamp, or None) and the lanes it saw then, by path."""
+def digest_base(home: Path) -> tuple[float | None, dict[str, dict], dict]:
+    """The digest's cursor (a timestamp, or None), the lanes it saw then by path, and the newest event it saw."""
     data = read_json(home / DIGEST_FILE)
     cursor = event_time({"ts": data.get("cursor")}) or None
     lanes = data.get("lanes") if isinstance(data.get("lanes"), dict) else {}
-    return cursor, {k: v for k, v in lanes.items() if isinstance(k, str) and isinstance(v, dict)}
+    seen = data.get("seen") if isinstance(data.get("seen"), dict) else {}
+    return cursor, {k: v for k, v in lanes.items() if isinstance(k, str) and isinstance(v, dict)}, seen
 
 
-def digest_events(events: list[dict], cursor: float | None, orch_pane: str | None,
-                  lane_paths: list[str]) -> list[dict]:
-    """The events that the orch has not seen: after the cursor, not its own, no `phase` and no session events,
-    except a compaction in a lane pane (that lane can need a reset)."""
+def seen_mark(events: list[dict]) -> dict | None:
+    """The newest event in the log, and how many events share its second: the log keeps whole seconds only."""
+    if not events:
+        return None
+    newest = event_time(events[-1])
+    return {"ts": events[-1].get("ts"), "count": sum(1 for e in events if event_time(e) == newest)}
+
+
+def unseen_events(events: list[dict], cursor: float | None, seen: dict) -> list[dict]:
+    """The events after the previous digest (all of them without one); none twice, none lost in its second."""
+    newest = event_time({"ts": seen.get("ts")}) if seen else 0.0
+    count = seen.get("count") if isinstance(seen.get("count"), int) else 0
+    if newest:
+        out, same = [], 0
+        for e in events:
+            t = event_time(e)
+            if t == newest:
+                same += 1
+            if t > newest or (t == newest and same > count):
+                out.append(e)
+        return out
+    return [e for e in events if cursor is None or event_time(e) >= cursor]
+
+
+def digest_events(events: list[dict], orch_pane: str | None, lane_paths: list[str]) -> list[dict]:
+    """Of the unseen events, those for the orch: not its own, no `phase` and no session events, except a
+    compaction in a lane pane (that lane can need a reset)."""
     out = []
     for e in events:
-        if cursor is not None and event_time(e) < cursor:
-            continue
         kind = e.get("event")
         if kind == "phase":
             continue
@@ -2577,7 +2599,7 @@ def event_line(e: dict) -> str:
 
 def cmd_board(args: argparse.Namespace) -> int:
     home = project_home(args)
-    cursor, base = digest_base(home)
+    cursor, base, _ = digest_base(home)
     records = make_board(home, cursor, {p: b.get("lane") for p, b in base.items() if b.get("lane")})
     path = save_board(home, records)
     if args.json:
@@ -2590,16 +2612,16 @@ def cmd_board(args: argparse.Namespace) -> int:
 
 def cmd_digest(args: argparse.Namespace) -> int:
     home = project_home(args)
-    started = now_iso()  # the new cursor: taken before the log is read, so no event falls between two digests
     me = os.environ.get("HERDR_PANE_ID") or None
     orch_pane = read_json(home / ORCH_FILE).get("pane") or None
     read_only = "--peek" if args.peek else None
     if not read_only and orch_pane and orch_pane != me and pane_alive(orch_pane):
         read_only = f"pane {orch_pane} is the orch of this project"
-    cursor, base = digest_base(home)
+    cursor, base, seen = digest_base(home)
     records = make_board(home, cursor, {p: b.get("lane") for p, b in base.items() if b.get("lane")})
     changes = phase_changes(records, base)
-    shown = digest_events(read_events([home]), cursor, orch_pane, [r["path"] for r in records])
+    events = read_events([home])
+    shown = digest_events(unseen_events(events, cursor, seen), orch_pane, [r["path"] for r in records])
     omitted = max(0, len(shown) - DIGEST_EVENTS_MAX)
     shown = shown[-DIGEST_EVENTS_MAX:]
     if not read_only:
@@ -2607,7 +2629,8 @@ def cmd_digest(args: argparse.Namespace) -> int:
             record("phase", None, home=home, lane=c["path"], name=c["lane"], branch=c.get("branch"), old=c["old"],
                    new=c["new"])
         save_board(home, records)
-        write_json(home / DIGEST_FILE, {"cursor": started, "lanes": {
+        mark = seen_mark(events) or (seen or None)
+        write_json(home / DIGEST_FILE, {"cursor": now_iso(), **({"seen": mark} if mark else {}), "lanes": {
             r["path"]: {"lane": r["lane"], "branch": r.get("branch"), "phase": r["phase"]} for r in records}})
     since = datetime.fromtimestamp(cursor).astimezone().isoformat(timespec="seconds") if cursor else None
     if args.json:
@@ -2665,11 +2688,12 @@ def orch_rebrief(data: dict, env) -> str | None:
         body += ["  " + line for line in board_lines(records)[:16]]
     else:
         body.append("No board yet.")
-    cursor, _ = digest_base(home)
+    cursor, _, seen = digest_base(home)
     if cursor is None:
         tail = ["No digest yet."]
     else:
-        month = datetime.fromtimestamp(cursor).strftime("%Y-%m")
+        since = min(cursor, event_time({"ts": seen.get("ts")}) or cursor)
+        month = datetime.fromtimestamp(since).strftime("%Y-%m")
         events = []
         for f in sorted((home / EVENTS_DIR).glob("*.jsonl")):
             if f.stem >= month:
@@ -2681,7 +2705,9 @@ def orch_rebrief(data: dict, env) -> str | None:
                     if isinstance(e, dict):
                         events.append(clean_event(e))
         paths = [r["path"] for r in records if isinstance(r.get("path"), str)]
-        tail = [f"{plural(len(digest_events(events, cursor, pane, paths)), 'event')} since the last digest."]
+        events.sort(key=event_time)
+        count = len(digest_events(unseen_events(events, cursor, seen), pane, paths))
+        tail = [f"{plural(count, 'event')} since the last digest."]
     tail.append(f"Run `python3 {script} digest` first, then load the fleet:fleet skill.")
     room = REBRIEF_LINES_MAX - len(head) - len(tail)
     if len(body) > room:

@@ -5,11 +5,13 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -1001,6 +1003,484 @@ class FilesTests(unittest.TestCase):
                             capture_output=True, text=True, timeout=20)
         self.assertEqual(cp.returncode, 0)
         self.assertEqual(cp.stdout, "")
+
+
+@contextmanager
+def chdir(path):
+    old = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(old)
+
+
+class OrchTests(unittest.TestCase):
+    """orch, board, digest and the orch re-brief, in a temporary FLEET_HOME. herdr and gh never run."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.home = self.root / "home"
+        self.patch = mock.patch.dict(os.environ, {"FLEET_HOME": str(self.home)})
+        self.patch.start()
+        self.repo = self.root / "app"
+        self.repo.mkdir()
+        git("init", "-q", "-b", "main", cwd=self.repo)
+        git("remote", "add", "origin", "git@github.com:acme/app.git", cwd=self.repo)
+        git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init", cwd=self.repo)
+        self.project = fleet.project_for(str(self.repo))
+        self.alive = set()
+        self.alive_patch = mock.patch.object(fleet, "pane_alive", side_effect=lambda p: p in self.alive)
+        self.alive_patch.start()
+
+    def tearDown(self):
+        self.alive_patch.stop()
+        self.patch.stop()
+        self.tmp.cleanup()
+
+    def env(self, pane=None, **extra):
+        """os.environ for a caller in `pane` (None: outside Herdr), without this machine's Herdr and Claude ids."""
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("HERDR_") and k not in ("CLAUDE_CODE_SESSION_ID", "CLAUDECODE")}
+        if pane:
+            env.update(HERDR_PANE_ID=pane, HERDR_ENV="1", HERDR_WORKSPACE_ID=pane.split(":")[0])
+        env.update(extra)
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    def main(self, *argv, pane=None, **extra):
+        buf = io.StringIO()
+        with self.env(pane, **extra), chdir(self.repo), redirect_stdout(buf):
+            code = fleet.main(list(argv))
+        return code, buf.getvalue()
+
+    def events(self, kind=None):
+        return [e for e in fleet.read_events([self.project]) if kind is None or e["event"] == kind]
+
+    def add_lane(self, name, **files):
+        path = self.root / name
+        git("worktree", "add", "-q", "-b", f"feat/{name}", str(path), cwd=self.repo)
+        d = path / ".fleet"
+        d.mkdir()
+        for fname, text in files.items():
+            (d / fname.replace("_", "-").replace("-md", ".md")).write_text(text)
+        return path
+
+    def facts(self, path, label=None, panes=(), pr=None, branch=None):
+        return {"path": str(path), "label": label, "workspace": "w2", "branch": branch or f"feat/{Path(path).name}",
+                "panes": [dict(p) for p in panes], "pr": pr, "exists": True, "git": True, "linked": True}
+
+    # orch -------------------------------------------------------------
+
+    def test_claim_refuse_replace_and_release(self):
+        code, out = self.main("orch", "claim", pane="w1:p1", CLAUDE_CODE_SESSION_ID="sess-orch-1")
+        res = json.loads(out)
+        self.assertEqual((code, res["ok"], res["previous"], res["project_md_created"]), (0, True, None, True))
+        rec = fleet.read_json(self.project / "orch.json")
+        self.assertEqual((rec["pane"], rec["workspace"], rec["session"], rec["checkout"]),
+                         ("w1:p1", "w1", "sess-orch-1", str(self.repo)))
+        self.assertIn("claimed_at", rec)
+        self.assertNotIn("cursor", rec)
+        self.assertEqual(res["project_md"], str(self.project / "PROJECT.md"))
+        self.assertEqual(res["board"], str(self.project / "board.json"))
+        self.assertIn("# Project: app", (self.project / "PROJECT.md").read_text())
+        (self.project / "PROJECT.md").write_text("# mine\n")
+        # Another pane cannot take a live orch, with or without --replace.
+        self.alive.add("w1:p1")
+        for argv in (("orch", "claim"), ("orch", "claim", "--replace"), ("orch", "claim", "--pane", "w2:p1")):
+            code, out = self.main(*argv, pane="w2:p1")
+            self.assertEqual((code, json.loads(out)["ok"]), (2, False), argv)
+            self.assertEqual(fleet.read_json(self.project / "orch.json")["pane"], "w1:p1")
+        self.assertIn("--replace works only from the registered pane",
+                      json.loads(self.main("orch", "claim", "--replace", pane="w2:p1")[1])["refused"])
+        # The registered pane hands over to a successor; the session is not the caller's.
+        with mock.patch.object(fleet, "pane_info", return_value={"workspace_id": "w3"}):
+            code, out = self.main("orch", "claim", "--pane", "w3:p1", "--replace", pane="w1:p1",
+                                  CLAUDE_CODE_SESSION_ID="sess-orch-1")
+        self.assertEqual((code, json.loads(out)["previous"]), (0, "w1:p1"))
+        rec = fleet.read_json(self.project / "orch.json")
+        self.assertEqual((rec["pane"], rec["workspace"], rec.get("session")), ("w3:p1", "w3", None))
+        self.assertEqual((self.project / "PROJECT.md").read_text(), "# mine\n")  # never overwritten
+        # A dead registered pane never blocks.
+        self.assertEqual(self.main("orch", "claim", pane="w4:p1")[0], 0)
+        claims = self.events("orch_claim")
+        self.assertEqual([(e.get("old"), e["pane"], e.get("replace")) for e in claims],
+                         [(None, "w1:p1", None), ("w1:p1", "w3:p1", True), ("w3:p1", "w4:p1", None)])
+        self.assertEqual(claims[1]["by"]["pane"], "w1:p1")
+        # Release: only the registered pane, or --force.
+        code, out = self.main("orch", "release", pane="w2:p1")
+        self.assertEqual((code, json.loads(out)["ok"]), (2, False))
+        self.assertEqual(self.main("orch", "release", pane="w4:p1")[0], 0)
+        self.assertFalse((self.project / "orch.json").exists())
+        self.main("orch", "claim", pane="w4:p1")
+        self.assertEqual(self.main("orch", "release", "--force")[0], 0)
+        self.assertEqual([(e["pane"], e.get("force")) for e in self.events("orch_release")],
+                         [("w4:p1", None), ("w4:p1", True)])
+        self.assertIn("no orch", json.loads(self.main("orch", "release", pane="w4:p1")[1])["note"])
+        # The new events read well in the log.
+        text = self.main("log")[1]
+        self.assertIn("orch pane w1:p1 -> w3:p1 (replace)", text)
+        self.assertIn("released orch pane w4:p1 (force)", text)
+
+    def test_claim_needs_a_pane_and_a_project(self):
+        with self.assertRaises(fleet.FleetError):
+            with self.env(None), chdir(self.repo):
+                fleet.cmd_orch(fleet.build_parser().parse_args(["orch", "claim"]))
+        with self.env("w1:p1"), chdir(self.root), mock.patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(fleet.main(["orch", "claim"]), 1)
+            self.assertEqual(fleet.main(["orch", "show", "--project", "nope"]), 1)
+
+    def test_show(self):
+        code, out = self.main("orch")
+        self.assertEqual(code, 0)
+        self.assertIn("none registered", out)
+        self.main("orch", "claim", pane="w1:p1")
+        self.alive.add("w1:p1")
+        data = json.loads(self.main("orch", "show", "--json", pane="w1:p1")[1])
+        self.assertEqual((data["project"], data["orch"]["pane"], data["alive"], data["self"], data["board_made"]),
+                         ("app", "w1:p1", True, True, None))
+        text = self.main("orch", "show", "--project", "app")[1]
+        self.assertIn("pane w1:p1, alive", text)
+        self.assertIn("board.json", text)
+
+    def test_claim_warns_about_a_live_fleet_md(self):
+        (self.repo / ".fleet").mkdir()
+        (self.repo / ".fleet" / "FLEET.md").write_text("# Fleet\n\nOrchestrator: pane w9:p9, account plain.\n")
+        lane = self.add_lane("x")
+        (lane / ".fleet" / "FLEET.md").write_text("Orchestrator: pane w8:p8\n")
+        self.alive.update({"w9:p9"})
+        warnings = json.loads(self.main("orch", "claim", pane="w1:p1")[1])["warnings"]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("w9:p9", warnings[0])
+        self.assertIn(str(self.repo / ".fleet" / "FLEET.md"), warnings[0])
+        self.alive.update({"w8:p8"})
+        self.assertEqual(len(json.loads(self.main("orch", "claim", pane="w1:p1")[1])["warnings"]), 2)
+        # The claimer's own pane on the old line is no warning; neither is a dead pane.
+        self.alive.clear()
+        self.assertEqual(json.loads(self.main("orch", "claim", pane="w9:p9")[1])["warnings"], [])
+
+    # board ------------------------------------------------------------
+
+    def phase(self, files=None, panes=(), pr=None):
+        d = self.root / f"lane-{len(list(self.root.glob('lane-*')))}"
+        d.mkdir()
+        for name, text in (files or {}).items():
+            (d / name).write_text(text)
+        return fleet.lane_phase({"panes": [dict(p) for p in panes], "pr": pr}, d)
+
+    def test_phase_rules(self):
+        working = [{"pane": "w2:p1", "agent": "claude", "status": "working", "role": "impl"}]
+        idle_critic = [{"pane": "w2:p2", "agent": "codex", "status": "working", "role": "critic"},
+                       {"pane": "w2:p1", "agent": "claude", "status": "done", "role": "impl"}]
+        blocked_md = "# Status\n\n## Blocked\n- Which API?\n\n## Next step\nAsk.\n"
+        self.assertEqual(fleet.lane_phase({"panes": [], "pr": None}, self.root / "gone", removed=True), "removed")
+        self.assertEqual(self.phase(pr={"number": 3, "state": "MERGED"}, files={"STATUS.md": blocked_md}), "merged")
+        self.assertEqual(self.phase(pr={"number": 3, "state": "OPEN"}, panes=working), "pr open")
+        self.assertEqual(self.phase(pr={"number": 3, "state": "CLOSED"}, panes=working), "working")
+        self.assertEqual(self.phase(files={"STATUS.md": blocked_md}, panes=working), "blocked")
+        self.assertEqual(self.phase(panes=[{"pane": "w2:p1", "agent": "claude", "status": "blocked"}]), "blocked")
+        for empty in ("", "-", "none", "- none", "- None.", "- <question for the orchestrator, if any>"):
+            md = f"## Blocked\n{empty}\n\n## Next step\nGo.\n"
+            self.assertEqual(self.phase(files={"STATUS.md": md}, panes=working), "working", empty)
+        ready1 = "## Log\n- x\n\nREADY FOR REVIEW: round 1\n"
+        ready2 = ready1 + "READY FOR REVIEW: round 2\n"
+        self.assertEqual(self.phase(files={"STATUS.md": ready1}, panes=working), "ready 1")
+        self.assertEqual(self.phase(files={"STATUS.md": ready1, "REVIEW-REQUEST-1.md": "r"}), "review 1")
+        self.assertEqual(self.phase(files={"STATUS.md": ready1, "REVIEW-REQUEST-1.md": "r", "REVIEW-1.md": "#1 bug"}),
+                         "review 1")
+        self.assertEqual(self.phase(files={"STATUS.md": ready1, "REVIEW-REQUEST-1.md": "r",
+                                           "REVIEW-1.md": "x\nVERDICT: APPROVE\n"}), "reviewed 1: APPROVE")
+        # Two critics: the round waits for both, and CHANGES REQUESTED wins.
+        two = {"STATUS.md": ready1, "REVIEW-REQUEST-1.md": "r", "REVIEW-1-codex.md": "**VERDICT: APPROVE**\n",
+               "REVIEW-1-claude.md": "still reading"}
+        self.assertEqual(self.phase(files=two), "review 1")
+        two["REVIEW-1-claude.md"] = "VERDICT: CHANGES REQUESTED\n"
+        self.assertEqual(self.phase(files=two), "reviewed 1: CHANGES REQUESTED")
+        # The implementer reports the next round: ready 2, then review 2 (REVIEW-REQUEST-10 sorts as 10).
+        self.assertEqual(self.phase(files={**two, "STATUS.md": ready2}, panes=idle_critic), "ready 2")
+        self.assertEqual(self.phase(files={**two, "STATUS.md": ready2, "REVIEW-REQUEST-2.md": "r"}), "review 2")
+        self.assertEqual(self.phase(files={"REVIEW-REQUEST-2.md": "r", "REVIEW-REQUEST-10.md": "r",
+                                           "REVIEW-2.md": "VERDICT: APPROVE"}), "review 10")
+        self.assertEqual(self.phase(panes=working), "working")
+        self.assertEqual(self.phase(panes=idle_critic), "idle")  # the implementer's status, not the critic's
+        self.assertEqual(self.phase(panes=[{"pane": "w2:p1", "agent": "claude", "status": "done"}]), "idle")
+        self.assertEqual(self.phase(panes=[{"pane": "w2:p1", "agent": None, "status": None}]), "no agent")
+
+    def test_status_notes(self):
+        md = ("# Status: x\n\n## Plan\n1. a\n\n## Blocked\n- none\n\n## Next steps\n\n- Run the tests.\n- More.\n\n"
+              "READY FOR REVIEW: round 1\n")
+        self.assertIsNone(fleet.first_note(md, "Blocked"))
+        self.assertEqual(fleet.first_note(md, r"Next steps?"), "Run the tests.")
+        # A level-3 heading belongs to the section; the next level-1 or level-2 heading ends it.
+        self.assertEqual(fleet.section_text("## Rules\n- a\n### sub\n- b\n# Top\n- c\n", "Rules"), ["- a", "### sub", "- b"])
+
+    def board(self, lanes, *argv, pane=None):
+        with mock.patch.object(fleet, "collect_lanes", return_value=(lanes, [], [])) as collect, \
+                mock.patch.object(fleet.shutil, "which", return_value="/usr/bin/herdr"):
+            code, out = self.main(*argv, pane=pane)
+        self.assertEqual(collect.call_args.kwargs["select"].__name__, "select")
+        return code, out
+
+    def test_board(self):
+        a = self.add_lane("a", STATUS_md="## Blocked\n- Which API?\n\n## Next step\nAsk.\n")
+        b = self.add_lane("b", STATUS_md="## Next step\nWrite the tests.\n")
+        fleet.save_panes(a / ".fleet", {"w2:p1": {"role": "impl"}, "w2:p2": {"role": "critic"}})
+        fleet.record("spawn", str(a), pane="w2:p1", cwd=str(a), branch="feat/a")
+        fleet.record("phase", None, home=self.project, lane=str(a), branch="feat/a", old="idle", new="blocked")
+        fleet.record("send", str(b), pane="w5:p1", cwd=str(b), branch="feat/b")
+        lanes = [self.facts(a, label="lane-a", panes=[{"pane": "w2:p1", "agent": "claude", "status": "idle"},
+                                                      {"pane": "w2:p2", "agent": "codex", "status": "working"},
+                                                      {"pane": "w2:p3", "agent": None, "status": None}]),
+                 self.facts(b, pr={"number": 12, "state": "OPEN", "url": "https://example.com/pr/12"})]
+        code, out = self.board(lanes, "board", "--json")
+        self.assertEqual(code, 0)
+        recs = {r["lane"]: r for r in json.loads(out)["lanes"]}
+        ra, rb = recs["lane-a"], recs["feat/b"]
+        self.assertEqual((ra["phase"], ra["blocked"], ra["next"], ra["workspace"], ra["branch"]),
+                         ("blocked", "Which API?", "Ask.", "w2", "feat/a"))
+        self.assertEqual([(p["pane"], p["role"], p["agent"], p["status"]) for p in ra["panes"]],
+                         [("w2:p1", "impl", "claude", "idle"), ("w2:p2", "critic", "codex", "working"),
+                          ("w2:p3", None, None, None)])
+        self.assertEqual(ra["last_event"]["event"], "spawn")  # the phase event does not count
+        self.assertEqual((rb["phase"], rb["pr"], rb["last_event"]["event"], rb["blocked"]),
+                         ("pr open", {"number": 12, "state": "OPEN"}, "send", None))
+        saved = fleet.read_json(self.project / "board.json")
+        self.assertEqual((saved["project"], len(saved["lanes"])), ("app", 2))
+        self.assertIn("made", saved)
+        self.assertFalse((self.project / "digest.json").exists())  # board never moves the digest
+        text = self.board(lanes, "board")[1]
+        self.assertIn("project app: 2 lanes", text)
+        self.assertRegex(text, r"lane-a\s+blocked\s+-\s+impl:idle critic:working\s+\S+ \S+ spawn\s+blocked: Which API\?")
+        self.assertRegex(text, r"feat/b\s+pr open\s+#12 open")
+        self.assertLessEqual(max(len(l) for l in text.splitlines()), 160)
+        # A lane that cleanup removed after the digest cursor shows as removed, once it is gone.
+        fleet.write_json(self.project / "digest.json", {"cursor": "2020-01-01T00:00:00+00:00", "lanes": {
+            str(b): {"lane": "lane-b", "branch": "feat/b", "phase": "pr open"}}})
+        fleet.record("cleanup", str(self.repo), lane=str(b), branch="feat/b", workspace="w5", removed=True)
+        fleet.record("cleanup", str(self.repo), lane=str(self.root / "kept"), branch="feat/kept", removed=False)
+        recs = json.loads(self.board(lanes[:1], "board", "--json")[1])["lanes"]
+        self.assertEqual([(r["lane"], r["phase"]) for r in recs], [("lane-a", "blocked"), ("lane-b", "removed")])
+        # Without a cursor, no lane counts as removed.
+        (self.project / "digest.json").unlink()
+        self.assertEqual(len(json.loads(self.board(lanes[:1], "board", "--json")[1])["lanes"]), 1)
+
+    def test_board_keeps_only_this_projects_lanes(self):
+        other = self.root / "other"
+        other.mkdir()
+        git("init", "-q", "-b", "main", cwd=other)
+        git("remote", "add", "origin", "https://example.com/acme/other.git", cwd=other)
+        fleet.project_for(str(other))
+        lane = self.add_lane("x")
+        select = fleet.lane_selector(self.project)
+        calls = []
+        real = fleet.repo_identity
+        with mock.patch.object(fleet, "repo_identity", side_effect=lambda *a, **k: calls.append(a) or real(*a, **k)):
+            self.assertTrue(select({"main_root": str(self.repo), "path": str(lane)}))
+            self.assertTrue(select({"main_root": str(self.repo), "path": str(self.root / "y")}))
+            self.assertFalse(select({"main_root": str(other), "path": str(other / "z")}))
+            self.assertFalse(select({"path": str(self.root / "missing")}))
+        self.assertEqual(len(calls), 2)  # cached per main checkout
+        # collect_lanes applies the filter before it reads any lane's facts.
+        stubs = [{"workspace": "w2", "label": None, "path": str(lane), "panes": []},
+                 {"workspace": "w3", "label": None, "path": str(other), "panes": []}]
+        seen = []
+        with mock.patch.object(fleet, "enumerate_lanes", return_value=(stubs, [])), \
+                mock.patch.object(fleet, "lane_facts", side_effect=lambda s, *a, **k: seen.append(s["path"]) or {
+                    **s, "panes": []}), mock.patch.object(fleet, "finish_lane", side_effect=lambda f: f):
+            lanes, _, _ = fleet.collect_lanes(select=select)
+        self.assertEqual(seen, [str(lane)])
+        self.assertEqual([l["path"] for l in lanes], [str(lane)])
+
+    # digest -----------------------------------------------------------
+
+    def test_digest_cursor_phases_and_peek(self):
+        a = self.add_lane("a", STATUS_md="## Next step\nGo.\n")
+        working = [{"pane": "w2:p1", "agent": "claude", "status": "working"}]
+        lanes = [self.facts(a, label="lane-a", panes=working)]
+        fleet.record("spawn", str(a), pane="w2:p1", cwd=str(a), branch="feat/a", role="impl")
+        # --peek reads only: nothing recorded, saved or moved.
+        code, out = self.board(lanes, "digest", "--peek", pane="w1:p1")
+        self.assertIn("read only (--peek)", out)
+        self.assertIn("lane-a: new -> working", out)
+        self.assertIn("spawn", out)
+        self.assertFalse((self.project / "digest.json").exists())
+        self.assertFalse((self.project / "board.json").exists())
+        self.assertEqual(self.events("phase"), [])
+        # The first digest: every lane is new.
+        data = json.loads(self.board(lanes, "digest", "--json", pane="w1:p1")[1])
+        self.assertEqual((data["read_only"], data["since"]), (False, None))
+        self.assertEqual([(c["lane"], c["old"], c["new"]) for c in data["changes"]], [("lane-a", None, "working")])
+        base = fleet.read_json(self.project / "digest.json")
+        self.assertEqual(base["seen"]["count"], 1)  # the spawn event
+        self.assertEqual(base["lanes"], {str(a): {"lane": "lane-a", "branch": "feat/a", "phase": "working"}})
+        self.assertTrue((self.project / "board.json").exists())
+        phases = self.events("phase")
+        self.assertEqual([(e["lane"], e["name"], e["branch"], e.get("old"), e["new"]) for e in phases],
+                         [(str(a), "lane-a", "feat/a", None, "working")])
+        # Nothing changed: no phase change, no event (the phase events are not shown).
+        out = self.board(lanes, "digest", pane="w1:p1")[1]
+        self.assertIn("No phase changes.", out)
+        self.assertIn("No new events.", out)
+        # `board` between two digests consumes nothing.
+        (a / ".fleet" / "STATUS.md").write_text("READY FOR REVIEW: round 1\n")
+        self.board(lanes, "board", pane="w1:p1")
+        fleet.record("send", str(a), pane="w2:p1", cwd=str(a), branch="feat/a", text="Fix it.")
+        out = self.board(lanes, "digest", pane="w1:p1")[1]
+        self.assertIn("lane-a: working -> ready 1", out)
+        self.assertIn('"Fix it."', out)
+        self.assertNotIn("spawn", out)  # before the cursor
+        self.assertEqual([(e.get("old"), e["new"]) for e in self.events("phase")][-1], ("working", "ready 1"))
+        # A lane that leaves the board without a cleanup event is gone; a removed lane is reported once.
+        out = self.board([], "digest", pane="w1:p1")[1]
+        self.assertIn("lane-a: ready 1 -> gone", out)
+        self.assertEqual(fleet.read_json(self.project / "digest.json")["lanes"], {})
+
+    def test_unseen_events_in_the_cursor_second(self):
+        def ev(ts, text):
+            return {"ts": ts, "event": "send", "text": text}
+        log = [ev("2026-11-03T10:00:00+00:00", "a"), ev("2026-11-03T10:00:05+00:00", "b"),
+               ev("2026-11-03T10:00:05+00:00", "c")]
+        seen = fleet.seen_mark(log[:2])
+        self.assertEqual(seen, {"ts": "2026-11-03T10:00:05+00:00", "count": 1})
+        # c was written in the same second as b, after the digest read the log: it is new, b is not.
+        self.assertEqual([e["text"] for e in fleet.unseen_events(log, None, seen)], ["c"])
+        self.assertEqual(fleet.unseen_events(log, None, fleet.seen_mark(log)), [])
+        self.assertEqual(len(fleet.unseen_events(log, None, {})), 3)
+        cursor = fleet.event_time(log[1])
+        self.assertEqual([e["text"] for e in fleet.unseen_events(log, cursor, {})], ["b", "c"])
+
+    def test_digest_only_reads_for_another_pane_than_a_live_orch(self):
+        a = self.add_lane("a")
+        lanes = [self.facts(a, label="lane-a")]
+        self.main("orch", "claim", pane="w1:p1")
+        self.alive.add("w1:p1")
+        for pane in ("w2:p1", None):  # another pane, and outside Herdr
+            out = self.board(lanes, "digest", pane=pane)[1]
+            self.assertIn("read only (pane w1:p1 is the orch of this project)", out)
+            self.assertFalse((self.project / "digest.json").exists())
+        self.assertTrue(json.loads(self.board(lanes, "digest", "--json", pane="w2:p1")[1])["read_only"])
+        # The orch itself moves the cursor; so does anyone once the orch pane is dead.
+        self.board(lanes, "digest", pane="w1:p1")
+        self.assertTrue((self.project / "digest.json").exists())
+        self.alive.clear()
+        (self.project / "digest.json").unlink()
+        self.board(lanes, "digest", pane="w2:p1")
+        self.assertTrue((self.project / "digest.json").exists())
+
+    def test_digest_event_filter_and_cap(self):
+        a = self.add_lane("a")
+        lanes = [self.facts(a, label="lane-a")]
+        self.main("orch", "claim", pane="w1:p1")
+        with self.env("w1:p1"):
+            fleet.record("send", str(a), pane="w2:p1", cwd=str(a), branch="feat/a", text="by the orch")
+        with self.env("w2:p1"):
+            fleet.record("send", str(a), pane="w3:p1", cwd=str(a), branch="feat/a", text="by a lane")
+        fleet.record("send", str(a), by=False, pane="w1:p1", text="to the orch")
+        for source, cwd in (("startup", a), ("compact", a), ("compact", self.repo)):
+            fleet.record("session_start", str(a), by=False, pane="w2:p1", cwd=str(cwd), source=source, role="impl")
+        fleet.record("session_end", str(a), by=False, pane="w2:p1", cwd=str(a), reason="other")
+        fleet.record("phase", None, home=self.project, lane=str(a), new="idle")
+        shown = json.loads(self.board(lanes, "digest", "--json", "--peek", pane="w1:p1")[1])["events"]
+        self.assertEqual([(e["event"], e.get("text") or e.get("source")) for e in shown],
+                         [("send", "by a lane"), ("session_start", "compact")])
+        self.assertEqual(shown[1]["cwd"], str(a))
+        # At most 30 events, newest last.
+        for i in range(40):
+            fleet.record("send", str(a), by=False, pane="w2:p1", cwd=str(a), branch="feat/a", text=f"n{i}")
+        data = json.loads(self.board(lanes, "digest", "--json", "--peek", pane="w1:p1")[1])
+        self.assertEqual((len(data["events"]), data["omitted"], data["events"][-1]["text"]), (30, 12, "n39"))
+        out = self.board(lanes, "digest", "--peek", pane="w1:p1")[1]
+        self.assertIn("12 earlier not shown", out)
+
+    # re-brief ---------------------------------------------------------
+
+    def orch_setup(self, rules=("- Never push to main.",), follow_ups=("- Add a CHANGELOG entry.",)):
+        self.main("orch", "claim", pane="w1:p1")
+        (self.project / "PROJECT.md").write_text(
+            "# Project: app\n\n## Rules\n" + "\n".join(rules) + "\n\n## Decisions\n- 11-01 Use sqlite.\n\n"
+            "## Follow-ups\n" + "\n".join(follow_ups) + "\n\n## Notes\n- none\n")
+        fleet.save_board(self.project, [{"lane": "lane-a", "path": str(self.root / "a"), "phase": "review 1",
+                                         "panes": [], "pr": None, "last_event": None, "blocked": None,
+                                         "next": "Fix it."}])
+        fleet.write_json(self.project / "digest.json", {"cursor": fleet.now_iso(), "lanes": {}})
+        for text in ("one", "two"):
+            fleet.record("send", str(self.repo), by=False, pane="w2:p1", text=text)
+        fleet.record("send", str(self.repo), by=False, pane="w1:p1", text="the orch's own")
+
+    def test_rebrief_on_every_source(self):
+        self.orch_setup()
+        for source in ("startup", "resume", "clear", "compact"):
+            text = fleet.session_start_context({"source": source, "cwd": str(self.repo)},
+                                               env={"HERDR_PANE_ID": "w1:p1"})
+            self.assertIn("you orchestrate project app (pane w1:p1)", text, source)
+            self.assertIn(str(self.project / "PROJECT.md"), text)
+            self.assertIn("Never push to main.", text)
+            self.assertIn("Add a CHANGELOG entry.", text)
+            self.assertNotIn("Use sqlite", text)  # decisions stay in the file
+            self.assertRegex(text, r"Board from \d+s ago")
+            self.assertRegex(text, r"lane-a\s+review 1")
+            self.assertIn("2 events since the last digest.", text)
+            self.assertIn("digest` first, then load the fleet:fleet skill.", text)
+        self.assertIn("just cleared", fleet.session_start_context({"source": "clear", "cwd": str(self.repo)},
+                                                                  env={"HERDR_PANE_ID": "w1:p1"}))
+        # In a checkout of another project, the orch pane is not briefed as this project's orch.
+        other = self.root / "other"
+        other.mkdir()
+        git("init", "-q", "-b", "main", cwd=other)
+        self.assertIsNone(fleet.session_start_context({"source": "startup", "cwd": str(other)},
+                                                      env={"HERDR_PANE_ID": "w1:p1"}))
+        # Without a digest or a board, the re-brief says so.
+        (self.project / "digest.json").unlink()
+        (self.project / "board.json").unlink()
+        text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)}, env={"HERDR_PANE_ID": "w1:p1"})
+        self.assertIn("No board yet.", text)
+        self.assertIn("No digest yet.", text)
+
+    def test_rebrief_is_capped(self):
+        self.orch_setup(rules=[f"- rule {i}" for i in range(40)], follow_ups=[f"- follow-up {i}" for i in range(40)])
+        fleet.save_board(self.project, [{"lane": f"lane-{i}", "path": str(self.root / str(i)), "phase": "idle",
+                                         "panes": []} for i in range(30)])
+        text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)}, env={"HERDR_PANE_ID": "w1:p1"})
+        self.assertLessEqual(len(text.splitlines()), fleet.REBRIEF_LINES_MAX)
+        self.assertIn("25 more in PROJECT.md", text)
+        self.assertTrue(text.splitlines()[-1].endswith("then load the fleet:fleet skill."))
+
+    def test_other_panes_get_todays_output(self):
+        d = self.repo / ".fleet"
+        d.mkdir()
+        (d / "BRIEF.md").write_text("brief")
+        (d / "STATUS.md").write_text("status")
+        (d / "FLEET.md").write_text("Orchestrator: pane w7:p7\n")
+        fleet.save_panes(d, {"w2:p1": {"role": "impl"}})
+        cases = [(source, pane) for source in ("startup", "resume", "clear", "compact")
+                 for pane in ("w2:p1", "w7:p7", "w9:p9", None)]
+
+        def outputs():
+            return [fleet.session_start_context({"source": s, "cwd": str(self.repo)},
+                                                env={"HERDR_PANE_ID": p} if p else {}) for s, p in cases]
+        before = outputs()
+        self.orch_setup()
+        self.assertEqual(outputs(), before)
+        self.assertIn("Fleet orchestrator: your context was just cleared. Before you act, read", before[9])
+        # The orch pane gets the project re-brief instead of the FLEET.md one.
+        text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)}, env={"HERDR_PANE_ID": "w1:p1"})
+        self.assertIn("you orchestrate project app", text)
+
+    def test_rebrief_hook_is_fast_and_offline(self):
+        self.orch_setup()
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        os.symlink(shutil.which("git"), bin_dir / "git")  # git only: herdr and gh cannot run
+        env = {"PATH": str(bin_dir), "FLEET_HOME": str(self.home), "HERDR_PANE_ID": "w1:p1", "HOME": str(self.root)}
+        payload = json.dumps({"source": "startup", "cwd": str(self.repo), "session_id": "s-9"})
+        start = time.monotonic()
+        cp = subprocess.run([sys.executable, str(SCRIPT), "hook", "session-start"], input=payload, cwd=self.repo,
+                            capture_output=True, text=True, timeout=20, env=env)
+        elapsed = time.monotonic() - start
+        self.assertEqual((cp.returncode, cp.stderr), (0, ""))
+        self.assertLess(elapsed, 1.0)
+        context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("you orchestrate project app (pane w1:p1)", context)
 
 
 if __name__ == "__main__":
