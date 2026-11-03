@@ -1067,7 +1067,8 @@ HOOK_GIT_TIMEOUT = 1  # seconds for each git call in a hook; SessionEnd has 5 s 
 # Types of the event fields that are not text. `fleet log` drops a field of another type, so one damaged
 # line cannot break it. Add each new field that is not text here.
 EVENT_FIELD_TYPES = {"ok": bool, "closed": bool, "removed": bool, "replace": bool, "force": bool, "by": dict,
-                     "exited": list, "reasons": list, "round": int}
+                     "exited": list, "reasons": list, "round": int, "files": int, "high_risk": list, "matches": list}
+DICT_LIST_FIELDS = ("exited", "high_risk", "matches")  # lists of objects with text fields; other lists hold text
 
 
 def fleet_home() -> Path:
@@ -1327,7 +1328,7 @@ def clean_event(e: dict) -> dict:
             value = {k: v for k, v in value.items() if isinstance(v, str)}
         elif want is list:
             value = ([{k: v for k, v in x.items() if isinstance(v, str)} for x in value if isinstance(x, dict)]
-                     if key == "exited" else [x for x in value if isinstance(x, str)])
+                     if key in DICT_LIST_FIELDS else [x for x in value if isinstance(x, str)])
         out[key] = value
     return out
 
@@ -1414,6 +1415,7 @@ def describe_event(e: dict) -> str:
         text = f"released orch pane {e.get('pane') or '-'}" + (" (force)" if e.get("force") else "")
     elif kind == "plan_approved":
         text = f"plan round {e.get('round', '?')} approved by {e.get('approved_by') or '?'}, risk {e.get('risk') or '?'}"
+        text += f"; high-risk paths: {event_matches(e.get('high_risk'))}" if e.get("high_risk") else ""
     elif kind == "phase":
         text = f"{e.get('name') or e.get('branch') or short_path(e.get('lane') or '')}: {e.get('old') or 'new'} -> {e.get('new')}"
     elif kind in ("session_start", "session_end"):
@@ -1424,6 +1426,13 @@ def describe_event(e: dict) -> str:
     if e.get("ok") is False:
         text += f"  FAILED: {e.get('reason') or e.get('error') or e.get('status') or 'see --json'}"
     return text
+
+
+def event_matches(items, limit: int = 3) -> str:
+    """`migration db/migrate/1.sql, +2` from the `{category, path}` list of an event; a damaged item counts as `?`."""
+    items = items if isinstance(items, list) else []
+    words = [f"{i.get('category') or '?'} {i.get('path') or '?'}" if isinstance(i, dict) else "?" for i in items]
+    return ", ".join(words[:limit] + ([f"+{len(words) - limit}"] if len(words) > limit else []))
 
 
 def clock(e: dict) -> str:
@@ -2203,6 +2212,7 @@ READY_LINE = re.compile(marker_line(r"READY FOR REVIEW: round (\d{1,9})"), re.M)
 PLAN_FILE = "PLAN.md"
 PLAN_READY_LINE = re.compile(marker_line(r"PLAN READY: (\d{1,9})"), re.M)
 PLAN_APPROVED_LINE = re.compile(marker_line(r"PLAN APPROVED: (\d{1,9})"), re.M)
+PLAN_APPROVED_BY = re.compile(marker_line(r"PLAN APPROVED: (\d{1,9})") + r"(?:[ \t]+by[ \t]+(\w+))?", re.M)
 RESEARCH_DIR = "research"
 RESEARCH_DONE_LINE = re.compile(marker_line("RESEARCH DONE"), re.M)
 RISK_LINE = re.compile(r"^[^\w\n]*Risk[*_`]*:[*_`]*[ \t]*(.*)$", re.M)
@@ -3512,10 +3522,67 @@ def plan_risk(text: str) -> tuple[str | None, bool]:
     return ", ".join(values), values == ["none"]
 
 
+LIST_MARK = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+
+
+def plan_files(text: str, every_line: bool = False) -> list[str]:
+    """The paths under `## Files` in a PLAN.md, one per list item: the first token after the list mark, `**` and
+    backticks, up to the first `:` or whitespace. An item that is `-`, `none` or a template `<...>` names no
+    path. With `every_line`, the first token of a line that is no list item counts too (the high-risk match
+    reads those, to fail closed); a marker line such as `PLAN READY: 1` never counts."""
+    found: list[str] = []
+    for line in section_lines(text, "Files"):
+        if PLAN_READY_LINE.search(line) or PLAN_APPROVED_LINE.search(line) or READY_LINE.search(line):
+            continue
+        item = LIST_MARK.match(line + " ")
+        if not item and not every_line:
+            continue
+        token = (line + " ")[item.end():] if item else line
+        token = token.replace("**", "").replace("`", "")
+        token = re.split(r"[:\s]", token.strip(), maxsplit=1)[0]
+        while token.startswith("./"):
+            token = token[2:]
+        if not token or token in ("-", "*", "+") or EMPTY_NOTE.match(token):
+            continue
+        if token not in found:
+            found.append(token)
+    return found
+
+
+def plan_approver(text: str, n: int) -> str | None:
+    """Who approved round n of a PLAN.md: `user` when every `PLAN APPROVED: <n>` line says `by user`, else `orch`
+    (also for a line that names no one); None when no line approves round n."""
+    who = [(by or "").lower() for m, by in PLAN_APPROVED_BY.findall(text) if int(m) == n]
+    if not who:
+        return None
+    return "user" if all(w == "user" for w in who) else "orch"
+
+
+def plan_categories(text: str, patterns: list[dict]) -> set[str]:
+    """The high-risk categories that a PLAN.md shows: the values of its `Risk:` lines that are categories (a list
+    split by commas or `and`; `none` adds nothing), and the categories that its `## Files` paths match."""
+    found = set()
+    for raw in RISK_LINE.findall(text):
+        for value in re.split(r",|;|\band\b", re.sub(r"[*_`]", "", raw)):
+            value = value.strip().rstrip(".").strip().lower()
+            if value in RISK_CATEGORIES:
+                found.add(value)
+    found.update(m["category"] for m in match_risk(plan_files(text, every_line=True), patterns))
+    return found
+
+
+def high_risk_text(matches: list[dict], limit: int = 5) -> str:
+    """`migration db/migrate/1.sql, auth-payments app/auth/x.py (+2)`."""
+    text = ", ".join(f"{m['category']} {m['path']}" for m in matches[:limit])
+    return text + (f" (+{len(matches) - limit})" if len(matches) > limit else "")
+
+
 def cmd_approve_plan(args: argparse.Namespace) -> int:
     """Append `PLAN APPROVED: <n> by <who> <date>` to the lane's PLAN.md. It refuses, and writes nothing, unless
     round n is ready and not yet approved, the worktree has no change outside .fleet/, the lane has no commit
-    of its own, and the risk is `none` or the user approves. `--by user` overrides only the risk."""
+    of its own, the project's high-risk patterns can be read, and either the user approves or the plan is low
+    risk: `Risk: none`, at least one path under `## Files`, and no such path that a high-risk pattern matches.
+    `--by user` overrides only the risk and the missing files."""
     start = os.path.abspath(os.path.expanduser(args.dir or os.getcwd()))
     top = git_toplevel(start) if os.path.isdir(start) else None
     if not top:
@@ -3555,18 +3622,32 @@ def cmd_approve_plan(args: argparse.Namespace) -> int:
                                     "nothing. When a commit predates the plan, or no branch, remote or tag holds the "
                                     "lane's base, name the base with --base <ref>",
                       lane_commits=len(commits), commits=commits[:5])
+    patterns, error = risk_patterns(project_for(top, create=False))
+    if error:
+        return refuse(**out, reason=f"the project's high-risk paths cannot be read ({error}); fix {PROJECT_MD} "
+                                    "in the project home")
     risk, low = plan_risk(text)
-    out["risk"] = risk
-    if not low and args.by != "user":
-        why = "has no Risk: line" if risk is None else f"says Risk: {risk}"
-        return refuse(**out, reason=f"{PLAN_FILE} {why}; only Risk: none can be approved by the orch. Ask the "
-                                    "user, then pass --by user")
+    files = plan_files(text)
+    high_risk = match_risk(plan_files(text, every_line=True), patterns)
+    out.update(risk=risk, files=len(files), high_risk=high_risk)
+    if args.by != "user":
+        if high_risk:
+            return refuse(**out, reason=f"{PLAN_FILE} names high-risk paths under ## Files "
+                                        f"({high_risk_text(high_risk)}); only the user can approve. Ask the user, "
+                                        "then pass --by user")
+        if not low:
+            why = "has no Risk: line" if risk is None else f"says Risk: {risk}"
+            return refuse(**out, reason=f"{PLAN_FILE} {why}; only Risk: none can be approved by the orch. Ask the "
+                                        "user, then pass --by user")
+        if not files:
+            return refuse(**out, reason=f"{PLAN_FILE} lists no files under ## Files: list them, or ask the user")
     line = f"PLAN APPROVED: {n} by {args.by} {now_iso()}"
     with plan.open("a") as fh:
         fh.write(("" if not text or text.endswith("\n") else "\n") + line + "\n")
     branch = git_branch(top) or None
     record("plan_approved", top, lane=top, cwd=top, branch=branch, workspace=os.environ.get("HERDR_WORKSPACE_ID"),
-           round=n, approved_by=args.by, risk=risk, base=args.base)
+           round=n, approved_by=args.by, risk=risk, base=args.base, files=len(files),
+           high_risk=[{"category": m["category"], "path": m["path"]} for m in high_risk])
     print(json.dumps({"ok": True, **out, "lane": top, "branch": branch, "line": line}, indent=2, ensure_ascii=False))
     return 0
 
@@ -3878,11 +3959,15 @@ def build_parser() -> argparse.ArgumentParser:
                                     "refuses, changing nothing, when PLAN.md is missing, has no 'PLAN READY: <n>' "
                                     "line (for --round N), already approves round n, the worktree has changes "
                                     "outside .fleet/, the lane has commits of its own (or a detached HEAD without "
-                                    "--base), or the Risk: line is not 'none' and --by is not user. --by user "
-                                    "overrides only the risk.")
+                                    "--base), or the project's high-risk paths in PROJECT.md cannot be read. With "
+                                    "--by orch it also refuses when the Risk: line is not 'none', when ## Files "
+                                    "lists no path, or when a path under ## Files matches a high-risk pattern (the "
+                                    "built-in migration directories, or the project's ## High-risk paths): such a "
+                                    "plan is high risk whatever its Risk: line says. --by user overrides only the "
+                                    "risk and the missing files.")
     ap.add_argument("dir", nargs="?", help="the lane's worktree (default: the git top of the current directory)")
     ap.add_argument("--by", choices=("orch", "user"), required=True,
-                    help="who approves: user only after the user said yes; a risk other than none needs it")
+                    help="who approves: user only after the user said yes; a high-risk plan needs it")
     ap.add_argument("--round", type=int, metavar="N", help="the round to approve (default: the newest)")
     ap.add_argument("--base", metavar="REF",
                     help="the lane's base: its own commits are REF..HEAD (default: the commits of HEAD that no other "

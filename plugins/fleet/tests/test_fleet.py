@@ -1204,7 +1204,7 @@ class ApprovePlanTests(unittest.TestCase):
     """approve-plan, the gate between a planner and the implementer: it refuses on every condition of the design,
     and then writes neither PLAN.md nor the log."""
 
-    PLAN = "# Plan: x\n\nRisk: none\n\n## Approach\nDo it.\n\nPLAN READY: 1\n"
+    PLAN = "# Plan: x\n\nRisk: none\n\n## Approach\nDo it.\n\n## Files\n- `app.py`: the change\n\nPLAN READY: 1\n"
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1406,7 +1406,7 @@ class ApprovePlanTests(unittest.TestCase):
         self.refused("--by", "orch", reason="no PLAN READY line")
         self.plan.write_text("Risk: none\nPLAN READY: 1234567890\n")
         self.refused("--by", "orch", reason="no PLAN READY line")
-        self.plan.write_text("Risk: none\nPLAN READY: 123456789\nPLAN APPROVED: " + "1" * 5000 + "\n")
+        self.plan.write_text("Risk: none\n## Files\n- app.py\nPLAN READY: 123456789\nPLAN APPROVED: " + "1" * 5000 + "\n")
         self.assertEqual(self.approve("--by", "orch")[1]["round"], 123456789)
 
     def test_risk_needs_the_user(self):
@@ -1424,11 +1424,52 @@ class ApprovePlanTests(unittest.TestCase):
         self.assertRegex(self.plan.read_text().splitlines()[-1], r"^PLAN APPROVED: 1 by user \d{4}-\d\d-\d\dT")
         self.assertEqual([(e["round"], e["approved_by"], e["risk"]) for e in self.approvals()], [(1, "user", "deletion")])
 
+    def test_high_risk_files_need_the_user(self):
+        # A built-in pattern makes the plan high risk whatever its Risk: line says.
+        self.plan.write_text("# Plan\nRisk: none\n\n## Files\n- app.py\n- `db/migrate/001.sql`: new table\n\n"
+                             "PLAN READY: 1\n")
+        out = self.refused("--by", "orch", reason="names high-risk paths under ## Files (migration db/migrate/001.sql)")
+        self.assertIn("only the user can approve", out["reason"])
+        self.assertEqual(out["high_risk"], [{"path": "db/migrate/001.sql", "category": "migration",
+                                             "pattern": "**/migrate/**", "source": "builtin"}])
+        code, out = self.approve("--by", "user")
+        self.assertEqual((code, out["files"], [m["path"] for m in out["high_risk"]]), (0, 2, ["db/migrate/001.sql"]))
+        [event] = self.approvals()
+        self.assertEqual((event["files"], event["high_risk"]), (2, [{"category": "migration", "path": "db/migrate/001.sql"}]))
+        self.assertEqual(fleet.describe_event(event), "plan round 1 approved by user, risk none; high-risk paths: "
+                                                      "migration db/migrate/001.sql")
+        logged = [e for e in fleet.read_events([fleet.project_for(str(self.repo))]) if e["event"] == "plan_approved"]
+        self.assertEqual(fleet.clean_event(logged[0])["high_risk"], event["high_risk"])  # `fleet log` keeps it
+
+    def test_project_patterns_override_the_risk_line(self):
+        home = fleet.project_for(str(self.repo))
+        (home / "PROJECT.md").write_text("# Project\n\n## High-risk paths\n- auth-payments: app/auth/\n")
+        self.plan.write_text("Risk: none\n## Files\n- app/auth/session.py: shorter tokens\nPLAN READY: 1\n")
+        out = self.refused("--by", "orch", reason="auth-payments app/auth/session.py")
+        self.assertEqual(out["high_risk"][0]["source"], "PROJECT.md")
+        # A pattern source that cannot be read refuses both approvers.
+        (home / "PROJECT.md").write_text("## High-risk paths\n- payments: app/pay/\n")
+        for by in ("orch", "user"):
+            self.refused("--by", by, reason="the project's high-risk paths cannot be read")
+        (home / "PROJECT.md").write_text("## High-risk paths\n- deletion: [z-a]\n")
+        self.refused("--by", "user", reason="is not valid")
+
+    def test_a_plan_without_files_needs_the_user(self):
+        for files in ("", "## Files\n\n", "## Files\n- <path>: <what changes>\n", "## Files\n- none\n"):
+            self.plan.write_text(f"# Plan\nRisk: none\n\n{files}PLAN READY: 1\n")
+            self.assertEqual(self.refused("--by", "orch", reason="lists no files under ## Files")["files"], 0)
+        # A path that is no list item counts for the high-risk match, not as a listed file.
+        self.plan.write_text("Risk: none\n## Files\nThese change:\ndb/migrate/002.sql\nPLAN READY: 1\n")
+        out = self.refused("--by", "orch", reason="migration db/migrate/002.sql")
+        self.assertEqual(out["files"], 0)
+        code, out = self.approve("--by", "user")
+        self.assertEqual((code, out["files"]), (0, 0))
+
     def test_orch_approves_a_low_risk_plan_once_per_round(self):
         self.plan.write_text(self.PLAN.rstrip("\n"))  # no newline at the end
         code, out = self.approve("--by", "orch")
-        self.assertEqual((code, out["ok"], out["round"], out["by"], out["risk"], out["branch"]),
-                         (0, True, 1, "orch", "none", "feat/lane"))
+        self.assertEqual((code, out["ok"], out["round"], out["by"], out["risk"], out["branch"], out["files"],
+                          out["high_risk"]), (0, True, 1, "orch", "none", "feat/lane", 1, []))
         lines = self.plan.read_text().splitlines()
         self.assertEqual(lines[-2], "PLAN READY: 1")
         self.assertTrue(lines[-1].startswith("PLAN APPROVED: 1 by orch "))
@@ -1436,6 +1477,7 @@ class ApprovePlanTests(unittest.TestCase):
         self.assertEqual((event["round"], event["approved_by"], event["risk"], event["branch"], event["lane"]),
                          (1, "orch", "none", "feat/lane", str(self.lane)))
         self.assertEqual(fleet.describe_event(event), "plan round 1 approved by orch, risk none")
+        self.assertEqual((event["files"], "high_risk" in event), (1, False))
         # Approving the same round again refuses; the next round can be approved, also by --round.
         before = self.plan.read_bytes()
         code, out = self.approve("--by", "user")
@@ -1448,6 +1490,39 @@ class ApprovePlanTests(unittest.TestCase):
         code, out = self.approve(str(self.lane), "--by", "orch", cwd=self.root)
         self.assertEqual((code, out["round"]), (0, 2))
         self.assertEqual([e["round"] for e in self.approvals()], [1, 2])
+
+
+class PlanFilesTests(unittest.TestCase):
+    """What approve-plan reads from a PLAN.md besides its rounds: the paths under ## Files, the approver of a
+    round, and the categories that the plan shows."""
+
+    def test_plan_files(self):
+        text = ("## Files\n\n- `db/migrate/001.sql`: new table\n* **app/auth/login.py** (changed)\n"
+                "- ./README.md\n1. src/a.py: x\n- `src/a.py`\n- -\n- none\n- <path>: <what changes>\n"
+                "plain/line.txt more words\n```\n\n## Tests\n- not/a/file.py\n")
+        self.assertEqual(fleet.plan_files(text), ["db/migrate/001.sql", "app/auth/login.py", "README.md", "src/a.py"])
+        # The high-risk match also reads a line that is no list item, and never a marker line.
+        self.assertEqual(fleet.plan_files(text + "## Files\nPLAN READY: 1\n", every_line=True),
+                         ["db/migrate/001.sql", "app/auth/login.py", "README.md", "src/a.py", "plain/line.txt"])
+        self.assertEqual(fleet.plan_files("# Plan\n\nRisk: none\n"), [])
+        self.assertEqual(fleet.plan_files("## Files\n- none\n"), [])
+
+    def test_plan_approver(self):
+        text = "PLAN READY: 1\nPLAN APPROVED: 1 by orch 2026\nPLAN READY: 2\n- PLAN APPROVED: 2 by user 2026\n"
+        self.assertEqual([fleet.plan_approver(text, n) for n in (1, 2, 3)], ["orch", "user", None])
+        self.assertEqual(fleet.plan_approver("PLAN APPROVED: 1\n", 1), "orch")  # names no one
+        self.assertEqual(fleet.plan_approver("PLAN APPROVED: 1 by user\nPLAN APPROVED: 1 by orch\n", 1), "orch")
+        self.assertIsNone(fleet.plan_approver("Then PLAN APPROVED: 1 by user follows.\n", 1))  # a sentence
+
+    def test_plan_categories(self):
+        patterns = fleet.risk_patterns(None)[0]
+        self.assertEqual(fleet.plan_categories("Risk: none\n## Files\n- app.py\n", patterns), set())
+        self.assertEqual(fleet.plan_categories("**Risk:** `deletion`, hotfix and auth-payments\n", patterns),
+                         {"deletion", "hotfix", "auth-payments"})
+        self.assertEqual(fleet.plan_categories("Risk: none\n## Files\n- db/migrate/1.sql\n", patterns), {"migration"})
+        # The template's list of values, and a sentence, show no category.
+        self.assertEqual(fleet.plan_categories("Risk: none | migration | auth-payments | deletion | hotfix\n"
+                                               "- Risk: deletion of old rows\n", patterns), set())
 
 
 class RiskPatternTests(unittest.TestCase):
