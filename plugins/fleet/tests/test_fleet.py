@@ -1320,11 +1320,12 @@ class ApprovePlanTests(unittest.TestCase):
         self.assertEqual(len(out["commits"]), 1)
         self.assertRegex(out["commits"][0], r"^[0-9a-f]{7,} planner wrote code$")
         self.refused("--by", "user", "--base", "main", reason="1 commit of its own")
-        # A remote branch of the lane's own name does not hide it.
-        remote = self.root / "remote.git"
-        git("init", "-q", "--bare", str(remote), cwd=self.root)
-        git("remote", "add", "origin", str(remote), cwd=self.repo)
-        git("push", "-q", "origin", "main", "feat/lane", cwd=self.lane)
+        # A remote branch of the lane's own name does not hide it, on any remote.
+        for name in ("origin", "upstream"):
+            remote = self.root / f"{name}.git"
+            git("init", "-q", "--bare", str(remote), cwd=self.root)
+            git("remote", "add", name, str(remote), cwd=self.repo)
+            git("push", "-q", name, "main", "feat/lane", cwd=self.lane)
         self.refused("--by", "orch", reason="1 commit of its own")
         # A commit and its revert leave the tree as it was, and still count.
         git("-c", "user.email=t@t", "-c", "user.name=t", "revert", "--no-edit", "HEAD", cwd=self.lane)
@@ -1335,6 +1336,51 @@ class ApprovePlanTests(unittest.TestCase):
         code, out = self.approve("--by", "orch", "--base", "HEAD")
         self.assertEqual((code, out["base"]), (0, "HEAD"))
         self.assertEqual(self.approvals()[0]["base"], "HEAD")
+
+    def assert_one_lane_commit(self, lane, plan):
+        """The lane's one commit counts: in lane_commits, in the board's note, and in a refusal by either approver."""
+        commits, why = fleet.lane_commits(str(lane))
+        self.assertEqual((len(commits), why), (1, None))
+        record = fleet.board_record({"path": str(lane), "panes": [], "pr": None, "branch": None}, [])
+        self.assertEqual((record["phase"], record["warning"]), ("plan ready 1", "1 lane commit: approve-plan refuses"))
+        for by in ("orch", "user"):
+            self.assertEqual(self.refused("--by", by, reason="1 commit of its own", cwd=lane, plan=plan)["lane_commits"], 1)
+
+    def test_a_tag_named_like_the_branch_does_not_hide_its_commits(self):
+        git("tag", "feat/lane", cwd=self.repo)  # at the base: it does not hold the lane's commit
+        self.plan.write_text(self.PLAN)
+        self.commit(self.lane, "app.py", "x = 2\n", "planner wrote code")
+        short = subprocess.run(["git", "symbolic-ref", "--short", "HEAD"], cwd=self.lane, capture_output=True,
+                               text=True).stdout.strip()
+        self.assertEqual(short, "heads/feat/lane")  # what the gate read before
+        self.assert_one_lane_commit(self.lane, self.plan)
+
+    def test_a_branch_name_that_ends_in_unicode_whitespace(self):
+        branch = "feat/lane\u00a0"  # a valid name; strip() would cut the space and exclude self.lane's feat/lane
+        lane = self.root / "lane-nbsp"
+        git("worktree", "add", "-q", "-b", branch, str(lane), cwd=self.repo)
+        plan = Path(fleet.prep_dir(str(lane))["fleet_dir"]) / "PLAN.md"
+        plan.write_text(self.PLAN)
+        self.commit(lane, "app.py", "x = 3\n", "planner wrote code")
+        self.assert_one_lane_commit(lane, plan)
+
+    def test_a_remote_branch_in_a_deeper_folder_holds_the_base(self):
+        # origin/team/feat/y holds a commit that no local branch or tag holds; the lane feat/y starts there.
+        remote = self.root / "origin.git"
+        git("init", "-q", "--bare", str(remote), cwd=self.root)
+        git("remote", "add", "origin", str(remote), cwd=self.repo)
+        git("checkout", "-q", "-b", "tmp", cwd=self.repo)
+        self.commit(self.repo, "team.py", "", "the team's work")
+        git("push", "-q", "origin", "tmp:refs/heads/team/feat/y", cwd=self.repo)
+        git("checkout", "-q", "main", cwd=self.repo)
+        git("branch", "-q", "-D", "tmp", cwd=self.repo)
+        git("fetch", "-q", "origin", cwd=self.repo)
+        lane = self.root / "lane-y"
+        git("worktree", "add", "-q", "-b", "feat/y", str(lane), "origin/team/feat/y", cwd=self.repo)
+        plan = Path(fleet.prep_dir(str(lane))["fleet_dir"]) / "PLAN.md"
+        plan.write_text(self.PLAN)
+        self.assertEqual(fleet.lane_commits(str(lane)), ([], None))
+        self.assertEqual(self.approve("--by", "orch", cwd=lane)[0], 0)
 
     def test_a_lane_on_a_feature_branch_or_ahead_of_origin_has_no_commits(self):
         self.commit(self.repo, "lib.py", "", "main moves on, ahead of any remote")

@@ -3303,14 +3303,14 @@ def cmd_accounts(args: argparse.Namespace) -> int:
 # approve-plan: the gate between a planner and the implementer
 
 
-def git_text(path: str, *args: str, timeout: float = 15) -> str | None:
+def git_text(path: str, *args: str, timeout: float = 15, errors: str = "replace") -> str | None:
     """stdout of a git command run in `path`, decoded with replacement (a path need not be UTF-8); None when git
-    fails or cannot run."""
+    fails or cannot run. errors="surrogateescape" keeps a name that goes back to git as an argument exact."""
     try:
         cp = subprocess.run(["git", "-C", path, *args], capture_output=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return cp.stdout.decode("utf-8", errors="replace") if cp.returncode == 0 else None
+    return cp.stdout.decode("utf-8", errors=errors) if cp.returncode == 0 else None
 
 
 def status_paths(path: str) -> list[str] | None:
@@ -3346,7 +3346,7 @@ def lane_commits(path: str, base: str | None = None) -> tuple[list[str] | None, 
     """(the commits that only this lane holds, newest first, as `<short sha> <subject>`; why they cannot be told).
 
     With `base`: the commits of `<base>..HEAD`. Without it: the commits of HEAD that no other local branch, no
-    remote branch of another name and no tag holds. That needs no stored state: a fresh lane has none, and a
+    remote branch other than `<remote>/<branch>` and no tag holds. That needs no stored state: a fresh lane has none, and a
     lane on a local feature branch neither. It needs a branch: a detached HEAD needs `base`."""
     if base is not None:
         sha = None if base.startswith("-") else git_text(path, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}")
@@ -3354,11 +3354,20 @@ def lane_commits(path: str, base: str | None = None) -> tuple[list[str] | None, 
             return None, f"--base {base} does not name a commit"
         revs = [f"{sha.strip()}..HEAD"]
     else:
-        branch = (git_text(path, "symbolic-ref", "--quiet", "--short", "HEAD") or "").strip()
-        if not branch:
+        # The full ref: `--short` can say `heads/<branch>` (a tag of the same name), and strip() would cut
+        # whitespace that a branch name can end with. Only the prefix and the line end go.
+        ref = git_text(path, "symbolic-ref", "--quiet", "HEAD", errors="surrogateescape")
+        ref = ref[:-1] if ref and ref.endswith("\n") else ref
+        if not ref or not ref.startswith("refs/heads/") or len(ref) == len("refs/heads/"):
             return None, "HEAD is detached, so the lane's own commits cannot be told; pass --base <ref>"
-        # Each --exclude applies to the next --branches or --remotes only.
-        revs = ["HEAD", "--not", f"--exclude={branch}", "--branches", f"--exclude=*/{branch}", "--remotes", "--tags"]
+        branch = ref[len("refs/heads/"):]
+        remotes = git_text(path, "remote", errors="surrogateescape")
+        if remotes is None:
+            return None, "git remote failed, so the lane's own commits cannot be told"
+        # Each --exclude applies to the next --branches or --remotes only. A glob such as */<branch> would also
+        # match <remote>/team/<branch>, so each remote gets its own exact exclusion.
+        revs = ["HEAD", "--not", f"--exclude={branch}", "--branches",
+                *[f"--exclude={r}/{branch}" for r in remotes.split("\n") if r], "--remotes", "--tags"]
     out = git_text(path, "log", "--format=%h %s", *revs, "--")
     if out is None:
         return None, "git log failed, so the lane's own commits cannot be told"
