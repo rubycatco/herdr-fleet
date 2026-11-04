@@ -3434,7 +3434,8 @@ def project_home(args: argparse.Namespace, create: bool = True) -> Path:
     if d:
         return d
     # Why there is none: git answers that this is no repository, or that it is one without a home yet, or it fails.
-    cp = run_git(cwd, "rev-parse", "--show-toplevel")
+    # A short limit, as in git_toplevel: project_for may have waited for git already.
+    cp = run_git(cwd, "rev-parse", "--show-toplevel", timeout=3)
     if cp is not None and cp.returncode > 0:
         raise FleetError("this directory is in no git repository, so it is in no fleet project; run this in a "
                          "checkout of the project, or pass --project NAME")
