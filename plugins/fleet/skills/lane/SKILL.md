@@ -22,7 +22,7 @@ The task comes from the arguments. If there are none, ask the user what the lane
 ## 1. Prepare
 
 1. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" conventions`. Use its implementer, critic, planning and account rules.
-2. With `--from <ID>`: run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" follow-up list --json` and find the ID. Its `text` (and `detail`, when present) is the task. When it has a `lane`, another lane holds it: ask the user whether to open a second lane for it, wait for that lane, or release it first (`follow-up release <ID>`, only after the user's yes). An unknown ID: tell the user and stop.
+2. With `--from <ID>`: run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" follow-up list --json` and find the ID. Its `text` (and `detail`, when present) is the task. When it has a `lane`, another lane holds it, and one lane holds a follow-up. Ask the user, with two choices: release it first (`follow-up release <ID>`, when that lane was dropped), or open the lane without `--from` (a separate task: no take, no link, and cleanup does not close the follow-up). An unknown ID: tell the user and stop.
 3. Learn enough to write the brief: read the issue, plan or code that the task names. Settle the scope with the user when the goal is unclear or another lane could touch the same files.
 4. Names: a short lane label (for example `fix-login-redirect`) and a branch (the project's naming, else the label). Base: the remote default branch after `git fetch`, unless the user names one.
 5. Account: in remuda mode, choose by the conventions. When the rules depend on usage, run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" accounts`. In plain mode there is no account.
@@ -41,7 +41,7 @@ With `--from <ID>`, link the follow-up to the lane right away:
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" follow-up take <ID> --lane <branch>
 ```
 
-Exit code 2 with `held_by` means that another lane took it since step 1: ask the user. From now on the board shows the ID on the lane, and `fleet cleanup` closes the follow-up when it removes the merged lane.
+Go on only when it prints `ok: true`. Any refusal (exit code 2, for example `held_by` when another lane took it since step 1): stop and ask the user. After the take, the board shows the ID on the lane, and `fleet cleanup` closes the follow-up when it removes the lane after its work merged (it records the branch's commit now, so a lane that merges no commit of its own releases the follow-up instead).
 
 ## 3. Write the brief
 
