@@ -2171,7 +2171,8 @@ def finish_branch(f: dict) -> str:
 
 
 def clean_lane(f: dict, timeout: float) -> dict:
-    """Exit the lane's agents, archive its .fleet/, remove its worktree, then delete its branch when merged."""
+    """Exit the lane's agents, archive its .fleet/, count its changes again, remove its worktree when there are
+    none, then delete its branch when merged."""
     out: dict = {"target": f["target"], "path": f["path"], "ok": False, "exited": []}
     sessions: list[dict] = []
     try:
@@ -2192,6 +2193,15 @@ def clean_lane(f: dict, timeout: float) -> dict:
             out["archive"] = archive_lane_files(f["path"], f.get("repo"), f.get("branch"))
         except OSError as e:
             out["error"] = f"could not archive .fleet/ ({e}); the worktree stays"
+            return out
+        # Count again, right before the removal: an agent can write a file while it exits, and neither removal
+        # command sees an untracked file that the user's git settings hide. Never --force.
+        dirty = dirty_count(f["path"])
+        if dirty is None:
+            out["error"] = "git status failed; the worktree stays"
+            return out
+        if dirty:
+            out["error"] = f"{plural(dirty, 'uncommitted change')} appeared after the check; the worktree stays"
             return out
         if f.get("workspace"):
             herdr("worktree", "remove", "--workspace", f["workspace"], "--json", timeout=120)

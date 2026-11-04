@@ -860,6 +860,151 @@ class LaneGitTests(unittest.TestCase):
         self.assertEqual(self.facts()["reasons"], ["detached HEAD with 1 commit on no branch"])
 
 
+
+class CleanupTests(unittest.TestCase):
+    """clean_lane and cmd_cleanup on real git worktrees: a lane in a temporary Herdr worktrees directory. Herdr, gh
+    and the agents' exit are stubs."""
+
+    PANE = {"pane_id": "w1:p1", "agent": "claude", "agent_status": "idle"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.repo, self.wt, self.home = self.root / "repo", self.root / "wt", self.root / "home"
+        self.lane_path = self.wt / "repo" / "lane-a"
+        self.env = {**os.environ, "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.com",
+                    "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.com"}
+        for patch in (mock.patch.dict(os.environ, {"FLEET_HOME": str(self.home)}),
+                      mock.patch.object(fleet, "herdr_worktrees_dir", return_value=self.wt),
+                      mock.patch.object(fleet, "herdr", side_effect=self.fake_herdr),
+                      mock.patch.object(fleet, "require_herdr"),
+                      mock.patch.object(fleet, "pr_for_branch", return_value=(None, None))):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.repo.mkdir()
+        self.git(self.repo, "init", "-q", "-b", "main")
+        self.git(self.repo, "commit", "-q", "--allow-empty", "-m", "init")
+        # The lane is merged: it has no commit of its own. Its .fleet/ is excluded, as `fleet worktree` leaves it.
+        self.git(self.repo, "worktree", "add", "-q", "-b", "lane-a", str(self.lane_path))
+        (Path(fleet.prep_dir(str(self.lane_path))["fleet_dir"]) / "STATUS.md").write_text("log")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @staticmethod
+    def fake_herdr(*args, **kwargs):
+        return {"workspaces": []} if args[:2] == ("workspace", "list") else {"panes": []}
+
+    def git(self, cwd, *args):
+        return subprocess.run(["git", *args], cwd=cwd, env=self.env, check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def facts(self, panes=()):
+        stub = {"workspace": None, "label": None, "path": str(self.lane_path), "panes": list(panes)}
+        stub.update(fleet.repo_paths(stub["path"]))
+        return fleet.finish_lane(fleet.lane_facts(stub, None, str(self.root)))
+
+    def cleanup(self, *args):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = fleet.main(["cleanup", str(self.lane_path), *args])
+        return code, json.loads(buf.getvalue())
+
+    def clean(self, write=None):
+        """clean_lane on the lane with one idle agent, whose exit writes the file `write` into the lane."""
+        f = self.facts([self.PANE])
+        self.assertEqual(f["verdict"], "ready")
+
+        def exit_agent(pane, agent, timeout):
+            if write:
+                (self.lane_path / write).parent.mkdir(parents=True, exist_ok=True)
+                (self.lane_path / write).write_text("written while the agent exits")
+            return True
+        info = {"agent": "claude", "agent_status": "idle", "agent_session": {"value": "s-1"}}
+        with mock.patch.object(fleet, "pane_info", return_value=info), \
+                mock.patch.object(fleet, "exit_agent", side_effect=exit_agent):
+            return fleet.clean_lane(f, 5)
+
+    def cleanup_events(self):
+        return [e for e in fleet.read_events([fleet.project_for(str(self.repo))]) if e["event"] == "cleanup"]
+
+    def assert_lane_stays(self):
+        self.assertTrue(self.lane_path.is_dir())
+        self.assertIn(str(self.lane_path), self.git(self.repo, "worktree", "list"))
+        self.assertEqual(self.git(self.repo, "rev-parse", "--verify", "--quiet", "--symbolic-full-name", "lane-a"),
+                         "refs/heads/lane-a")
+
+    def test_cleanup_refuses_a_lane_with_a_hidden_untracked_file(self):
+        self.git(self.lane_path, "config", "status.showUntrackedFiles", "no")
+        (self.lane_path / "new.txt").write_text("work")
+        self.assertEqual(self.git(self.lane_path, "status", "--porcelain"), "")  # the setting took
+        global_config = self.root / "gitconfig"
+        global_config.write_text("[status]\n\tshowUntrackedFiles = no\n")
+        for where in ("repository", "global"):
+            if where == "global":
+                self.git(self.lane_path, "config", "--unset", "status.showUntrackedFiles")
+            with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(global_config)} if where == "global" else {}):
+                for extra in ([], ["--dry-run"]):
+                    code, out = self.cleanup(*extra)
+                    self.assertEqual(code, 2, (where, extra))
+                    self.assertEqual((out["ok"], out["changed"]), (False, "nothing"))
+                    [refused] = out["refused"]
+                    self.assertEqual((refused["verdict"], refused["reasons"]), ("keep", ["1 uncommitted change"]))
+                    self.assertTrue((self.lane_path / "new.txt").is_file())
+                    self.assert_lane_stays()
+        self.assertEqual(self.cleanup_events(), [])
+        self.assertEqual(list(self.home.rglob("lanes")), [])  # no archive either
+
+    def test_cleanup_keeps_a_lane_that_changes_while_its_agent_exits(self):
+        # Once with the file in plain sight, once hidden by the git settings: then neither removal command
+        # would refuse, and only the count again stands between the file and its deletion.
+        for name, hide in (("late.txt", False), ("hidden.txt", True)):
+            if hide:
+                self.git(self.lane_path, "config", "status.showUntrackedFiles", "no")
+            out = self.clean(write=name)
+            self.assertEqual((out["ok"], out.get("removed"), out["exited"]), (False, None, ["w1:p1"]))
+            self.assertEqual(out["error"], "1 uncommitted change appeared after the check; the worktree stays")
+            self.assertTrue((self.lane_path / name).is_file())
+            self.assert_lane_stays()
+            event = self.cleanup_events()[-1]
+            self.assertEqual((event["removed"], event["ok"], event["error"]), (False, False, out["error"]))
+            self.assertEqual(event["archive"], out["archive"])  # the archive comes first, and the event names it
+            (self.lane_path / name).unlink()
+        # A file that appears in .fleet/ is no change: the removal goes ahead.
+        out = self.clean(write=".fleet/notes.md")
+        self.assertEqual((out["ok"], out["removed"]), (True, True), out)
+        self.assertFalse(self.lane_path.exists())
+
+    def test_cleanup_removes_a_clean_merged_lane(self):
+        out = self.clean()
+        self.assertEqual((out["ok"], out["removed"], out["branch"], out["exited"]),
+                         (True, True, "deleted lane-a", ["w1:p1"]), out)
+        self.assertNotIn("error", out)
+        self.assertFalse(self.lane_path.exists())
+        self.assertFalse((self.wt / "repo").exists())  # Herdr's repository folder held only this lane
+        self.assertEqual((Path(out["archive"]) / "STATUS.md").read_text(), "log")
+        self.assertEqual(self.git(self.repo, "branch", "--list", "--format=%(refname)", "lane-a"), "")
+        event = self.cleanup_events()[-1]
+        self.assertEqual((event["removed"], event["ok"], event["branch_result"]), (True, True, "deleted lane-a"))
+
+    def test_cleanup_end_to_end_removes_a_clean_merged_lane(self):
+        code, out = self.cleanup()
+        self.assertEqual(code, 0, out)
+        [lane] = out["lanes"]
+        self.assertEqual((lane["ok"], lane["removed"], lane["branch"]), (True, True, "deleted lane-a"))
+        self.assertFalse(self.lane_path.exists())
+
+    def test_cleanup_with_a_failing_status_keeps_the_worktree(self):
+        f = self.facts([self.PANE])
+        info = {"agent": "claude", "agent_status": "idle", "agent_session": {"value": "s-1"}}
+        with mock.patch.object(fleet, "pane_info", return_value=info), \
+                mock.patch.object(fleet, "exit_agent", return_value=True), \
+                mock.patch.object(fleet, "status_entries", return_value=None):
+            out = fleet.clean_lane(f, 5)
+        self.assertEqual((out["ok"], out.get("removed")), (False, None))
+        self.assertEqual(out["error"], "git status failed; the worktree stays")
+        self.assert_lane_stays()
+
 class ProjectLogTests(unittest.TestCase):
     """Project homes, the event log, the session hooks and `fleet log`, in a temporary FLEET_HOME."""
 
