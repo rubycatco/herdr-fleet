@@ -4343,6 +4343,31 @@ class PatientFleetTests(FleetTestCase):
         self.assertEqual(clock.now, patient_fleet.FakeClock.START)
         self.assertIs(time.monotonic, patient_fleet._real_monotonic)  # the tests' own clock stays real
 
+    def test_a_wait_without_end_fails_instead_of_hanging(self):
+        clock, limit = patient_fleet.HOOK_CLOCK, patient_fleet.FakeClock.LIMIT
+        self.assertFalse(issubclass(patient_fleet.FakeClockLimit, Exception))  # `except Exception` lets it through
+        fleet.time.sleep(limit)  # up to the limit: a sleep as any other
+        self.assertEqual(clock.now - patient_fleet.FakeClock.START, limit)
+        with self.assertRaises(patient_fleet.FakeClockLimit) as caught:
+            try:
+                fleet.time.sleep(0.05)
+            except Exception:  # noqa: BLE001 - as the helper's own handlers
+                self.fail("an `except Exception` caught FakeClockLimit")
+        self.assertIn("past its limit of 300.0 s: a wait without end", str(caught.exception))
+        clock.reset()  # each test starts below the limit again (FleetTestCase.run)
+        with self.assertRaises(patient_fleet.FakeClockLimit):
+            clock.sleep(limit + 1)  # the child's time.sleep, too
+        clock.reset()
+        # In a child: a script that waits without end, and catches every Exception, ends with the traceback.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        spin = Path(tmp.name) / "spin.py"
+        spin.write_text("import time\nwhile True:\n    try:\n        time.sleep(0.05)\n    except Exception:\n"
+                        "        pass\n")
+        cp = subprocess.run([*HELPER[:2], str(spin)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(cp.returncode, 1, cp.stderr)
+        self.assertIn("\nFakeClockLimit: patient_fleet: the helper slept the fake clock to 300.05 s", cp.stderr)
+
 
 class FollowUpTests(FleetTestCase):
     """fleet follow-up, the cleanup close and the board's IDs, in a temporary FLEET_HOME. herdr and gh never run."""

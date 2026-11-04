@@ -15,7 +15,11 @@ time.monotonic and time.sleep. Its monotonic() stands still, so a hook asks git 
 long the test takes. It moves only in two ways: git_takes() says that each git call took some seconds (a call that
 asked for less expires at its limit, TimeoutExpired), and each time.sleep of the helper moves it by the seconds asked
 and returns at once. So a slow git, a held lock and every wait of the helper end without real waiting. A sleep of
-the subprocess module (its wait loop while git runs) is a real sleep and does not move the clock. In this process
+the subprocess module (its wait loop while git runs) is a real sleep and does not move the clock. A wait without end
+would spin for ever on this clock, since no sleep waits: so a sleep that takes the clock past FakeClock.LIMIT seconds
+from its start raises FakeClockLimit, a BaseException that no `except Exception` of the helper catches, and the test
+fails instead of hanging (in a child, the process ends with a traceback and exit code 1). The largest fake time of a
+normal full run is 30 s (a child's `orch release`; 13 s in this process): the limit is ten times that. In this process
 load() gives the script a time module whose monotonic and sleep are HOOK_CLOCK's (the test's own time module stays
 real); in a child this file puts them in place of time.monotonic and time.sleep before the script starts. The clock
 goes back to its start before each test (reset(); test_fleet.FleetTestCase).
@@ -67,11 +71,18 @@ _timing_out = [0]  # open git_times_out() scopes
 _git_takes: list[float] = []  # open git_takes() scopes: the innermost one counts
 
 
+class FakeClockLimit(BaseException):
+    """A sleep of the helper took the fake clock past FakeClock.LIMIT: a wait without end. Not an Exception, so that
+    the helper's own `except Exception` (record, the hook's catch-all) lets it through."""
+
+
 class FakeClock:
     """The helper's monotonic clock and sleep in the tests: it stands still, git_takes() and the helper's sleeps move
     it, and a sleep of the subprocess module is real."""
 
     START = 1000.0
+    LIMIT = 300.0  # fake seconds from START: a sleep that passes it raises FakeClockLimit
+
 
     def __init__(self):
         self.now = self.START
@@ -88,8 +99,16 @@ class FakeClock:
         _note("PATIENT_SLEEP_LOG", {"seconds": seconds, "file": caller})
         if os.path.realpath(caller) == os.path.realpath(subprocess.__file__):
             return _real_sleep(seconds)  # subprocess waits for git in short steps: real time, not the helper's
+        self.advance(seconds)
+
+    def advance(self, seconds) -> None:
+        """The helper slept `seconds`: move the clock, or raise FakeClockLimit past the limit."""
         with _lock:
             self.now += max(0.0, float(seconds))
+            spent = self.now - self.START
+        if spent > self.LIMIT:
+            raise FakeClockLimit(f"patient_fleet: the helper slept the fake clock to {spent:.2f} s from its start, "
+                                 f"past its limit of {self.LIMIT} s: a wait without end")
 
 
 HOOK_CLOCK = FakeClock()
@@ -104,8 +123,7 @@ class FakeTime:
     def sleep(self, seconds):
         caller = sys._getframe(1).f_code.co_filename
         _note("PATIENT_SLEEP_LOG", {"seconds": seconds, "file": caller})
-        with _lock:
-            HOOK_CLOCK.now += max(0.0, float(seconds))
+        HOOK_CLOCK.advance(seconds)
 
     def __getattr__(self, name):
         return getattr(time, name)
