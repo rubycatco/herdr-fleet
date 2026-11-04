@@ -2574,24 +2574,24 @@ def clean_lane(f: dict, timeout: float) -> dict:
         if dirty:
             out["error"] = f"{plural(dirty, 'uncommitted change')} appeared after the check; the worktree stays"
             return out
-        herdr_error = None
+        # git honors status.showUntrackedFiles when it removes a worktree: with `no`, it deletes untracked files.
+        # `-c status.showUntrackedFiles=all` makes it refuse a worktree with an untracked file at the moment of the
+        # removal, whatever the user's configuration.
+        remove = ["git", "-C", f["main_root"], "-c", "status.showUntrackedFiles=all", "worktree", "remove", f["path"]]
         if f.get("workspace"):
             try:
                 herdr("worktree", "remove", "--workspace", f["workspace"], "--json", timeout=120)
             except FleetError as e:
-                herdr_error = str(e)  # e.g. a workspace opened from a copied clone: git removes it from main_root
-        if not f.get("workspace") or (herdr_error and os.path.isdir(f["path"])):
-            cp = run(["git", "-C", f["main_root"], "worktree", "remove", f["path"]], timeout=120)
-            if cp.returncode != 0:
-                out["error"] = (first_line(cp.stderr or cp.stdout) or "git worktree remove failed") + (
-                    f" (herdr worktree remove failed first: {herdr_error})" if herdr_error else "")
+                # The worktree and the branch stay, as in 0.8.3: no second removal after a wait that new work may
+                # have used. The user can remove it by hand.
+                out["error"] = f"{e}; the worktree stays"
+                out["by_hand"] = (f"{shlex.join(remove)}, then `herdr workspace close {f['workspace']}`")
                 return out
-            if herdr_error:
-                out["note"] = (f"herdr worktree remove failed ({herdr_error}); git removed the worktree from "
-                               f"{f['main_root']}: close the workspace with `herdr workspace close {f['workspace']}`")
-        elif herdr_error:
-            out["error"] = herdr_error
-            return out
+        else:
+            cp = run(remove, timeout=120)
+            if cp.returncode != 0:
+                out["error"] = first_line(cp.stderr or cp.stdout) or "git worktree remove failed"
+                return out
         out["removed"] = True
         parent = os.path.dirname(os.path.realpath(f["path"]))
         if os.path.dirname(parent) == os.path.realpath(herdr_worktrees_dir()):
@@ -2606,7 +2606,7 @@ def clean_lane(f: dict, timeout: float) -> dict:
         out["error"] = str(e)
     finally:
         record("cleanup", f.get("main_root"), lane=f["path"], workspace=f.get("workspace"), branch=f.get("branch"),
-               orch=owner, note=out.get("note"), verdict=f.get("verdict"), reasons=f.get("reasons"), exited=sessions, archive=out.get("archive"),
+               orch=owner, by_hand=out.get("by_hand"), verdict=f.get("verdict"), reasons=f.get("reasons"), exited=sessions, archive=out.get("archive"),
                removed=bool(out.get("removed")), branch_result=out.get("branch"), ok=out["ok"],
                error=out.get("error"), follow_ups_closed=out.get("follow_ups_closed"),
                follow_ups_released=out.get("follow_ups_released"), follow_up_error=out.get("follow_up_error"))
@@ -2740,7 +2740,9 @@ PROJECT_MD = "PROJECT.md"
 ORCHS_DIR = "orchs"
 ORCH_MD = "ORCH.md"
 DEFAULT_ORCH = "default"
-ORCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}")  # also a folder name under orchs/
+# Also a folder name under orchs/, so lowercase only: on a file system that ignores case, two names that differ only
+# in case would share one folder, and so one ORCH.md, digest cursor and board.
+ORCH_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,39}")
 LANE_FILE = "lane.json"  # <lane>/.fleet/lane.json: the orch that owns the lane, by name
 LOCK_FILE = ".lock"
 LOCK_WAIT = 30  # seconds to wait for the project lock
@@ -3953,8 +3955,8 @@ def orch_files(home: Path, name: str | None, is2: bool | None = None) -> dict:
 
 def check_orch_name(name: str) -> str:
     if not isinstance(name, str) or not ORCH_NAME.fullmatch(name):
-        raise FleetError(f"not an orch name: {name!r}; use letters, digits, '.', '_' and '-' (at most 40, the first a "
-                         "letter or a digit)")
+        raise FleetError(f"not an orch name: {name!r}; an orch name is lowercase: use a-z, 0-9, '.', '_' and '-' "
+                         "(at most 40, the first a letter or a digit)")
     return name
 
 
@@ -3977,8 +3979,10 @@ def current_orch(home: Path, name: str | None = None,
     return None, None
 
 
-def orch_title(home: Path, name: str) -> str:
-    return f"orch {name} of project {home.name}"
+def orch_title(home: Path, name: str, is2: bool = True) -> str:
+    """How a refusal names an orch. A legacy orch.json (one orch, `default`) keeps the 0.8.3 text, byte for byte:
+    the name shows only in format 2 (and in the re-brief and `orch show`)."""
+    return f"orch {name} of project {home.name}" if is2 else f"the orch of project {home.name}"
 
 
 def orch_out(home: Path, name: str | None = None, is2: bool | None = None) -> dict:
@@ -4125,7 +4129,7 @@ def cmd_orch(args: argparse.Namespace) -> int:
             current = orchs.get(name, {})
             old = current.get("pane") if isinstance(current.get("pane"), str) else None
             handoff = bool(args.replace and me and me == old)
-            title = orch_title(home, name)
+            title = orch_title(home, name, is2)
             if old and old != pane and not handoff:
                 if args.replace:
                     return refuse(orch=current, refused=f"pane {old} is {title}; --replace works only from that "
@@ -4202,8 +4206,9 @@ def cmd_orch(args: argparse.Namespace) -> int:
                           refused=f"project {home.name} has {len(orchs)} orchs and this pane is none of them: name "
                                   "the orch: --orch NAME")
         if current.get("pane") != me and not args.force:
-            return refuse(orch=current, refused=f"pane {current.get('pane')} is {orch_title(home, name)}, not this "
-                                                "pane; --force releases it")
+            return refuse(orch=current, refused=f"pane {current.get('pane')} is "
+                                                + (f"{orch_title(home, name)}, not this pane" if is2 else
+                                                   "the orch, not this pane") + "; --force releases it")
         write_orchs(home, {n: r for n, r in orchs.items() if n != name})
         record("orch_release", None, home=home, orch=name, pane=current.get("pane"),
                force=True if args.force else None)
@@ -4380,7 +4385,7 @@ def cmd_digest(args: argparse.Namespace) -> int:
         elif not read_only and orch_pane and orch_pane != me:
             state = pane_state(orch_pane)
             if state != "dead":
-                read_only = (f"pane {orch_pane} is " + (f"orch {name}" if view["several"] else "the orch")
+                read_only = (f"pane {orch_pane} is " + (f"orch {name}" if view["is2"] else "the orch")
                              + " of this project" + ("; herdr cannot tell whether it is alive" if state == "unknown"
                                                      else ""))
                 lock.close()

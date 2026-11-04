@@ -1526,7 +1526,7 @@ class LaneOwnerTests(FleetTestCase):
         self.assertIn("prunable", git_out("worktree", "list", "--porcelain", cwd=copy))
         self.assertTrue(own.is_dir())
 
-    def test_sweep_shows_the_owner_and_herdr_refusal_falls_back_to_git(self):
+    def test_sweep_shows_the_owner(self):
         self.claim("w1:p1")
         self.claim("w2:p1", "billing")
         mine, unowned = self.worktree("feat/mine"), self.worktree("feat/free", pane="w9:p9")
@@ -1539,22 +1539,60 @@ class LaneOwnerTests(FleetTestCase):
         self.assertIn("A lane of another orch needs --other-orch.", text)
         lanes = {l["path"]: l for l in self.main("sweep", "--json")[1]["lanes"]}
         self.assertEqual((lanes[str(mine)]["orch"], lanes[str(unowned)]["orch"]), ("default", None))
-        # herdr refuses to remove the worktree (a workspace opened from a copied clone): git removes it from the
-        # lane's own main checkout, and the result says to close the workspace.
+
+    def test_a_failed_herdr_removal_keeps_the_lane(self):
+        """When `herdr worktree remove` fails, the worktree, a file written meanwhile and the branch stay, as in
+        0.8.3 (no second removal by git), and the result names the command to run by hand."""
+        self.claim("w1:p1")
+        git("config", "status.showUntrackedFiles", "no", cwd=self.repo)
+        mine = self.worktree("feat/mine")
         real = self.fake_herdr
 
         def refusing(*args, **kwargs):
             if args[:2] == ("worktree", "remove"):
+                (mine / "draft.txt").write_text("written while herdr worked\n")  # after the last clean check
                 raise fleet.FleetError("herdr: validation failed")
             return real(*args, **kwargs)
         with mock.patch.object(fleet, "herdr", side_effect=refusing):
             code, out = self.cleanup(str(mine))
         [lane] = out["lanes"]
-        self.assertEqual((code, lane["removed"]), (0, True), out)
-        self.assertIn("herdr worktree remove failed (herdr: validation failed); git removed the worktree", lane["note"])
-        self.assertFalse(mine.exists())
-        self.assertIn("herdr workspace close", self.events("cleanup")[-1]["note"])
+        self.assertEqual((code, out["ok"], lane.get("removed")), (2, False, None), out)
+        self.assertEqual(lane["error"], "herdr: validation failed; the worktree stays")
+        self.assertIn(f"-c status.showUntrackedFiles=all worktree remove {mine}", lane["by_hand"])
+        self.assertIn("herdr workspace close w5", lane["by_hand"])
+        self.assertTrue((mine / "draft.txt").is_file())
+        self.assertIn("feat/mine", git_out("branch", "--list", "feat/mine", cwd=self.repo))
+        self.assertEqual(self.events("cleanup")[-1]["by_hand"], lane["by_hand"])
 
+    def test_git_refuses_an_untracked_file_whatever_the_config(self):
+        """A lane without a workspace is removed by git, with `-c status.showUntrackedFiles=all`: an untracked file
+        that appears after the last check makes git refuse, also when the repository hides untracked files."""
+        self.claim("w1:p1")
+        git("config", "status.showUntrackedFiles", "no", cwd=self.repo)
+        mine = self.worktree("feat/mine")
+        self.workspaces = [w for w in self.workspaces if w[1] != str(mine)]  # no Herdr workspace: git removes it
+        real_count, real_clean = fleet.dirty_count, fleet.clean_lane
+
+        def late_file(path):
+            count = real_count(path)  # clean_lane's last check finds nothing; then a file appears
+            (mine / "draft.txt").write_text("late\n")
+            return count
+
+        def clean_lane(*args, **kwargs):
+            with mock.patch.object(fleet, "dirty_count", side_effect=late_file):
+                return real_clean(*args, **kwargs)
+        with mock.patch.object(fleet, "clean_lane", side_effect=clean_lane):
+            code, out = self.cleanup(str(mine))
+        [lane] = out["lanes"]
+        self.assertEqual((code, lane.get("removed")), (2, None), out)
+        self.assertIn("untracked", lane["error"])
+        self.assertTrue((mine / "draft.txt").is_file())
+        self.assertIn("feat/mine", git_out("branch", "--list", "feat/mine", cwd=self.repo))
+        # Without the file, the same lane goes.
+        (mine / "draft.txt").unlink()
+        code, out = self.cleanup(str(mine))
+        self.assertEqual((code, out["lanes"][0]["removed"]), (0, True), out)
+        self.assertFalse(mine.exists())
 
 def git_out(*args, cwd):
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
@@ -3111,6 +3149,15 @@ class DocsTests(FleetTestCase):
                      "/reload-plugins", "`orch_rename`", "`adopt`", "field `orch`", "board --all"):
             self.assertIn(text, readme)
         self.assertNotIn("## One orchestrator per project", readme)
+        # Round 1: no git fallback after a failed Herdr removal; the window of 0.8.x opens at any switch; names.
+        for text in ("-c status.showUntrackedFiles=all", "`by_hand`", "An orch name is lowercase",
+                     "a first claim with a name other than `default`", "`orch list --project NAME`",
+                     "with several orchs it refuses and lists them", "The 0.8.3 helper runs `orch show`, `digest`"):
+            self.assertIn(text, readme)
+        for text in ("git removed the worktree", "only when you open a second orch", "the same on disk"):
+            self.assertNotIn(text, readme)
+        self.assertIn("by_hand", cleanup)
+        self.assertNotIn("neither `git worktree remove` nor", cleanup)
         # The rule for a checkout that several orchestrators share, in the README and the fleet skill's rules.
         rules = skill.split("## Rules", 1)[1]
         for doc in (readme, rules):
@@ -3347,7 +3394,7 @@ class OrchTests(FleetTestCase):
         self.assertFalse((self.project / "orchs" / "default").exists())
 
     def test_orch_names_and_unknown_formats(self):
-        for bad in ("-x", ".x", "a/b", "x" * 41, "", "a b", "é"):
+        for bad in ("-x", ".x", "a/b", "x" * 41, "", "a b", "é", "Default", "billinG"):
             with self.assertRaises(fleet.FleetError, msg=bad):
                 fleet.check_orch_name(bad)
         self.assertEqual(fleet.check_orch_name("x" * 40), "x" * 40)
@@ -3355,6 +3402,18 @@ class OrchTests(FleetTestCase):
             self.assertEqual(self.main("orch", "claim", "--name", "a/b", pane="w1:p1")[0], 1)
         self.assertIn("not an orch name: 'a/b'", err.getvalue())
         self.assertFalse((self.project / "orch.json").exists())
+        # Names are lowercase: on a file system that ignores case, `Default` would share default's folder.
+        self.main("orch", "claim", pane="w1:p1")
+        before = (self.project / "orch.json").read_bytes()
+        for argv in (("claim", "--name", "Default"), ("rename", "default", "Billing")):
+            with mock.patch.object(sys, "stderr", io.StringIO()) as err, \
+                    mock.patch.object(fleet, "project_lane_stubs", return_value=[]), \
+                    mock.patch.object(fleet, "require_herdr"):
+                self.assertEqual(self.main("orch", *argv, pane="w2:p1")[0], 1, argv)
+            self.assertIn(f"not an orch name: {argv[-1]!r}; an orch name is lowercase", err.getvalue())
+        self.assertEqual((self.project / "orch.json").read_bytes(), before)
+        self.assertFalse((self.project / "orchs").exists())
+        (self.project / "orch.json").unlink()
         # A format that this helper does not know: no writer replaces the file.
         fleet.write_json(self.project / "orch.json", {"format": 3, "orchs": {}})
         with mock.patch.object(sys, "stderr", io.StringIO()) as err:
@@ -3365,6 +3424,45 @@ class OrchTests(FleetTestCase):
         fleet.write_json(self.project / "orch.json", {"format": 2, "orchs": {"../x": {"pane": "w1:p1"},
                                                                              "ok": "w2:p1", "good": {"pane": "w3:p1"}}})
         self.assertEqual(fleet.read_orchs(self.project), {"good": {"pane": "w3:p1"}})
+
+    def test_a_legacy_orch_keeps_the_0_8_3_refusals(self):
+        """With orch.json in the legacy shape (one orch, `default`), every refusal is 0.8.3's text, byte for byte
+        (the strings below are copied from 0.8.3, not built from the script). In format 2 they name the orch, also
+        when one orch is left."""
+        self.main("orch", "claim", pane="w1:p1")
+        self.alive.add("w1:p1")
+        refused = lambda *argv, pane: json.loads(self.main(*argv, pane=pane)[1])["refused"]
+        self.assertEqual(refused("orch", "claim", pane="w2:p1"),
+                         "pane w1:p1 is the orch of project app and is alive; from that pane, `fleet orch claim "
+                         "--pane <new pane> --replace` hands it over")
+        self.assertEqual(refused("orch", "claim", "--replace", pane="w2:p1"),
+                         "pane w1:p1 is the orch of project app; --replace works only from that pane")
+        self.assertEqual(refused("orch", "release", pane="w2:p1"),
+                         "pane w1:p1 is the orch, not this pane; --force releases it")
+        self.alive.discard("w1:p1")
+        self.unknown.add("w1:p1")
+        self.assertEqual(refused("orch", "claim", pane="w2:p1"),
+                         "pane w1:p1 is the orch of project app, and herdr cannot tell whether it is alive; check "
+                         "that pane, then `fleet orch claim --force` takes over")
+        with mock.patch.object(fleet, "collect_lanes", return_value=([], [], [])):
+            data = json.loads(self.main("digest", "--json", pane="w2:p1")[1])
+            self.assertEqual(data["why"], "pane w1:p1 is the orch of this project; herdr cannot tell whether it is alive")
+            self.unknown.discard("w1:p1")
+            self.alive.add("w1:p1")
+            data = json.loads(self.main("digest", "--json", pane="w2:p1")[1])
+            self.assertEqual(data["why"], "pane w1:p1 is the orch of this project")
+        self.assertNotIn("format", fleet.read_json(self.project / "orch.json"))
+        # Format 2 names the orch, also with one orch left (here after a rename).
+        with mock.patch.object(fleet, "project_lane_stubs", return_value=[]), mock.patch.object(fleet, "require_herdr"):
+            self.main("orch", "rename", "default", "billing", pane="w1:p1")
+        self.assertEqual(refused("orch", "claim", pane="w2:p1"),
+                         "pane w1:p1 is orch billing of project app and is alive; from that pane, `fleet orch claim "
+                         "--pane <new pane> --replace` hands it over")
+        self.assertEqual(refused("orch", "release", pane="w2:p1"),
+                         "pane w1:p1 is orch billing of project app, not this pane; --force releases it")
+        with mock.patch.object(fleet, "collect_lanes", return_value=([], [], [])):
+            self.assertEqual(json.loads(self.main("digest", "--json", pane="w2:p1")[1])["why"],
+                             "pane w1:p1 is orch billing of this project")
 
     def test_show_list_and_release_with_several_orchs(self):
         self.main("orch", "claim", pane="w1:p1", CLAUDE_CODE_SESSION_ID="aaaaaaaa-1")
@@ -3395,9 +3493,10 @@ class OrchTests(FleetTestCase):
         self.assertEqual([(r["name"], r["pane"], r["state"], r["lanes"]) for r in rows],
                          [("billing", "w2:p1", "unknown", None), ("default", "w1:p1", "alive", 1)])
         self.assertEqual(rows[1]["session"], "aaaaaaaa-1")
+        self.stop_clock(fleet.read_json(fleet.orch_files(self.project, "default")["board"]), 75)
         text = self.main("orch", "list", pane="w1:p1")[1]
         self.assertIn("project app: 2 orchs", text)
-        self.assertRegex(text, r"default\s+w1:p1 \(this pane\)\s+alive\s+aaaaaaaa\s+\S+\s+\S+ \S+\s+1 lane, \d+s old")
+        self.assertRegex(text, r"default\s+w1:p1 \(this pane\)\s+alive\s+aaaaaaaa\s+\S+\s+\S+ \S+\s+1 lane, 1m old")
         self.assertRegex(text, r"billing\s+w2:p1\s+unknown\s+-\s+.*none yet")
         # release: the caller's own; another one only with --force; a caller with none names it.
         code, out = self.main("orch", "release", pane="w9:p9")
@@ -3918,7 +4017,9 @@ class OrchTests(FleetTestCase):
         code, out, seen = self.views(lanes.values(), "board", "--json", pane="w1:p1")
         data = json.loads(out)
         self.assertEqual((code, data["orch"], data["all"], data["saved"]), (0, "default", False, True))
-        self.assertEqual(seen, [a, c])  # filtered before the facts: gh is asked for these only
+        self.assertEqual(sorted(seen), sorted([a, c]))  # filtered before the facts: gh is asked for these only
+        # lane_facts runs in a thread pool: the order of `seen` is the order in which workers start, so it is compared
+        # as a set; the board's own rows keep their order.
         self.assertEqual([(r["lane"], r["orch"]) for r in data["lanes"]], [("feat/a", "default"), ("feat/c", None)])
         self.assertEqual(data["board"], str(orchs / "default" / "board.json"))
         self.assertEqual([r["lane"] for r in fleet.read_json(orchs / "default" / "board.json")["lanes"]],
@@ -3931,12 +4032,12 @@ class OrchTests(FleetTestCase):
         (lanes["c"] / ".fleet" / "STATUS.md").write_text("# Status\n")
         self.assertRegex(self.views(lanes.values(), "board", pane="w1:p1")[1], r"(?m)^feat/c .*unowned: adopt it$")
         _, out, seen = self.views(lanes.values(), "board", "--json", pane="w2:p1")
-        self.assertEqual(([r["lane"] for r in json.loads(out)["lanes"]], seen), (["feat/b", "feat/c"], [b, c]))
+        self.assertEqual(([r["lane"] for r in json.loads(out)["lanes"]], sorted(seen)), (["feat/b", "feat/c"], sorted([b, c])))
         # --all, and a caller that is no orch: every lane with its orch, an ORCH column, nothing saved.
         saved = {n: (orchs / n / "board.json").read_bytes() for n in ("default", "billing")}
         for argv, pane in ((("board", "--all"), "w1:p1"), (("board",), "w9:p9"), (("board",), None)):
             code, text, seen = self.views(lanes.values(), *argv, pane=pane)
-            self.assertEqual((code, seen), (0, [a, b, c]), argv)
+            self.assertEqual((code, sorted(seen)), (0, sorted([a, b, c])), argv)
             self.assertIn("project app (every orch's lanes): 3 lanes", text)
             self.assertRegex(text, r"(?m)^LANE\s+ORCH\s+PHASE")
             self.assertRegex(text, r"(?m)^feat/b\s+billing\s+")
@@ -4457,6 +4558,8 @@ class OrchTests(FleetTestCase):
         also in another project's checkout and outside any repository. A stale or empty session, a payload without
         one, and two candidates with one session fall to the directory rule."""
         self.orch_setup()
+        # The re-brief says "Board from 5s ago" here and in the child (PATIENT_TIME), however long the test takes.
+        self.stop_clock(fleet.read_json(self.project / "board.json"), 5)
         self.main("orch", "claim", pane="w1:p1", CLAUDE_CODE_SESSION_ID="sess-orch")  # a re-claim records it
         self.assertEqual(fleet.read_orchs(self.project)["default"]["session"], "sess-orch")
         plain, other = self.root / "plain", self.root / "other"
