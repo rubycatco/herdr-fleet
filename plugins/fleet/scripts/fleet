@@ -56,7 +56,7 @@ from contextlib import ExitStack, contextmanager
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.8.1"
+VERSION = "0.8.2"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 FLEET_DIR = ".fleet"
 LANE_FILES = ("BRIEF.md", "STATUS.md", "HANDOFF.md", "PLAN.md")
@@ -2354,8 +2354,8 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
 # decisions, follow-ups and rules, in <home>/PROJECT.md. board.json caches the newest board for the
 # SessionStart re-brief and never consumes a change. digest.json holds the digest's baseline: its cursor (a
 # time), the byte offset that it read each monthly log up to, and the phase of each lane; only digest moves
-# it. <home>/.lock serializes claim, release, a digest that consumes, and board.json writes. --peek and the
-# SessionStart hook never take it.
+# it. <home>/.lock serializes claim, release, a digest that consumes, board.json writes and follow-up writes.
+# --peek and the SessionStart hook never take it.
 
 ORCH_FILE = "orch.json"
 BOARD_FILE = "board.json"
@@ -4963,7 +4963,8 @@ def build_parser() -> argparse.ArgumentParser:
                         description="Appends 'PLAN APPROVED: <n> by <who> <date>' and records plan_approved. It "
                                     "refuses, changing nothing, when PLAN.md is missing, has no 'PLAN READY: <n>' "
                                     "line (for --round N), already approves round n, the worktree has changes "
-                                    "outside .fleet/, the lane has commits of its own (or a detached HEAD without "
+                                    "outside .fleet/ or paths outside it marked assume-unchanged or skip-worktree, "
+                                    "the lane has commits of its own (or a detached HEAD without "
                                     "--base), or the project's high-risk paths in PROJECT.md cannot be read. With "
                                     "--by orch it also refuses when the Risk: line is not 'none', when ## Files "
                                     "lists no path, or when a path under ## Files matches a high-risk pattern (the "
@@ -4994,8 +4995,10 @@ def build_parser() -> argparse.ArgumentParser:
     ar = sub.add_parser("approve-risk", help="record the user's yes for the lane's high-risk paths in .fleet/RISK.md",
                         description="Appends 'RISK APPROVED: <category> <path> by user <date>' for each high-risk "
                                     "path that `risk` says needs the user, and records risk_approved. It refuses, "
-                                    "changing nothing, outside a git worktree, when the changes cannot be told, and "
-                                    "when nothing needs the user. Run it only after the user said yes.")
+                                    "changing nothing, outside a git worktree, when the changes cannot be told, "
+                                    "when nothing needs the user, when git cannot resolve HEAD, and when a path that "
+                                    "needs the user has a control character or bytes that are not UTF-8. Run it "
+                                    "only after the user said yes.")
     ar.add_argument("dir", nargs="?", help="the lane's worktree (default: the git top of the current directory)")
     ar.add_argument("--by", choices=("user",), required=True, help="who approves: only the user can")
     ar.add_argument("--base", metavar="REF", help="the lane's base: its own commits are REF..HEAD (see approve-plan)")

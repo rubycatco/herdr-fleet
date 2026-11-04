@@ -1,7 +1,7 @@
 {
   "name": "fleet",
-  "version": "0.8.1",
-  "description": "Run fleets of coding-agent lanes in Herdr panes: open lanes, hand off to a new pane, keep context small, clean up finished lanes, and pick accounts with remuda when it is installed.",
+  "version": "0.8.2",
+  "description": "Run fleets of coding-agent lanes in Herdr panes: open lanes, run critic review rounds, hand off to a new pane, keep context small, clean up finished lanes, and pick accounts with remuda when it is installed.",
   "author": {
     "name": "Tao Luo"
   },
