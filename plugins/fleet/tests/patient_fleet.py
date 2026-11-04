@@ -30,7 +30,14 @@ git_times_out(), which raises subprocess.TimeoutExpired at the boundary; it neve
 In a child, environment variables name files that get one JSON line for each event, and play a slow git:
     PATIENT_GIT_LOG    each git call: its arguments and the limit that the helper asked for (before widening);
     PATIENT_SLEEP_LOG  each time.sleep request: the seconds and the file of the caller;
-    PATIENT_GIT_TAKES  seconds: the child runs as inside git_takes(PATIENT_GIT_TAKES).
+    PATIENT_GIT_TAKES  seconds: the child runs as inside git_takes(PATIENT_GIT_TAKES);
+    PATIENT_RAISE_IN   a function name: the first call of that function of the script raises RuntimeError
+                       (through sys.settrace, which then stops), so a test can make the real entry fail anywhere.
+
+A test's calendar goes to its child too (test_fleet.helper_env), so that both name and lock the same month's log:
+    PATIENT_CALENDAR   seconds since the epoch: time.strftime and time.localtime without a time give this instant;
+    PATIENT_TIME       seconds since the epoch: time.time gives this instant (the parent's stopped wall clock).
+datetime stays real, as in the parent: it only stamps events and never names a file.
 """
 
 import importlib.machinery
@@ -216,5 +223,22 @@ if __name__ == "__main__":
     time.sleep = HOOK_CLOCK.sleep
     if os.environ.get("PATIENT_GIT_TAKES"):
         _git_takes.append(float(os.environ["PATIENT_GIT_TAKES"]))
+    if os.environ.get("PATIENT_CALENDAR"):
+        calendar = time.localtime(float(os.environ["PATIENT_CALENDAR"]))
+        real_strftime, real_localtime = time.strftime, time.localtime
+        time.strftime = lambda fmt, t=None: real_strftime(fmt, calendar if t is None else t)
+        time.localtime = lambda secs=None: calendar if secs is None else real_localtime(secs)
+    if os.environ.get("PATIENT_TIME"):
+        stopped = float(os.environ["PATIENT_TIME"])
+        time.time = lambda: stopped
+    if os.environ.get("PATIENT_RAISE_IN"):
+        target, script_path = os.environ["PATIENT_RAISE_IN"], os.path.realpath(script)
+
+        def _raise_in(frame, event, arg):
+            if event == "call" and frame.f_code.co_name == target and \
+                    os.path.realpath(frame.f_code.co_filename) == script_path:
+                raise RuntimeError(f"patient_fleet: injected in {target}")
+            return None
+        sys.settrace(_raise_in)
     sys.argv = [script, *sys.argv[2:]]
     runpy.run_path(script, run_name="__main__")  # the script's own `sys.exit(main())` ends the process

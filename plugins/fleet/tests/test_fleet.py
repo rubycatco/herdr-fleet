@@ -24,6 +24,7 @@ fleet = patient_fleet.load(SCRIPT)
 # patient_fleet.git_times_out() (an injected TimeoutExpired), never a real wait.
 HELPER = [sys.executable, str(Path(patient_fleet.__file__).resolve()), str(SCRIPT)]
 CHILD_LIMIT = 300  # seconds for a child process: a guard against a hang, never a measure of speed
+NOTE = "could not confirm that this session works in that project"  # the note for an unconfirmed orch pane
 
 # No test writes to the real ~/.fleet, also not through a subprocess.
 _FLEET_HOME = tempfile.TemporaryDirectory()
@@ -144,6 +145,19 @@ class Clock:
 
     def __getattr__(self, name):
         return getattr(self.base, name)
+
+    def child_env(self) -> dict:
+        """The environment that gives a HELPER child this calendar and stopped clock (see patient_fleet.py)."""
+        env = {"PATIENT_CALENDAR": repr(time.mktime(self.calendar))}
+        if self.stopped is not None:
+            env["PATIENT_TIME"] = repr(self.stopped)
+        return env
+
+
+def helper_env(env: dict) -> dict:
+    """`env` for a HELPER child, with the test's calendar when the test has a Clock: parent and child then name and
+    lock the same month's log, also when a month ends during the test."""
+    return {**env, **fleet.time.child_env()} if isinstance(fleet.time, Clock) else env
 
 
 def use_clock(test):
@@ -1323,7 +1337,7 @@ class ProjectLogTests(FleetTestCase):
                                ("session-start", {"session_id": "s-2", "source": "startup"})):
             cp = subprocess.run([*HELPER, "hook", event], cwd=self.repo, capture_output=True,
                                 text=True, timeout=CHILD_LIMIT, input=json.dumps({**payload, "cwd": str(self.repo)}),
-                                env={**os.environ, **env})
+                                env=helper_env({**os.environ, **env}))
             self.assertEqual((cp.returncode, cp.stdout), (0, ""))
         events = fleet.read_events([self.home / "projects" / "app"])
         self.assertEqual([(e["event"], e["session"]) for e in events[-2:]],
@@ -3553,17 +3567,27 @@ class OrchTests(FleetTestCase):
         payload = json.dumps({"source": "clear", "cwd": str(self.repo)})
         cp = subprocess.run([*HELPER, "hook", "session-start"], input=payload, cwd=self.repo,
                             capture_output=True, text=True, timeout=CHILD_LIMIT,
-                            env={**os.environ, "HERDR_PANE_ID": "w1:p1"})
+                            env=helper_env({**os.environ, "HERDR_PANE_ID": "w1:p1"}))
         context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
         self.assertIn("you orchestrate project app", context)
         self.assertNotIn("You implement this lane", context)
-        # Any other failure once the pane is known as the orch: the short fixed re-brief.
+        # Any other failure once the pane is known as the orch: the note.
         with mock.patch.object(fleet, "orch_rebrief", side_effect=RuntimeError("boom")):
             text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)},
                                                env={"HERDR_PANE_ID": "w1:p1", "CLAUDE_PLUGIN_ROOT": "/plugins/fleet"})
-        self.assertIn("you orchestrate project app (pane w1:p1). The re-brief from the project home failed.", text)
-        self.assertIn('`python3 "/plugins/fleet/scripts/fleet" digest`', text)
+        self.assertIn(f"orchestrator of project app, but this hook {NOTE} (its re-brief failed: RuntimeError)", text)
+        self.assertIn('`python3 "/plugins/fleet/scripts/fleet" digest --project app`', text)
         self.assertNotIn("You implement", text)
+        # The same through the real entry: an exception in orch_rebrief, then one before any git call.
+        for target, cause in (("orch_rebrief", "its re-brief failed: RuntimeError"),
+                              ("identity_from", "an error in the hook: RuntimeError")):
+            cp = subprocess.run([*HELPER, "hook", "session-start"], input=payload, cwd=self.repo,
+                                capture_output=True, text=True, timeout=CHILD_LIMIT,
+                                env=helper_env({**os.environ, "HERDR_PANE_ID": "w1:p1", "PATIENT_RAISE_IN": target}))
+            self.assertEqual((cp.returncode, cp.stderr), (0, ""), target)
+            context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
+            self.assertIn(f"{NOTE} ({cause})", context, target)
+            self.assertNotIn("You implement", context, target)
         # A failure before that point behaves as on main.
         with mock.patch.object(fleet, "orch_match", side_effect=RuntimeError("boom")):
             self.assertEqual(fleet.session_start_context({"source": "clear", "cwd": str(self.repo)},
@@ -3667,7 +3691,7 @@ class OrchTests(FleetTestCase):
         text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)}, env={"HERDR_PANE_ID": "w1:p1"})
         self.assertIn("you orchestrate project app", text)
 
-    def hook_child(self, event, payload, path_dirs=(), **env):
+    def hook_child(self, event, payload, path_dirs=(), cwd=True, **env):
         """The real hook entry in a child (HELPER: the script as __main__, with the stopped hook clock). PATH holds
         only `path_dirs`, so herdr and gh cannot run. Returns (completed process, git limits asked, waits asked)."""
         limits, sleeps = self.root / "git-limits.jsonl", self.root / "sleeps.jsonl"
@@ -3676,8 +3700,9 @@ class OrchTests(FleetTestCase):
         env = {"PATH": os.pathsep.join(map(str, path_dirs)) or str(self.root / "no-bin"), "FLEET_HOME": str(self.home),
                "HERDR_PANE_ID": "w1:p1", "HOME": str(self.root), "PATIENT_GIT_LOG": str(limits),
                "PATIENT_SLEEP_LOG": str(sleeps), **env}
-        cp = subprocess.run([*HELPER, "hook", event], input=json.dumps(payload), cwd=self.repo, capture_output=True,
-                            text=True, timeout=CHILD_LIMIT, env=env)
+        cp = subprocess.run([*HELPER, "hook", event], input=json.dumps(payload), cwd=self.repo if cwd is True else cwd,
+                            capture_output=True,
+                            text=True, timeout=CHILD_LIMIT, env=helper_env(env))
         asked = [json.loads(line)["timeout"] for line in limits.read_text().splitlines()] if limits.exists() else []
         waits = [json.loads(line) for line in sleeps.read_text().splitlines()] if sleeps.exists() else []
         return cp, asked, waits
@@ -3795,7 +3820,8 @@ class OrchTests(FleetTestCase):
             self.assertEqual(clock.now - start, 6)
         self.assertEqual([limit for _, limit in calls], [6])
         self.assertEqual(self.log_file().read_bytes(), before)
-        self.assertIn("this pane (w1:p1) is registered as the orchestrator of project app", text)
+        self.assertIn(f"this pane (w1:p1) is registered as the orchestrator of project app, but this hook {NOTE} "
+                      "(git did not answer in time)", text)
         self.assertNotIn("Fleet lane", text)
 
     def test_hooks_when_git_times_out(self):
@@ -3822,10 +3848,10 @@ class OrchTests(FleetTestCase):
             (self.root / "orch.json").rename(self.project / "orch.json")
         self.assertTrue(calls)  # git was asked, and timed out each time
         self.assertEqual(log.read_bytes(), before)
-        note = ("Fleet orchestrator: this pane (w1:p1) is registered as the orchestrator of project app. git failed or "
-                "did not answer in time, so this hook could not confirm that this session works in that project, and "
-                'it gives no re-brief. If you orchestrate it, run `python3 "/plugins/fleet/scripts/fleet" digest '
-                f'--project app` first, then read {self.project / "PROJECT.md"} and load the fleet:fleet skill.')
+        note = ("Fleet orchestrator: this pane (w1:p1) is registered as the orchestrator of project app, but this hook "
+                "could not confirm that this session works in that project (git did not answer in time), so it gives "
+                'no re-brief. If you orchestrate it, run `python3 "/plugins/fleet/scripts/fleet" digest --project app` '
+                f'first, then read {self.project / "PROJECT.md"} and load the fleet:fleet skill.')
         self.assertEqual(texts, dict.fromkeys(texts, note))
         # With no orch.json naming the pane: the lane text, the same as when git answers.
         self.assertIn("This worktree has fleet lane files", lane)
@@ -3837,25 +3863,49 @@ class OrchTests(FleetTestCase):
         fleet.write_json(other / "orch.json", {"pane": "w1:p1"})
         with patient_fleet.git_times_out():
             text = fleet.session_start_context(data, env)
-        self.assertIn(f"orchestrator of one of the projects app, {other.name}.", text)
+        self.assertIn(f"orchestrator of one of the projects app, {other.name}, but", text)
         self.assertIn("digest --project NAME` first", text)
 
-    def test_git_that_answers_gives_no_note(self):
-        """git answers that the directory is in no repository (exit code 128 and no .git entry above it), or in
-        another project: the orch pane is then simply not this project's orch (no note). Through the real entry too."""
+    def test_orch_outcomes(self):
+        """A pane that orch candidates name has three outcomes: (a) the identity of a candidate's project, the full
+        re-brief; (b) the identity of another project, the ordinary path and no note; (c) anything else, the note:
+        a directory outside any repository too. A pane that no candidate names never gets the note."""
         self.orch_setup()
         plain = self.root / "plain"
         plain.mkdir()
-        env = {"HERDR_PANE_ID": "w1:p1"}
-        for source in ("startup", "clear"):
-            self.assertIsNone(fleet.orch_match({"source": source, "cwd": str(plain)}, env))
-            self.assertIsNone(fleet.session_start_context({"source": source, "cwd": str(plain)}, env))
+        other = self.root / "other"
+        other.mkdir()
+        git("init", "-q", "-b", "main", cwd=other)
         git_dir = Path(shutil.which("git")).parent
-        cp, asked, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(plain)}, [git_dir])
-        self.assertEqual((cp.returncode, cp.stdout, cp.stderr, asked), (0, "", "", [6]))
-        # GIT_DIR names a repository: git's 128 is then no answer.
+        for source in ("startup", "compact"):
+            # (c) outside any repository: the note, with git's answer as its cause.
+            cp, asked, _ = self.hook_child("session-start", {"source": source, "cwd": str(plain)}, [git_dir])
+            self.assertEqual((cp.returncode, cp.stderr, asked), (0, "", [6, 6]), source)  # the record asks again
+            context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
+            self.assertIn(f"orchestrator of project app, but this hook {NOTE} (git found no repository here)",
+                          context)
+            # (b) another project's checkout: no note.
+            cp, _, _ = self.hook_child("session-start", {"source": source, "cwd": str(other)}, [git_dir])
+            self.assertEqual((cp.returncode, cp.stdout, cp.stderr), (0, "", ""), source)
+            # A pane that no candidate names, outside any repository: no note.
+            cp, _, _ = self.hook_child("session-start", {"source": source, "cwd": str(plain)}, [git_dir],
+                                       HERDR_PANE_ID="w5:p5")
+            self.assertEqual((cp.returncode, cp.stdout, cp.stderr), (0, "", ""), source)
+        # (a) the project's checkout: the re-brief.
+        cp, _, _ = self.hook_child("session-start", {"source": "startup", "cwd": str(self.repo)}, [git_dir])
+        self.assertIn("you orchestrate project app (pane w1:p1)",
+                      json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
+        # In-process, the same outcomes.
+        env = {"HERDR_PANE_ID": "w1:p1"}
+        with self.assertRaises(fleet.OrchUnconfirmed) as caught:
+            fleet.orch_match({"cwd": str(plain)}, env)
+        self.assertEqual((caught.exception.cause, caught.exception.homes), (fleet.HOOK_NO_REPOSITORY, [self.project]))
+        self.assertIsNone(fleet.orch_match({"cwd": str(other)}, env))
+        self.assertIsNone(fleet.orch_match({"cwd": str(plain)}, {"HERDR_PANE_ID": "w5:p5"}))
+        self.assertEqual(fleet.orch_match({"cwd": str(self.repo)}, env), (self.project, "w1:p1"))
+        # project_home's refusal still tells "no repository" by the .git entries; the hook does not use that.
         with mock.patch.dict(os.environ, {"GIT_DIR": str(plain / "nowhere")}):
-            self.assertTrue(fleet.no_git_entry(str(self.root)) is False)
+            self.assertFalse(fleet.no_git_entry(str(self.root)))
         self.assertTrue(fleet.no_git_entry(str(plain)))
         self.assertFalse(fleet.no_git_entry(str(self.repo / "src")))  # a parent has .git
 
@@ -3873,12 +3923,14 @@ class OrchTests(FleetTestCase):
                  "exit 128 in a repository": 'echo "fatal: not a git repository" >&2; exit 128',
                  "config exit 3": f'case "$*" in *config*) exit 3;; esac; exec "{real}" "$@"',
                  "signal": "kill -TERM $$"}
+        causes = {"exit 3": fleet.HOOK_GIT_ERROR, "exit 128 in a repository": fleet.HOOK_NO_REPOSITORY,
+                  "config exit 3": fleet.HOOK_GIT_ERROR, "signal": fleet.HOOK_GIT_ERROR}
         for name, body in cases.items():
             bin_dir, _ = self.git_wrapper(body)
             cp, _, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(self.repo)}, [bin_dir])
             self.assertEqual((cp.returncode, cp.stderr), (0, ""), name)
             context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
-            self.assertIn("registered as the orchestrator of project app. git failed", context, name)
+            self.assertIn(f"orchestrator of project app, but this hook {NOTE} ({causes[name]})", context, name)
             self.assertNotIn("Fleet lane", context, name)
         # A git that cannot start: not executable (PermissionError), not a program (OSError).
         for name, text, mode in (("not executable", "#!/bin/sh\nexit 0\n", 0o644), ("not a program", "junk\n", 0o755)):
@@ -3888,8 +3940,8 @@ class OrchTests(FleetTestCase):
             (bin_dir / "git").chmod(mode)
             cp, _, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(self.repo)}, [bin_dir])
             self.assertEqual((cp.returncode, cp.stderr), (0, ""), name)
-            self.assertIn("git failed or did not answer in time",
-                          json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"], name)
+            self.assertIn(f"{NOTE} (a git error)", json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"],
+                          name)
         # A malformed configuration with the real git.
         config = self.repo / ".git" / "config"
         good = config.read_text()
@@ -3899,8 +3951,36 @@ class OrchTests(FleetTestCase):
                                        [Path(real).parent])
         finally:
             config.write_text(good)
-        self.assertIn("registered as the orchestrator of project app. git failed",
-                      json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
+        self.assertIn(NOTE, json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
+        # A byte that is not UTF-8 in the origin URL: git answers, its output cannot be read.
+        git("remote", "set-url", "origin", "git@github.com:acme/app.git", cwd=self.repo)
+        raw = config.read_bytes()
+        config.write_bytes(raw.replace(b"acme/app.git", b"acme/app-\xff.git"))
+        try:
+            for source in ("startup", "compact"):
+                cp, _, _ = self.hook_child("session-start", {"source": source, "cwd": str(self.repo)},
+                                           [Path(real).parent])
+                self.assertEqual((cp.returncode, cp.stderr), (0, ""), source)
+                self.assertIn(f"{NOTE} (a git error)",
+                              json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"], source)
+        finally:
+            config.write_bytes(raw)
+        # A checkout directory that cannot be searched, entered before it lost the right (git: "cannot change to
+        # ...", exit 128); the child inherits it as its working directory.
+        mode = self.repo.stat().st_mode & 0o777
+        with chdir(self.repo):
+            self.repo.chmod(0o600)
+            try:
+                for source in ("startup", "compact"):
+                    cp, _, _ = self.hook_child("session-start", {"source": source, "cwd": str(self.repo)},
+                                               [Path(real).parent], cwd=None)
+                    self.assertEqual((cp.returncode, cp.stderr), (0, ""), source)
+                    self.assertIn(f"{NOTE} (git found no repository here)",
+                                  json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"], source)
+            finally:
+                self.repo.chmod(mode)
+        cp, _, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(self.repo)}, [Path(real).parent])
+        self.assertIn("you orchestrate project app", json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
 
     def test_a_failure_is_not_kept_while_time_is_left(self):
         """A remote query that fails once: the re-brief gives the note, and the session record asks git again and
@@ -3913,7 +3993,7 @@ class OrchTests(FleetTestCase):
             f'case "$*" in *config*) if [ ! -e "{once}" ]; then : > "{once}"; exit 3; fi;; esac; exec "{real}" "$@"')
         cp, asked, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(self.repo),
                                                          "session_id": "s-7"}, [bin_dir])
-        self.assertIn("git failed", json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
+        self.assertIn(NOTE, json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
         self.assertEqual(asked, [6] * 5)  # identity (failed), identity again, branch
         e = self.events("session_start")[-1]
         self.assertEqual((e["session"], e["project"], e["branch"]), ("s-7", "app", "main"))
@@ -3949,7 +4029,7 @@ class OrchTests(FleetTestCase):
         # The orch match stays strict: with an orch.json naming the pane, the same failure gives the note.
         self.orch_setup()
         cp, _, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(sub)}, [bin_dir])
-        self.assertIn("git failed", json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
+        self.assertIn(NOTE, json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
 
     def test_hook_entry_without_git_gives_the_note(self):
         """The real entry with no git on PATH: git cannot run, which is no answer; the orch pane gets the note in the
@@ -3958,8 +4038,8 @@ class OrchTests(FleetTestCase):
         cp, asked, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(self.repo)})
         self.assertEqual((cp.returncode, cp.stderr, asked), (0, "", [6, 6]))
         context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("this pane (w1:p1) is registered as the orchestrator of project app. git failed or did not "
-                      "answer in time", context)
+        self.assertIn(f"this pane (w1:p1) is registered as the orchestrator of project app, but this hook {NOTE} "
+                      "(a git error)", context)
         cp, _, _ = self.hook_child("session-end", {"cwd": str(self.repo)})
         self.assertEqual((cp.returncode, cp.stdout, cp.stderr), (0, "", ""))
 
@@ -4051,6 +4131,102 @@ class OrchTests(FleetTestCase):
         self.assertEqual(home.name, "other-11")
         self.assertAlmostEqual(patient_fleet.HOOK_CLOCK.now - patient_fleet.FakeClock.START, 11 * 20 * 0.05)
 
+    def test_the_hook_entry_never_loses_the_orch_note(self):
+        """The catch-all of the hook entry: when anything raises before the output, a pane that orch candidates name
+        gets the note; a pane that none names keeps today's behaviour (no output)."""
+        self.orch_setup()
+        git_dir = Path(shutil.which("git")).parent
+        payload = {"source": "compact", "cwd": str(self.repo)}
+        cp, _, _ = self.hook_child("session-start", payload, [git_dir], PATIENT_RAISE_IN="session_start_context")
+        self.assertEqual((cp.returncode, cp.stderr), (0, ""))
+        self.assertIn(f"orchestrator of project app, but this hook {NOTE} (an error in the hook: RuntimeError)",
+                      json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
+        cp, _, _ = self.hook_child("session-start", payload, [git_dir], PATIENT_RAISE_IN="session_start_context",
+                                   HERDR_PANE_ID="w5:p5")
+        self.assertEqual((cp.returncode, cp.stdout, cp.stderr), (0, "", ""))
+        # In-process through main: the same, and a failing candidate read gives no note.
+        for side_effect, pane, want in ((RuntimeError("boom"), "w1:p1", NOTE), (RuntimeError("boom"), "w5:p5", None)):
+            buf = io.StringIO()
+            with mock.patch.object(fleet, "session_start_context", side_effect=side_effect), \
+                    mock.patch.dict(os.environ, {"HERDR_PANE_ID": pane}), \
+                    mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), redirect_stdout(buf):
+                self.assertEqual(fleet.main(["hook", "session-start"]), 0)
+            self.assertEqual(want in buf.getvalue() if want else buf.getvalue(), True if want else "", pane)
+        buf = io.StringIO()
+        with mock.patch.object(fleet, "session_start_context", side_effect=RuntimeError("boom")), \
+                mock.patch.object(fleet, "orch_candidates", side_effect=OSError("unreadable")), \
+                mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1"}), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), redirect_stdout(buf):
+            self.assertEqual(fleet.main(["hook", "session-start"]), 0)
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_parent_and_child_share_the_calendar(self):
+        """At the last second of a month, a HELPER child names and locks the parent's month's log, not the next
+        one: the child gets the parent's calendar (helper_env)."""
+        import fcntl
+        self.orch_setup()
+        (self.repo / ".fleet").mkdir()
+        self.clock.calendar = time.strptime("2026-10-31 23:59:59", "%Y-%m-%d %H:%M:%S")
+        log = self.log_file()
+        self.assertEqual(log.name, "2026-10.jsonl")
+        log.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(log, os.O_WRONLY | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            cp, _, waits = self.hook_child("session-start", {"source": "startup", "cwd": str(self.repo),
+                                                             "session_id": "s-31"}, [Path(shutil.which("git")).parent])
+        finally:
+            os.close(fd)
+        self.assertEqual(cp.returncode, 0)
+        self.assertTrue(any(Path(w["file"]).resolve() == SCRIPT for w in waits))  # it met the parent's lock
+        self.assertFalse(any("s-31" in f.read_text() for f in log.parent.glob("*.jsonl")))
+        cp, _, _ = self.hook_child("session-start", {"source": "startup", "cwd": str(self.repo), "session_id": "s-32"},
+                                   [Path(shutil.which("git")).parent])
+        self.assertIn('"session":"s-32"', log.read_text())  # the parent's month
+        self.assertEqual(helper_env({})["PATIENT_CALENDAR"], repr(time.mktime(self.clock.calendar)))
+        self.clock.stopped = 1_700_000_000.0
+        self.assertEqual(helper_env({})["PATIENT_TIME"], "1700000000.0")
+
+    def test_a_hook_never_makes_a_second_home(self):
+        """One name whose folder exists and whose project.json comes later (another process is writing it): the
+        hook waits for it, within its end time, and records in that home; it never makes a home under the next
+        name. When it does not come in time, nothing is recorded and no home is made."""
+        other = self.root / "other"
+        other.mkdir()
+        git("init", "-q", "-b", "main", cwd=other)
+        git("remote", "add", "origin", "git@github.com:acme/other.git", cwd=other)
+        (other / ".fleet").mkdir()
+        keys = ["github.com/acme/other", f"local:{other}"]
+        folder = self.home / "projects" / "other"
+        folder.mkdir(parents=True)
+        writes = []
+        real_sleep = fleet.time.sleep
+
+        def writer_finishes(seconds):  # the other process writes project.json during the hook's wait, at 1.6 s
+            real_sleep(seconds)
+            if patient_fleet.HOOK_CLOCK.now - start >= 1.6 and not writes:
+                fleet.write_json(folder / "project.json", {"name": "other", "keys": keys})
+                writes.append(patient_fleet.HOOK_CLOCK.now)
+        env = {"HERDR_PANE_ID": "w2:p1"}
+        start = patient_fleet.HOOK_CLOCK.now
+        run = fleet.HookRun("session-end")
+        with mock.patch.object(fleet.time, "sleep", writer_finishes):
+            self.assertIsNotNone(fleet.hook_session_event("session_end", {"cwd": str(other)}, env, run))
+        self.assertTrue(writes)
+        self.assertEqual(sorted(p.name for p in (self.home / "projects").iterdir()), ["app", "other"])
+        self.assertEqual(fleet.read_events([folder])[-1]["event"], "session_end")
+        # The writer never finishes: the hook gives up at its end, with no record and no second home.
+        (folder / "project.json").unlink()
+        (folder / "events").rename(self.root / "other-events")
+        patient_fleet.HOOK_CLOCK.reset()
+        run = fleet.HookRun("session-end")
+        self.assertIsNone(fleet.hook_session_event("session_end", {"cwd": str(other)}, env, run))
+        self.assertLessEqual(patient_fleet.HOOK_CLOCK.now, run.end)
+        self.assertGreater(patient_fleet.HOOK_CLOCK.now, run.end - 2 * fleet.HOOK_WAIT_STEP)
+        self.assertEqual(sorted(p.name for p in (self.home / "projects").iterdir()), ["app", "other"])
+        # A command (no end time) keeps its 1 s for the name, then makes the next one.
+        self.assertEqual(fleet.ensure_project(keys).name, "acme-other")
+
     def test_a_held_project_lock_in_a_child_is_busy(self):
         """In a child the fake clock moves with each sleep: a command that waits for a held project lock reports
         busy, without real waiting and without hanging."""
@@ -4060,8 +4236,8 @@ class OrchTests(FleetTestCase):
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:
             cp = subprocess.run([*HELPER, "orch", "release"], cwd=self.repo, capture_output=True, text=True,
-                                timeout=CHILD_LIMIT, env={**os.environ, "FLEET_HOME": str(self.home),
-                                                          "HERDR_PANE_ID": "w1:p1"})
+                                timeout=CHILD_LIMIT, env=helper_env({**os.environ, "FLEET_HOME": str(self.home),
+                                                                         "HERDR_PANE_ID": "w1:p1"}))
         finally:
             os.close(fd)
         self.assertEqual(cp.returncode, 1)
@@ -4101,7 +4277,7 @@ class OrchTests(FleetTestCase):
         # Through the real entry: the same texts on stderr.
         for where, message in ((plain, no_repo), (bare, no_tree), (fresh, no_home), (broken, failed)):
             cp = subprocess.run([*HELPER, "orch", "show"], cwd=where, capture_output=True, text=True,
-                                timeout=CHILD_LIMIT, env={**os.environ, "FLEET_HOME": str(self.home)})
+                                timeout=CHILD_LIMIT, env=helper_env({**os.environ, "FLEET_HOME": str(self.home)}))
             self.assertEqual((cp.returncode, cp.stderr), (1, f"fleet: {message}\n"), where)
         self.assertEqual(fleet.project_dirs(), [self.project])  # no refusal created a home
         with chdir(fresh):  # the command that the refusal names creates the home

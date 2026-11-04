@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import glob
+import itertools
 import json
 import os
 import re
@@ -1287,8 +1288,10 @@ def project_names(key: str) -> list[str]:
 def ensure_project(keys: list[str], until: float | None = None) -> Path | None:
     """The home of the project with these keys; keys[0] names a new one. The first call creates it.
 
-    With `until` (a time of hook_clock), its waits for other processes, over all candidate names together, give up
-    at that time, and it returns None: a hook's end time. Without it, it waits up to 1 s for each name."""
+    With `until` (a time of hook_clock: a hook's end time), a name whose folder exists but whose project.json is not
+    there yet is waited for up to that time, and then it returns None: a folder of unknown identity never lets it
+    make a home under another name, which could be a second home for the same keys. Without `until`, it waits up to
+    1 s for each such name, then tries the next."""
     found = find_project(keys, learn=True)
     if found:
         return found
@@ -1301,7 +1304,7 @@ def ensure_project(keys: list[str], until: float | None = None) -> Path | None:
         except FileExistsError:
             # Another process can have created this project a moment ago: give it time to write project.json.
             known: list[str] = []
-            for _ in range(20):
+            for _ in (itertools.count() if until is not None else range(20)):
                 data = read_json(d / PROJECT_FILE)
                 if data:
                     known = project_keys(data)
@@ -1392,19 +1395,33 @@ def pane_lane_fields(info: dict) -> dict:
 
 
 def hook_clock() -> float:
-    """The clock of the hooks' git deadline (see HOOK_BUDGET). The tests control it: in-process they replace this
-    function, and in a child patient_fleet.py stops time.monotonic."""
+    """The clock of the hooks' end time and git deadline (see HOOK_BUDGET), as HOOK_STARTED reads it. The tests do
+    not replace this function: patient_fleet.py gives the script a fake time.monotonic (in-process its own time
+    module, in a child the patched one) that moves only when the harness says that git took time, or by the
+    helper's own sleeps."""
     return time.monotonic()
 
 
+HOOK_NO_REPOSITORY = "git found no repository here"
+HOOK_GIT_ERROR = "a git error"
+HOOK_NO_ANSWER = "git did not answer in time"
+
+
 class HookGitFailed(Exception):
-    """A git call of a hook gave no answer: no time was left, it timed out, git could not start or run, a signal
-    ended it, or its error does not establish an answer."""
+    """A git call of a hook gave no identity. `cause` is one of HOOK_NO_REPOSITORY (exit code 128, for any reason),
+    HOOK_GIT_ERROR (any other exit code, any exception, output that is not UTF-8, a failed remote query) or
+    HOOK_NO_ANSWER (a timeout, or no time left)."""
+
+    def __init__(self, cause: str, detail: str = ""):
+        super().__init__(f"{cause}: {detail}" if detail else cause)
+        self.cause = cause
 
 
 def no_git_entry(path: str) -> bool:
     """True when nothing tells git where a repository is: GIT_DIR is not set, and no `.git` entry (a file or a
-    directory) exists in `path` or in any parent. Only then does git's exit code 128 mean "no repository"."""
+    directory) exists in `path` or in any parent. Only then does git's exit code 128 mean "no repository" in
+    project_home's refusal. The hook does not use it: for a registered orch pane, every exit code 128 is outcome c
+    of orch_match."""
     if os.environ.get("GIT_DIR"):
         return False
     d = os.path.realpath(path)
@@ -1426,52 +1443,55 @@ class HookRun:
         start = hook_clock() if start is None else start
         self.end = start + HOOK_BUDGET[event] - HOOK_BEFORE_CLOCK - HOOK_EXIT_MARGIN
         self.deadline = self.end - HOOK_AFTER_GIT[event]
-        self.identities: dict[str, dict | None] = {}
+        self.identities: dict[str, dict] = {}
         self.tops: dict[str, str] = {}  # the checkout top that rev-parse confirmed, also when the remote query failed
 
     def git(self, path: str, *args: str) -> subprocess.CompletedProcess:
-        """`git -C path args` with the time left until the deadline as its limit. An exit code >= 0 comes back for
-        the caller to judge; HookGitFailed when less than HOOK_GIT_MIN is left (git does not start), on a timeout,
-        when git cannot start or run, or when a signal ends it."""
+        """`git -C path args` with the time left until the deadline as its limit, its output decoded strictly as
+        UTF-8. An exit code >= 0 comes back for the caller to judge. HookGitFailed: HOOK_NO_ANSWER when less than
+        HOOK_GIT_MIN is left (git does not start) or on a timeout; HOOK_GIT_ERROR for every other exception (git
+        cannot start, output that is not UTF-8, anything else) and for a signal."""
         left = self.deadline - hook_clock()
         if left < HOOK_GIT_MIN:
-            raise HookGitFailed(f"no time was left for git {args[0]}")
+            raise HookGitFailed(HOOK_NO_ANSWER, f"no time was left for git {args[0]}")
         try:
-            cp = run(["git", "-C", path, *args], timeout=left)
-        except (FleetError, OSError, subprocess.SubprocessError) as e:
-            raise HookGitFailed(str(e) or type(e).__name__)
+            cp = subprocess.run(["git", "-C", path, *args], capture_output=True, timeout=left)
+            out, err = cp.stdout.decode(), cp.stderr.decode(errors="replace")
+        except subprocess.TimeoutExpired:
+            raise HookGitFailed(HOOK_NO_ANSWER, f"git {args[0]} timed out after {left:.2f}s")
+        except Exception as e:
+            raise HookGitFailed(HOOK_GIT_ERROR, f"git {args[0]}: {type(e).__name__}: {e}")
         if cp.returncode < 0:
-            raise HookGitFailed(f"git {args[0]} was ended by signal {-cp.returncode}")
-        return cp
+            raise HookGitFailed(HOOK_GIT_ERROR, f"git {args[0]} was ended by signal {-cp.returncode}")
+        return subprocess.CompletedProcess(cp.args, cp.returncode, out, err)
 
-    def identity(self, path: str) -> dict | None:
-        """repo_identity(path) within the deadline. None only when git answers that `path` is in no repository: exit
-        code 128 and no_git_entry(path). HookGitFailed for every other failure, also of the remote query: without
-        it the local key alone could name another project. A found identity is kept for the run; a failure is not,
-        so a later caller asks git again while time is left."""
+    def identity(self, path: str) -> dict:
+        """repo_identity(path) within the deadline: the top and the remotes. HookGitFailed for every failure: exit
+        code 128 of rev-parse is HOOK_NO_REPOSITORY (whatever its reason), any other failure, also of the remote
+        query, is HOOK_GIT_ERROR (without the remotes the local key alone could name another project). A found
+        identity is kept for the run; a failure is not, so a later caller asks git again while time is left."""
         if path not in self.identities:
             cp = self.git(path, "rev-parse", "--git-common-dir", "--show-toplevel")
             lines = cp.stdout.strip().splitlines()
-            if cp.returncode == 128 and no_git_entry(path):
-                self.identities[path] = None  # git answered: no repository here
-                return None
+            if cp.returncode == 128:
+                raise HookGitFailed(HOOK_NO_REPOSITORY, (cp.stderr.strip().splitlines() or [""])[0])
             if cp.returncode != 0 or len(lines) < 2:
-                raise HookGitFailed(f"git rev-parse failed with exit code {cp.returncode}")
+                raise HookGitFailed(HOOK_GIT_ERROR, f"git rev-parse failed with exit code {cp.returncode}")
             self.tops[path] = lines[1]
             remotes = self.git(path, "config", "--get-regexp", r"^remote\..*\.url$")
             if remotes.returncode not in (0, 1):  # 1: no remote
-                raise HookGitFailed(f"git config failed with exit code {remotes.returncode}")
+                raise HookGitFailed(HOOK_GIT_ERROR, f"git config failed with exit code {remotes.returncode}")
             self.identities[path] = identity_from(path, lines, remotes.stdout if remotes.returncode == 0 else "")
         return self.identities[path]
 
     def top(self, path: str) -> str | None:
-        """The checkout top of `path` within the deadline, for the lane files: from the identity, or from the
-        rev-parse that confirmed it when only the remote query failed. None when git gives none."""
+        """The checkout top of `path` within the deadline, for the lane files of a pane that is no orch candidate:
+        from the identity, or from the rev-parse that confirmed it when only the remote query failed. None when git
+        gives none."""
         try:
-            ident = self.identity(path)
+            return self.identity(path)["top"]
         except HookGitFailed:
             return self.tops.get(path)
-        return ident["top"] if ident else None
 
 
 def hook_session_event(event: str, data: dict, env: dict | None = None, run: HookRun | None = None) -> str | None:
@@ -1492,7 +1512,7 @@ def hook_session_event(event: str, data: dict, env: dict | None = None, run: Hoo
         ident = run.identity(cwd)
     except HookGitFailed:
         return None
-    if not ident or not (Path(ident["top"]) / FLEET_DIR).is_dir():
+    if not (Path(ident["top"]) / FLEET_DIR).is_dir():
         return None
     top = ident["top"]
     try:
@@ -3813,55 +3833,60 @@ def helper_command(env) -> str:
 
 
 class OrchUnconfirmed(Exception):
-    """An orch.json names this pane, but git did not answer, so the hook cannot tell the session's project."""
+    """Orch candidates name this pane, but the hook cannot confirm the session's project (outcome c of orch_match)."""
 
-    def __init__(self, homes: list[Path], pane: str, why: str):
-        super().__init__(why)
-        self.homes, self.pane = homes, pane
+    def __init__(self, homes: list[Path], pane: str, cause: str):
+        super().__init__(cause)
+        self.homes, self.pane, self.cause = homes, pane, cause
+
+
+def orch_candidates(env) -> tuple[str | None, list[Path]]:
+    """(this pane, the homes whose orch.json names it). Reads files only, never git. No candidate: the pane is no
+    orch, and the hook treats it as any other pane."""
+    pane = text_or_none(env.get("HERDR_PANE_ID"))
+    if not pane:
+        return None, []
+    return pane, sorted(p.parent for p in (fleet_home() / PROJECTS_DIR).glob(f"*/{ORCH_FILE}")
+                        if read_json(p).get("pane") == pane)
 
 
 def orch_match(data: dict, env, run: HookRun | None = None) -> tuple[Path, str] | None:
-    """(project home, pane) when the session runs in the registered orch pane of the project that holds its
-    directory; None when no orch.json names this pane, or git answers that the directory is in another project or
-    in none. OrchUnconfirmed when an orch.json names this pane and git gives no answer. Reads files, and runs git
-    (two calls, within the deadline of `run`) only when an orch.json names this pane."""
-    pane = text_or_none(env.get("HERDR_PANE_ID"))
-    if not pane:
-        return None
-    homes = [p.parent for p in (fleet_home() / PROJECTS_DIR).glob(f"*/{ORCH_FILE}") if read_json(p).get("pane") == pane]
+    """For a pane that orch candidates name, exactly three outcomes:
+    (a) git gives the identity of the session's directory (top and remotes), and it is a candidate's project:
+        (project home, pane);
+    (b) git gives the identity, and it is no candidate's project: None (the pane is not this project's orch);
+    (c) anything else: OrchUnconfirmed. That is every failure of git (exit code 128 for any reason, "no repository"
+        too: `orch claim` needs a checkout, so a registered pane without one has usually lost it), a timeout, no
+        time left, and an exception of any type.
+    None for a pane that no candidate names. Runs git (two calls, within the deadline of `run`) only for a pane
+    with candidates."""
+    pane, homes = orch_candidates(env)
     if not homes:
         return None
-    cwd = text_or_none(data.get("cwd")) or os.getcwd()
-    if not os.path.isdir(cwd):
-        return None
     try:
-        ident = (run or HookRun()).identity(cwd)
+        cwd = text_or_none(data.get("cwd")) or os.getcwd()
+        if not os.path.isdir(cwd):
+            raise HookGitFailed(HOOK_NO_REPOSITORY, f"no directory {cwd}")
+        home = find_project((run or HookRun()).identity(cwd)["keys"])
     except HookGitFailed as e:
-        raise OrchUnconfirmed(sorted(homes), pane, str(e))
-    home = find_project(ident["keys"]) if ident else None
-    if not home or all(os.path.realpath(home) != os.path.realpath(h) for h in homes):
-        return None
-    return home, pane
+        raise OrchUnconfirmed(homes, pane, e.cause)
+    except Exception as e:
+        raise OrchUnconfirmed(homes, pane, f"an error in the hook: {type(e).__name__}")
+    if home and any(os.path.realpath(home) == os.path.realpath(h) for h in homes):
+        return home, pane
+    return None
 
 
-def orch_unconfirmed_note(e: OrchUnconfirmed, env) -> str:
-    """The note for the orch pane when git did not answer: what is known, and how to get the re-brief by hand.
-    Never the lane or FLEET.md text: the pane may be the orch."""
-    names = ", ".join(h.name for h in e.homes)
-    which = f"project {names}" if len(e.homes) == 1 else f"one of the projects {names}"
-    digest = f"{helper_command(env)} digest --project {e.homes[0].name if len(e.homes) == 1 else 'NAME'}"
-    files = ", ".join(str(h / PROJECT_MD) for h in e.homes)
-    return (f"Fleet orchestrator: this pane ({e.pane}) is registered as the orchestrator of {which}. git failed or "
-            "did not answer in time, so this hook could not confirm that this session works in that project, and it "
-            f"gives no re-brief. If you orchestrate it, run `{digest}` first, then read {files} and load the "
-            "fleet:fleet skill.")
-
-
-def orch_fallback(home: Path, pane: str, env) -> str:
-    """The short re-brief when the full one fails: never the lane or FLEET.md text."""
-    return (f"Fleet orchestrator: you orchestrate project {home.name} (pane {pane}). The re-brief from the "
-            f"project home failed. Run `{helper_command(env)} digest` first, then read {home / PROJECT_MD} and "
-            "load the fleet:fleet skill.")
+def orch_unconfirmed_note(homes: list[Path], pane: str, cause: str, env) -> str:
+    """The note for a pane that orch candidates name, when the hook cannot give it the re-brief: what is known, why
+    not, and how to get the re-brief by hand. Never the lane or FLEET.md text: the pane may be the orch."""
+    names = ", ".join(h.name for h in homes)
+    which = f"project {names}" if len(homes) == 1 else f"one of the projects {names}"
+    digest = f"{helper_command(env)} digest --project {homes[0].name if len(homes) == 1 else 'NAME'}"
+    files = ", ".join(str(h / PROJECT_MD) for h in homes)
+    return (f"Fleet orchestrator: this pane ({pane}) is registered as the orchestrator of {which}, but this hook could "
+            f"not confirm that this session works in that project ({cause}), so it gives no re-brief. If you "
+            f"orchestrate it, run `{digest}` first, then read {files} and load the fleet:fleet skill.")
 
 
 def orch_rebrief(home: Path, pane: str, data: dict, env) -> str:
@@ -4841,23 +4866,23 @@ def session_start_context(data: dict, env: dict | None = None, run: HookRun | No
 
     The registered orch pane of a project gets a re-brief from the project home on every source. For any
     other pane, the pane's role comes from .fleet/panes.json (written by `fleet spawn --role`), so a critic
-    or an unrelated session in the same checkout is not told that it implements the lane. When an orch.json names
-    the pane and git does not answer, the pane gets a short note instead (orch_unconfirmed_note). Its git calls
-    share the deadline of `run`.
+    or an unrelated session in the same checkout is not told that it implements the lane. A pane that orch
+    candidates name and whose project the hook cannot confirm gets a short note instead (orch_match, outcome c), as
+    does the orch when its re-brief fails. Its git calls share the deadline of `run`.
     """
     env = os.environ if env is None else env
     run = run or HookRun()
     try:
         match = orch_match(data, env, run)
     except OrchUnconfirmed as e:
-        return orch_unconfirmed_note(e, env)
+        return orch_unconfirmed_note(e.homes, e.pane, e.cause, env)
     except Exception:
-        match = None  # an error before the pane is known as the orch: behave as for any other pane
+        match = None  # the candidates could not be read: the pane is known as no orch, as for any other pane
     if match:
         try:
             return orch_rebrief(*match, data, env)
-        except Exception:
-            return orch_fallback(*match, env)
+        except Exception as e:
+            return orch_unconfirmed_note([match[0]], match[1], f"its re-brief failed: {type(e).__name__}", env)
     source = data.get("source")
     if source not in ("clear", "compact"):
         return None
@@ -4938,11 +4963,26 @@ def cmd_hook(args: argparse.Namespace) -> int:
         return 0
     if args.event == "session-start":
         try:
-            context = session_start_context(data, run=run)
+            pane, homes = orch_candidates(os.environ)
         except Exception:
-            context = None
-        if context:
-            print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}))
+            pane, homes = None, []  # no candidate known: today's behaviour
+        try:
+            context = session_start_context(data, run=run)
+            out = json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}) \
+                if context else None
+        except Exception as e:
+            # A pane that orch candidates name never loses its re-brief silently: anything that raises before the
+            # output gives the note.
+            out = None
+            if homes:
+                try:
+                    note = orch_unconfirmed_note(homes, pane, f"an error in the hook: {type(e).__name__}", os.environ)
+                    out = json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                                             "additionalContext": note}})
+                except Exception:
+                    out = None
+        if out:
+            print(out)
             sys.stdout.flush()
     try:
         hook_session_event("session_start" if args.event == "session-start" else "session_end", data, run=run)
