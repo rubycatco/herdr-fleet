@@ -1765,13 +1765,18 @@ def repo_paths(path: str) -> dict:
             "main_root": main_root, "repo": os.path.basename(main_root)}
 
 
-def count_dirty(porcelain: str | None) -> int | None:
-    """Changed and untracked paths in `git status --porcelain`, not counting the lane's .fleet/."""
-    if porcelain is None:
+def count_dirty(entries: list[list[str]] | None) -> int | None:
+    """The changes in `status_entries`, not counting the lane's .fleet/: one for each entry with a path outside
+    it. A rename stays one change, and a rename out of .fleet/ counts."""
+    if entries is None:
         return None
-    fleet_dir = FLEET_DIR + "/"
-    paths = [line[3:].strip('"') for line in porcelain.splitlines() if line.strip()]
-    return sum(1 for p in paths if not (p == fleet_dir or p.startswith(fleet_dir)))
+    return sum(1 for paths in entries if outside_fleet(paths))
+
+
+def dirty_count(path: str) -> int | None:
+    """The uncommitted changes of the lane at `path`, for sweep and cleanup: each untracked directory counts as one,
+    whatever the user's git settings say. None when git status fails."""
+    return count_dirty(status_entries(path, "normal"))
 
 
 def base_refs(path: str) -> list[str]:
@@ -1892,8 +1897,7 @@ def lane_facts(stub: dict, caller_pane: str | None, caller_cwd: str, pr_lookup=N
         return f
     f["branch"] = git_out(path, "symbolic-ref", "--quiet", "--short", "HEAD") or None
     f["head"] = git_out(path, "rev-parse", "HEAD")
-    status = run_git(path, "status", "--porcelain")
-    f["dirty"] = count_dirty(status.stdout if status is not None and status.returncode == 0 else None)
+    f["dirty"] = dirty_count(path)
     if f["branch"] is None:
         # A detached checkout (a review at one commit, say) loses nothing when a branch, remote or tag holds HEAD.
         f["unreachable"] = count_out(git_out(path, "rev-list", "--count", "HEAD", "--not", "--branches",
@@ -3565,28 +3569,36 @@ def git_text(path: str, *args: str, timeout: float = 15, errors: str = "replace"
     return cp.stdout.decode("utf-8", errors=errors) if cp.returncode == 0 else None
 
 
-def status_paths(path: str) -> list[str] | None:
-    """Every path that `git status` reports in the checkout at `path`, both sides of a rename or copy, with each
-    untracked file and each submodule listed whatever the user's git settings say. None when git fails.
-
-    `count_dirty`, which sweep and cleanup use, reads the plain porcelain form instead."""
-    out = git_text(path, "status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none")
+def status_entries(path: str, untracked: str) -> list[list[str]] | None:
+    """The entries of `git status` in the checkout at `path`, one list of paths each: `[<to>, <from>]` for a rename
+    or copy, `[<path>]` otherwise. Untracked files show in the mode `untracked` (`all`: each file; `normal`: an
+    untracked directory as one entry), and each submodule change shows, whatever the user's git settings say.
+    -z never quotes a path. None when git fails."""
+    out = git_text(path, "status", "--porcelain", "-z", f"--untracked-files={untracked}", "--ignore-submodules=none")
     if out is None:
         return None
     fields = out.split("\0")
-    paths: list[str] = []
+    entries: list[list[str]] = []
     i = 0
     while i < len(fields):
         entry = fields[i]
         i += 1
         if len(entry) < 4:
             continue
-        paths.append(entry[3:])
+        paths = [entry[3:]]
         if "R" in entry[:2] or "C" in entry[:2]:  # `XY <to>`, then `<from>` as the next field
             if i < len(fields) and fields[i]:
                 paths.append(fields[i])
             i += 1
-    return paths
+        entries.append(paths)
+    return entries
+
+
+def status_paths(path: str) -> list[str] | None:
+    """Every path that `git status` reports in the checkout at `path`, both sides of a rename or copy, with each
+    untracked file listed (`status_entries` at `all`, flattened). None when git fails."""
+    entries = status_entries(path, "all")
+    return None if entries is None else [p for paths in entries for p in paths]
 
 
 def outside_fleet(paths: list[str]) -> list[str]:

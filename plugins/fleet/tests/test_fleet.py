@@ -672,9 +672,13 @@ class SweepTests(unittest.TestCase):
         config = '[ui]\ndirectory = "x"\n\n[worktrees]\ndirectory = "~/wt"  # checkouts\n'
         self.assertEqual(fleet.worktrees_dir_from_config(config), "~/wt")
         self.assertIsNone(fleet.worktrees_dir_from_config("[ui]\ntheme = 'dark'\n"))
-        self.assertEqual(fleet.count_dirty(" M a.rb\n?? .fleet/\n?? new.txt\n"), 2)
-        self.assertEqual(fleet.count_dirty(""), 0)
+        self.assertEqual(fleet.count_dirty([["a.rb"], [".fleet/"], ["new.txt"]]), 2)
+        self.assertEqual(fleet.count_dirty([]), 0)
         self.assertIsNone(fleet.count_dirty(None))
+        self.assertEqual(fleet.count_dirty([["app2.py", ".fleet/draft.py"]]), 1)  # a rename out of .fleet/
+        self.assertEqual(fleet.count_dirty([[".fleet/b.md", ".fleet/a.md"]]), 0)  # a rename inside it
+        self.assertEqual(fleet.count_dirty([["d/"]]), 1)  # one untracked directory
+        self.assertEqual(fleet.count_dirty([["a -> b.py"]]), 1)  # -z never splits a name at an arrow
         shell = {"foreground_process_group_id": 5, "shell_pid": 5, "foreground_processes": [{"name": "zsh"}]}
         self.assertIsNone(fleet.busy_from_process_info(shell))
         job = {"foreground_process_group_id": 9, "shell_pid": 5, "foreground_processes": [{"name": "node"}]}
@@ -748,7 +752,59 @@ class LaneGitTests(unittest.TestCase):
         self.git(self.repo, "merge", "-q", "--no-ff", "-m", "merge lane-a", "lane-a")
         f = self.facts()
         self.assertEqual((f["verdict"], f["reasons"], f["delete_branch"]), ("ready", ["in main"], True))
+        self.assertEqual(f["dirty"], 0)  # only .fleet/ files are left
         self.assertFalse(fleet.repo_paths(str(self.repo))["linked"])
+
+    def test_git_settings_cannot_hide_untracked_files_from_sweep(self):
+        # The lane is merged (no commit of its own); its only change is one untracked file.
+        self.git(self.lane_path, "config", "status.showUntrackedFiles", "no")
+        (self.lane_path / "new.txt").write_text("work")
+        self.assertEqual(self.git(self.lane_path, "status", "--porcelain"), "")  # the setting took
+        f = self.facts()
+        self.assertEqual((f["verdict"], f["reasons"], f["dirty"]), ("keep", ["1 uncommitted change"], 1))
+        # The same setting in the global config.
+        self.git(self.lane_path, "config", "--unset", "status.showUntrackedFiles")
+        global_config = Path(self.tmp.name) / "gitconfig"
+        global_config.write_text("[status]\n\tshowUntrackedFiles = no\n")
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(global_config)}):
+            plain = subprocess.run(["git", "status", "--porcelain"], cwd=self.lane_path, capture_output=True,
+                                   text=True)
+            self.assertEqual(plain.stdout, "")
+            f = self.facts()
+        self.assertEqual((f["verdict"], f["reasons"], f["dirty"]), ("keep", ["1 uncommitted change"], 1))
+
+    def test_an_untracked_directory_is_one_change(self):
+        (self.lane_path / "d").mkdir()
+        (self.lane_path / "d" / "a.txt").write_text("a")
+        (self.lane_path / "d" / "b.txt").write_text("b")
+        self.assertEqual(self.facts()["dirty"], 1)
+        self.git(self.lane_path, "add", "d")
+        f = self.facts()
+        self.assertEqual((f["dirty"], f["reasons"]), (2, ["2 uncommitted changes"]))
+
+    def test_a_rename_out_of_fleet_counts_for_sweep(self):
+        # A base that tracks a file in .fleet/; a new lane moves it to a code path, staged, without a commit.
+        (self.repo / ".fleet").mkdir()
+        (self.repo / ".fleet" / "draft.py").write_text("print('x')\n")
+        self.git(self.repo, "add", "-f", ".fleet/draft.py")
+        self.git(self.repo, "commit", "-q", "-m", "draft")
+        self.lane_path = Path(self.tmp.name) / "lane-r"
+        self.git(self.repo, "worktree", "add", "-q", "-b", "lane-r", str(self.lane_path))
+        self.git(self.lane_path, "mv", ".fleet/draft.py", "app2.py")
+        f = self.facts()
+        self.assertEqual((f["verdict"], f["reasons"], f["dirty"]), ("keep", ["1 uncommitted change"], 1))
+        # A move inside .fleet/ is no change.
+        self.git(self.lane_path, "mv", "app2.py", ".fleet/draft.py")
+        self.git(self.lane_path, "mv", ".fleet/draft.py", ".fleet/kept.py")
+        self.assertIn("R  .fleet/draft.py -> .fleet/kept.py", self.git(self.lane_path, "status", "--porcelain"))
+        f = self.facts()
+        self.assertEqual((f["verdict"], f["dirty"]), ("ready", 0))
+
+    def test_a_failing_status_keeps_the_lane(self):
+        with mock.patch.object(fleet, "status_entries", return_value=None):
+            f = self.facts()
+        self.assertIsNone(f["dirty"])
+        self.assertEqual((f["verdict"], f["reasons"]), ("keep", ["git status failed"]))
 
     def test_merged_pull_request_whose_head_is_not_in_the_clone(self):
         origin = Path(self.tmp.name) / "origin.git"
@@ -1483,7 +1539,6 @@ class ApprovePlanTests(unittest.TestCase):
         git("mv", ".fleet/draft.py", "app2.py", cwd=lane)
         self.assertIn(" -> ", subprocess.run(["git", "status", "--porcelain"], cwd=lane, capture_output=True,
                                              text=True).stdout)
-        self.assertEqual(fleet.count_dirty("R  .fleet/draft.py -> app2.py\n"), 0)  # sweep's reading, unchanged
         self.assertEqual(fleet.status_paths(str(lane)), ["app2.py", ".fleet/draft.py"])
         out = self.refused("--by", "user", reason="1 changed path outside .fleet/", cwd=lane, plan=plan)
         self.assertEqual(out["paths"], ["app2.py"])
