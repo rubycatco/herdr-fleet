@@ -19,7 +19,10 @@ import patient_fleet  # noqa: E402
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "fleet"
 # Each git call of the helper gets a long limit while the tests run (see patient_fleet.py), here and in a child.
 fleet = patient_fleet.load(SCRIPT)
-HELPER = [sys.executable, str(Path(patient_fleet.__file__).resolve()), str(SCRIPT)]  # the helper in a child process
+# The helper in a child process, run as __main__ by patient_fleet.py. A child that runs SCRIPT directly gets the
+# product's own limits: use HELPER unless the test is about those limits. A test of an expired limit uses
+# patient_fleet.git_times_out() (an injected TimeoutExpired), never a real wait.
+HELPER = [sys.executable, str(Path(patient_fleet.__file__).resolve()), str(SCRIPT)]
 CHILD_LIMIT = 300  # seconds for a child process: a guard against a hang, never a measure of speed
 
 # No test writes to the real ~/.fleet, also not through a subprocess.
@@ -3646,8 +3649,9 @@ class OrchTests(unittest.TestCase):
         self.assertIn("you orchestrate project app", text)
 
     def test_rebrief_hook_is_fast_and_offline(self):
-        """The hook's work is bounded: four quick git calls and files, never herdr, gh or a scan of the lanes. The
-        test counts that work instead of timing it, so a loaded machine cannot fail it."""
+        """The hook's work is bounded: four git calls, each with the hook's 1 s limit, and files; never herdr, gh, a
+        scan of the lanes or a wait (time.sleep) of the helper. The test counts that work instead of timing it, so
+        a loaded machine cannot fail it, and a wait of any length can."""
         self.orch_setup()
         bin_dir = self.root / "bin"
         bin_dir.mkdir()
@@ -3655,7 +3659,9 @@ class OrchTests(unittest.TestCase):
         # git only, through a wrapper that notes each call: herdr and gh cannot run.
         (bin_dir / "git").write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{calls}"\nexec "{shutil.which("git")}" "$@"\n')
         (bin_dir / "git").chmod(0o755)
-        env = {"PATH": str(bin_dir), "FLEET_HOME": str(self.home), "HERDR_PANE_ID": "w1:p1", "HOME": str(self.root)}
+        limits, sleeps = self.root / "git-limits.jsonl", self.root / "sleeps.jsonl"
+        env = {"PATH": str(bin_dir), "FLEET_HOME": str(self.home), "HERDR_PANE_ID": "w1:p1", "HOME": str(self.root),
+               "PATIENT_GIT_LOG": str(limits), "PATIENT_SLEEP_LOG": str(sleeps)}
         payload = json.dumps({"source": "startup", "cwd": str(self.repo), "session_id": "s-9"})
         cp = subprocess.run([*HELPER, "hook", "session-start"], input=payload, cwd=self.repo,
                             capture_output=True, text=True, timeout=CHILD_LIMIT, env=env)
@@ -3666,27 +3672,51 @@ class OrchTests(unittest.TestCase):
         identity = [f"-C {self.repo} rev-parse --git-common-dir --show-toplevel",
                     f"-C {self.repo} config --get-regexp ^remote\\..*\\.url$"]
         self.assertEqual(calls.read_text().splitlines(), identity * 2)
+        self.assertEqual([json.loads(line)["timeout"] for line in limits.read_text().splitlines()], [1] * 4)
+        # The helper asks for no wait on this path. The subprocess module's own wait loop sleeps in short steps
+        # while git runs; that is not a wait of the hook.
+        asked = [json.loads(line) for line in sleeps.read_text().splitlines()] if sleeps.exists() else []
+        self.assertEqual([e for e in asked if Path(e["file"]).resolve() == SCRIPT], [])
+        self.assertTrue(all(Path(e["file"]).name == "subprocess.py" for e in asked), asked)
 
     def test_hooks_pass_their_git_limit(self):
         """The tests give each git call a long limit (patient_fleet.py), so that a slow git cannot change a result;
-        the hooks still ask for their own limit, HOOK_GIT_TIMEOUT (1 s), on each git call."""
+        the hooks still ask for their own limit, HOOK_GIT_TIMEOUT (1 s), on each git call. The limits come from
+        the subprocess boundary, before patient_run widens them: what the helper really passes to git."""
         self.assertIsInstance(fleet.subprocess, patient_fleet.PatientSubprocess)
         self.assertEqual(fleet.HOOK_GIT_TIMEOUT, 1)
         self.orch_setup()
         (self.repo / ".fleet").mkdir()
-        limits = []
-        real = fleet.run
-
-        def run(cmd, *args, **kwargs):
-            if cmd[0] == "git":
-                limits.append(kwargs.get("timeout"))
-            return real(cmd, *args, **kwargs)
         data, env = {"source": "startup", "cwd": str(self.repo)}, {"HERDR_PANE_ID": "w1:p1"}
-        with mock.patch.object(fleet, "run", run):
+        with patient_fleet.record_git_limits() as calls:
             self.assertEqual(fleet.orch_match(data, env), (self.project, "w1:p1"))
-            self.assertEqual(limits, [1, 1])
+            self.assertEqual([limit for _, limit in calls], [1, 1])
             self.assertIsNotNone(fleet.hook_session_event("session_start", data, env))
-        self.assertEqual(limits, [1] * 5)  # and the session record: the project twice more, then the branch
+        # And the session record: the project twice more, then the branch.
+        self.assertEqual([limit for _, limit in calls], [1] * 5)
+        self.assertEqual([args[2] for args, _ in calls], ["rev-parse", "config"] * 2 + ["rev-parse"])
+
+    def test_hooks_when_git_times_out(self):
+        """Each git call raises TimeoutExpired at the subprocess boundary, as when its 1 s limit expires: no hook
+        raises, the orch pane is not matched, nothing is recorded, and the re-brief is the one for a pane that is in
+        no panes.json."""
+        self.orch_setup()
+        d = self.repo / ".fleet"
+        d.mkdir()
+        (d / "BRIEF.md").write_text("brief")
+        (d / "STATUS.md").write_text("status")
+        data, env = {"source": "clear", "cwd": str(self.repo)}, {"HERDR_PANE_ID": "w1:p1"}
+        log = self.log_file()  # orch_setup recorded events in it
+        before = log.read_bytes()
+        with patient_fleet.record_git_limits() as calls, patient_fleet.git_times_out():
+            self.assertIsNone(fleet.orch_match(data, env))
+            self.assertIsNone(fleet.hook_session_event("session_start", data, env))
+            text = fleet.session_start_context(data, env)
+        self.assertTrue(calls)  # git was asked, and timed out each time
+        self.assertEqual(log.read_bytes(), before)
+        (self.project / "orch.json").unlink()  # with git answering, the same pane is no orch: the lane text
+        self.assertEqual(text, fleet.session_start_context(data, env))
+        self.assertIn("This worktree has fleet lane files", text)
 
 
 class FollowUpTests(unittest.TestCase):
