@@ -3709,7 +3709,6 @@ class FollowUpTests(unittest.TestCase):
         git("-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init",
             cwd=self.repo)
         self.project = fleet.project_for(str(self.repo))
-        self.clock = use_clock(self)
         self.md = self.project / "PROJECT.md"
 
     def tearDown(self):
