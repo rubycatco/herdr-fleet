@@ -110,6 +110,15 @@ def git(*args, cwd):
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
 
 
+class FleetTestCase(unittest.TestCase):
+    """Each test starts with the helper's fake clock at its start (patient_fleet.HOOK_CLOCK): a wait of an earlier
+    test (its sleeps move the clock) cannot spend the time of a hook that this test runs."""
+
+    def run(self, result=None):
+        patient_fleet.HOOK_CLOCK.reset()
+        return super().run(result)
+
+
 class Clock:
     """fleet.time for a test: the real time module, with a calendar that is fixed when the test begins and a wall
     clock that the test can stop.
@@ -119,11 +128,13 @@ class Clock:
     time in the names of handoff and inbox files stay at the second when the test began (with the real clock,
     two handoffs in one second get the same name too). time() is the real clock until the test sets `stopped` (seconds since the
     epoch); then an age that the helper computes is the same however long the test takes. monotonic() and sleep()
-    stay real, so the project lock and its deadlines work as they do."""
+    stay the harness's fake clock (patient_fleet.HOOK_CLOCK), so the project lock and its deadlines work as they do,
+    without real waiting."""
 
     def __init__(self):
         self.calendar = time.localtime()
         self.stopped = None
+        self.base = fleet.time  # patient_fleet.FAKE_TIME: its monotonic and sleep are the fake clock's
 
     def time(self):
         return time.time() if self.stopped is None else self.stopped
@@ -132,7 +143,7 @@ class Clock:
         return time.strftime(fmt, self.calendar if t is None else t)
 
     def __getattr__(self, name):
-        return getattr(time, name)
+        return getattr(self.base, name)
 
 
 def use_clock(test):
@@ -157,7 +168,7 @@ def install_stale_monitor(root, repo, lane, run_git):
         run_git(lane, "status", "--porcelain", "-z", "--untracked-files=normal")
 
 
-class AccountTests(unittest.TestCase):
+class AccountTests(FleetTestCase):
     def setUp(self):
         self.accounts = fleet.parse_remuda_list(REMUDA_LIST)
 
@@ -198,7 +209,7 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(fleet.caller_account("codex", self.accounts, env)["account"], "codex:default")
 
 
-class LaunchTests(unittest.TestCase):
+class LaunchTests(FleetTestCase):
     def setUp(self):
         self.accounts = fleet.parse_remuda_list(REMUDA_LIST)
 
@@ -335,7 +346,7 @@ class LaunchTests(unittest.TestCase):
             self.assertNotIn("task", fleet.load_panes(repo / ".fleet")["w2:p6"])
 
 
-class SpawnGateTests(unittest.TestCase):
+class SpawnGateTests(FleetTestCase):
     """spawn refuses an implementer in a lane whose PLAN.md is not approved, before it creates anything."""
 
     def setUp(self):
@@ -495,7 +506,7 @@ class SpawnGateTests(unittest.TestCase):
                          ("/src/pane", ("pane", "split", "w3:p3", "--direction"), "/src/pane"))
 
 
-class ScreenTests(unittest.TestCase):
+class ScreenTests(FleetTestCase):
     def test_claude_composer_and_sent_count(self):
         lines = fleet.clean_lines(CLAUDE_SCREEN)
         self.assertEqual(fleet.composer_line(lines, "claude"), "")
@@ -543,7 +554,7 @@ class ScreenTests(unittest.TestCase):
         self.assertEqual(fleet.auto_direction({"width": 344, "height": 60}), "right")
 
 
-class DoctorTests(unittest.TestCase):
+class DoctorTests(FleetTestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
@@ -606,7 +617,7 @@ class DoctorTests(unittest.TestCase):
         self.assertIsNone(fleet.codex_hook_trusted(str(self.home)))
 
 
-class SweepTests(unittest.TestCase):
+class SweepTests(FleetTestCase):
     def lane(self, **kw):
         f = {"exists": True, "git": True, "linked": True, "self": False, "locked": False, "branch": "fix/x",
              "default_branch": False, "head": "abc", "dirty": 0, "panes": [], "pr": None, "pr_error": None,
@@ -753,7 +764,7 @@ class SweepTests(unittest.TestCase):
             self.assertIsNone(fleet.archive_lane_files(str(Path(tmp) / "none"), "repo", "x"))
 
 
-class LaneGitTests(unittest.TestCase):
+class LaneGitTests(FleetTestCase):
     """lane_facts and the verdict on real git worktrees. gh is replaced by a stub."""
 
     def setUp(self):
@@ -987,7 +998,7 @@ class LaneGitTests(unittest.TestCase):
 
 
 
-class CleanupTests(unittest.TestCase):
+class CleanupTests(FleetTestCase):
     """clean_lane and cmd_cleanup on real git worktrees: a lane in a temporary Herdr worktrees directory. Herdr, gh
     and the agents' exit are stubs."""
 
@@ -1199,7 +1210,7 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(out["error"], "git status failed; the worktree stays")
         self.assert_lane_stays()
 
-class ProjectLogTests(unittest.TestCase):
+class ProjectLogTests(FleetTestCase):
     """Project homes, the event log, the session hooks and `fleet log`, in a temporary FLEET_HOME."""
 
     def setUp(self):
@@ -1477,7 +1488,7 @@ class ProjectLogTests(unittest.TestCase):
             fleet.parse_since("yesterday")
 
 
-class FilesTests(unittest.TestCase):
+class FilesTests(FleetTestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self.tmp.name) / "repo"
@@ -1735,7 +1746,7 @@ def chdir(path):
         os.chdir(old)
 
 
-class MarkerTests(unittest.TestCase):
+class MarkerTests(FleetTestCase):
     """Markers are lines: a marker counts at the start of a line, after list or bold marks, not in a sentence."""
 
     SENTENCE = "## Plan\n5. Verify, then add READY FOR REVIEW: round 1 and stop.\nSee `READY FOR REVIEW: round 1`.\n"
@@ -1783,7 +1794,7 @@ class MarkerTests(unittest.TestCase):
         self.assertIsNone(fleet.first_note("## Next step\nREADY FOR REVIEW: round 1\n", r"Next steps?"))
 
 
-class ApprovePlanTests(unittest.TestCase):
+class ApprovePlanTests(FleetTestCase):
     """approve-plan, the gate between a planner and the implementer: it refuses on every condition of the design,
     and then writes neither PLAN.md nor the log."""
 
@@ -2186,7 +2197,7 @@ class ApprovePlanTests(unittest.TestCase):
         self.assertEqual([e["round"] for e in self.approvals()], [1, 2])
 
 
-class PlanFilesTests(unittest.TestCase):
+class PlanFilesTests(FleetTestCase):
     """What approve-plan reads from a PLAN.md besides its rounds: the paths under ## Files, the approver of a
     round, and the categories that the plan shows."""
 
@@ -2219,7 +2230,7 @@ class PlanFilesTests(unittest.TestCase):
                                                "- Risk: deletion of old rows\n", patterns), set())
 
 
-class RiskPatternTests(unittest.TestCase):
+class RiskPatternTests(FleetTestCase):
     """The high-risk path patterns: the glob rules, the built-ins, and the PROJECT.md section."""
 
     def matches(self, pattern, path):
@@ -2295,7 +2306,7 @@ class RiskPatternTests(unittest.TestCase):
                          [("app/auth/x.py", "deletion"), ("app/a.py", "deletion")])
 
 
-class RiskLaneCase(unittest.TestCase):
+class RiskLaneCase(FleetTestCase):
     """A main checkout and a lane worktree in a scratch directory, with a temporary FLEET_HOME."""
 
     def setUp(self):
@@ -2610,7 +2621,7 @@ class RiskCommandTests(RiskLaneCase):
         self.assertEqual(fleet.status_paths(str(self.lane)).count(".fleet/RISK.md"), 0)  # .fleet/ stays out of git
 
 
-class DocsTests(unittest.TestCase):
+class DocsTests(FleetTestCase):
     """The templates and skills that the plan and research flow relies on match the code."""
 
     PLUGIN = SCRIPT.parent.parent
@@ -2718,7 +2729,7 @@ class DocsTests(unittest.TestCase):
         self.assertEqual([(i["id"], i["lane"]) for i in items], [("F1", None), ("F2", "fix/upload-retry")])
 
 
-class OrchTests(unittest.TestCase):
+class OrchTests(FleetTestCase):
     """orch, board, digest and the orch re-brief, in a temporary FLEET_HOME. herdr and gh never run."""
 
     def setUp(self):
@@ -3704,17 +3715,21 @@ class OrchTests(unittest.TestCase):
         self.assertTrue(all(Path(e["file"]).name == "subprocess.py" for e in waits), waits)
 
     def test_hook_budgets_agree_with_hooks_json(self):
-        """HOOK_BUDGET is the time that hooks.json gives each hook; the git deadline keeps a reserve inside it."""
+        """HOOK_BUDGET is the time that hooks.json gives each hook; the run's end and git deadline lie inside it."""
         hooks = json.loads((SCRIPT.parent.parent / "hooks" / "hooks.json").read_text())["hooks"]
         budgets = {name: {h["timeout"] for group in hooks[name] for h in group["hooks"]}
                    for name in ("SessionStart", "SessionEnd")}
         self.assertEqual(budgets, {"SessionStart": {fleet.HOOK_BUDGET["session-start"]},
                                    "SessionEnd": {fleet.HOOK_BUDGET["session-end"]}})
-        self.assertEqual((fleet.HOOK_BUDGET, fleet.HOOK_RESERVE),
-                         ({"session-start": 10, "session-end": 5}, {"session-start": 4, "session-end": 3}))
+        self.assertEqual((fleet.HOOK_BUDGET, fleet.HOOK_BEFORE_CLOCK, fleet.HOOK_EXIT_MARGIN, fleet.HOOK_AFTER_GIT),
+                         ({"session-start": 10, "session-end": 5}, 1.5, 0.5, {"session-start": 2, "session-end": 1}))
         self.assertEqual(patient_fleet.MIN_GIT_LIMIT, fleet.HOOK_GIT_MIN)  # a smaller git limit expires at once
-        for event in fleet.HOOK_BUDGET:  # a deadline that leaves git less than the floor would never run git
-            self.assertGreaterEqual(fleet.HOOK_BUDGET[event] - fleet.HOOK_RESERVE[event], 4 * fleet.HOOK_GIT_MIN)
+        # The run's times, from its start: the end leaves the time before the clock and the exit margin.
+        for event, end, deadline in (("session-start", 8, 6), ("session-end", 3, 2)):
+            run = fleet.HookRun(event, start=100)
+            self.assertEqual((run.end - 100, run.deadline - 100), (end, deadline), event)
+            self.assertLessEqual(run.end + fleet.HOOK_EXIT_MARGIN - 100 + fleet.HOOK_BEFORE_CLOCK,
+                                 fleet.HOOK_BUDGET[event])
 
     def test_hooks_pass_their_git_limit(self):
         """The tests give each git call a long limit (patient_fleet.py), so that a slow git cannot change a result;
@@ -3758,8 +3773,8 @@ class OrchTests(unittest.TestCase):
                 run = fleet.HookRun("session-start")
                 self.assertEqual(fleet.session_start_context(data, env, run), full, takes)
                 self.assertIsNotNone(fleet.hook_session_event("session_start", data, env, run))
-                self.assertLessEqual(clock.now - start, fleet.HOOK_BUDGET["session-start"]
-                                     - fleet.HOOK_RESERVE["session-start"])
+                self.assertLessEqual(clock.now, run.end)  # the record too
+                self.assertEqual(run.deadline - start, 6)
             self.assertEqual([limit for _, limit in calls], limits, takes)
             self.assertEqual(self.events("session_start")[-1].get("branch"), branch, takes)  # 2.5 s: no time left
 
@@ -3826,8 +3841,8 @@ class OrchTests(unittest.TestCase):
         self.assertIn("digest --project NAME` first", text)
 
     def test_git_that_answers_gives_no_note(self):
-        """git answers that the directory is in no repository, or in another project: the orch pane is then simply
-        not this project's orch (no note); only a git that fails gives the note."""
+        """git answers that the directory is in no repository (exit code 128 and no .git entry above it), or in
+        another project: the orch pane is then simply not this project's orch (no note). Through the real entry too."""
         self.orch_setup()
         plain = self.root / "plain"
         plain.mkdir()
@@ -3835,46 +3850,250 @@ class OrchTests(unittest.TestCase):
         for source in ("startup", "clear"):
             self.assertIsNone(fleet.orch_match({"source": source, "cwd": str(plain)}, env))
             self.assertIsNone(fleet.session_start_context({"source": source, "cwd": str(plain)}, env))
-        # git's own errors that are answers (exit code 128) and those that are not (a config error).
-        bin_dir, _ = self.git_wrapper('echo "fatal: not a git repository" >&2; exit 128')
-        cp, _, _ = self.hook_child("session-start", {"source": "startup", "cwd": str(self.repo)}, [bin_dir])
-        self.assertEqual((cp.returncode, cp.stdout, cp.stderr), (0, "", ""))
+        git_dir = Path(shutil.which("git")).parent
+        cp, asked, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(plain)}, [git_dir])
+        self.assertEqual((cp.returncode, cp.stdout, cp.stderr, asked), (0, "", "", [6]))
+        # GIT_DIR names a repository: git's 128 is then no answer.
+        with mock.patch.dict(os.environ, {"GIT_DIR": str(plain / "nowhere")}):
+            self.assertTrue(fleet.no_git_entry(str(self.root)) is False)
+        self.assertTrue(fleet.no_git_entry(str(plain)))
+        self.assertFalse(fleet.no_git_entry(str(self.repo / "src")))  # a parent has .git
+
+    def test_git_errors_that_are_no_answer_give_the_note(self):
+        """Through the real entry, with a registered orch pane and lane files: every failure of git that does not
+        establish "no repository" gives the note, never the lane text: a malformed .git/config, exit code 3, exit
+        code 128 inside a repository, a remote query that fails, a signal, and a git that cannot start."""
+        self.orch_setup()
+        d = self.repo / ".fleet"
+        d.mkdir()
+        (d / "BRIEF.md").write_text("brief")
+        fleet.save_panes(d, {"w1:p1": {"role": "impl"}})
+        real = shutil.which("git")
+        cases = {"exit 3": 'echo "fatal: I/O failure" >&2; exit 3',
+                 "exit 128 in a repository": 'echo "fatal: not a git repository" >&2; exit 128',
+                 "config exit 3": f'case "$*" in *config*) exit 3;; esac; exec "{real}" "$@"',
+                 "signal": "kill -TERM $$"}
+        for name, body in cases.items():
+            bin_dir, _ = self.git_wrapper(body)
+            cp, _, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(self.repo)}, [bin_dir])
+            self.assertEqual((cp.returncode, cp.stderr), (0, ""), name)
+            context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
+            self.assertIn("registered as the orchestrator of project app. git failed", context, name)
+            self.assertNotIn("Fleet lane", context, name)
+        # A git that cannot start: not executable (PermissionError), not a program (OSError).
+        for name, text, mode in (("not executable", "#!/bin/sh\nexit 0\n", 0o644), ("not a program", "junk\n", 0o755)):
+            bin_dir = self.root / name.replace(" ", "-")
+            bin_dir.mkdir()
+            (bin_dir / "git").write_text(text)
+            (bin_dir / "git").chmod(mode)
+            cp, _, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(self.repo)}, [bin_dir])
+            self.assertEqual((cp.returncode, cp.stderr), (0, ""), name)
+            self.assertIn("git failed or did not answer in time",
+                          json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"], name)
+        # A malformed configuration with the real git.
+        config = self.repo / ".git" / "config"
+        good = config.read_text()
+        config.write_text("[broken\n")
+        try:
+            cp, _, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(self.repo)},
+                                       [Path(real).parent])
+        finally:
+            config.write_text(good)
+        self.assertIn("registered as the orchestrator of project app. git failed",
+                      json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
+
+    def test_a_failure_is_not_kept_while_time_is_left(self):
+        """A remote query that fails once: the re-brief gives the note, and the session record asks git again and
+        records; a failed remote query never counts as an identity without remotes."""
+        self.orch_setup()
+        (self.repo / ".fleet").mkdir()
+        once = self.root / "failed-once"
+        real = shutil.which("git")
+        bin_dir, calls = self.git_wrapper(
+            f'case "$*" in *config*) if [ ! -e "{once}" ]; then : > "{once}"; exit 3; fi;; esac; exec "{real}" "$@"')
+        cp, asked, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(self.repo),
+                                                         "session_id": "s-7"}, [bin_dir])
+        self.assertIn("git failed", json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(asked, [6] * 5)  # identity (failed), identity again, branch
+        e = self.events("session_start")[-1]
+        self.assertEqual((e["session"], e["project"], e["branch"]), ("s-7", "app", "main"))
+        # In-process: the failure is not kept, a found identity is.
+        run = fleet.HookRun()
+        with patient_fleet.git_times_out(), self.assertRaises(fleet.HookGitFailed):
+            run.identity(str(self.repo))
+        self.assertEqual(run.identity(str(self.repo))["top"], str(self.repo))
+        with patient_fleet.git_times_out():
+            self.assertEqual(run.identity(str(self.repo))["top"], str(self.repo))  # kept: no git call
+        # Once the deadline is spent, no git starts at all.
+        spent = fleet.HookRun(start=patient_fleet.HOOK_CLOCK.now - 6)
+        with patient_fleet.record_git_limits() as limits, self.assertRaises(fleet.HookGitFailed):
+            spent.identity(str(self.repo))
+        self.assertEqual(limits, [])
+
+    def test_lane_files_from_the_confirmed_top(self):
+        """A lane session in a subdirectory, with no orch.json naming its pane: rev-parse finds the top, the remote
+        query fails. The lane re-brief still comes from the top's .fleet/; nothing is recorded (no identity)."""
+        d = self.repo / ".fleet"
+        d.mkdir()
+        (d / "BRIEF.md").write_text("brief")
+        fleet.save_panes(d, {"w1:p1": {"role": "impl"}})
+        sub = self.repo / "src"
+        sub.mkdir()
         real = shutil.which("git")
         bin_dir, _ = self.git_wrapper(f'case "$*" in *config*) exit 3;; esac; exec "{real}" "$@"')
-        cp, _, _ = self.hook_child("session-start", {"source": "startup", "cwd": str(self.repo)}, [bin_dir])
-        self.assertIn("registered as the orchestrator of project app", cp.stdout)
+        before = self.events()
+        cp, _, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(sub)}, [bin_dir])
+        context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(f"You implement this lane (pane w1:p1). Before you act, read {d / 'BRIEF.md'}", context)
+        self.assertEqual(self.events(), before)
+        # The orch match stays strict: with an orch.json naming the pane, the same failure gives the note.
+        self.orch_setup()
+        cp, _, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(sub)}, [bin_dir])
+        self.assertIn("git failed", json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
 
     def test_hook_entry_without_git_gives_the_note(self):
         """The real entry with no git on PATH: git cannot run, which is no answer; the orch pane gets the note in the
-        hook's JSON, at once, and the hook ends cleanly."""
+        hook's JSON, at once, and the hook ends cleanly. The session record asks git once more, and gives up."""
         self.orch_setup()
         cp, asked, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(self.repo)})
-        self.assertEqual((cp.returncode, cp.stderr, asked), (0, "", [6]))
+        self.assertEqual((cp.returncode, cp.stderr, asked), (0, "", [6, 6]))
         context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
         self.assertIn("this pane (w1:p1) is registered as the orchestrator of project app. git failed or did not "
                       "answer in time", context)
         cp, _, _ = self.hook_child("session-end", {"cwd": str(self.repo)})
         self.assertEqual((cp.returncode, cp.stdout, cp.stderr), (0, "", ""))
 
+    def test_slow_git_in_the_real_entry(self):
+        """The real entry in a child, with git at 2 s for each call on the fake clock: the limits shrink as git time
+        passes (the product's own clock reads it), the orch pane gets its full re-brief, and the branch call,
+        which would end after the deadline, expires at it."""
+        self.orch_setup()
+        (self.repo / ".fleet").mkdir()
+        git_dir = Path(shutil.which("git")).parent
+        payload = {"source": "compact", "cwd": str(self.repo), "session_id": "s-2"}
+        cp, asked, _ = self.hook_child("session-start", payload, [git_dir], PATIENT_GIT_TAKES="2")
+        self.assertEqual(asked, [6, 4, 2])
+        self.assertIn("you orchestrate project app (pane w1:p1)",
+                      json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(self.events("session_start")[-1]["branch"], "main")
+        cp, asked, _ = self.hook_child("session-start", payload, [git_dir], PATIENT_GIT_TAKES="2.5")
+        self.assertEqual(asked, [6, 3.5, 1])
+        self.assertNotIn("branch", self.events("session_start")[-1])
+        cp, asked, _ = self.hook_child("session-end", payload, [git_dir], PATIENT_GIT_TAKES="0.5")
+        self.assertEqual(asked, [2, 1.5, 1])
+
+    def test_the_record_waits_end_at_the_runs_end(self):
+        """A held event log, and project names whose project.json never comes: the record's waits give up at the
+        run's end time (the fake clock moves by each wait), it records nothing, and the hook still prints its
+        re-brief. Commands other than the hooks keep their 1 s for each name."""
+        import fcntl
+        self.orch_setup()
+        (self.repo / ".fleet").mkdir()
+        data, env = {"source": "clear", "cwd": str(self.repo), "session_id": "s-3"}, {"HERDR_PANE_ID": "w1:p1"}
+        log = self.log_file()
+        before = log.read_bytes()
+        fd = os.open(log, os.O_WRONLY)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            clock = patient_fleet.HOOK_CLOCK
+            for event, hook in (("session_start", "session-start"), ("session_end", "session-end")):
+                run = fleet.HookRun(hook)
+                start = clock.now
+                self.assertIsNone(fleet.hook_session_event(event, data, env, run))
+                self.assertAlmostEqual(clock.now - start, 20 * fleet.HOOK_WAIT_STEP)  # its own cap: 20 retries
+                # With less time left than that, the retries stop at the run's end.
+                run = fleet.HookRun(hook)
+                run.identity(str(self.repo))  # found while there was time
+                clock.now = run.end - 0.3  # the git deadline has passed: no branch
+                with patient_fleet.record_git_limits() as limits:
+                    self.assertIsNone(fleet.hook_session_event(event, data, env, run))
+                self.assertEqual(limits, [])
+                self.assertLessEqual(clock.now, run.end)
+                self.assertGreater(clock.now, run.end - 2 * fleet.HOOK_WAIT_STEP)  # it waited up to the end
+            # Through the real entry: the re-brief comes, the record does not, the child does not hang.
+            cp, _, waits = self.hook_child("session-start", data, [Path(shutil.which("git")).parent])
+            self.assertIn("you orchestrate project app", json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
+            self.assertTrue(any(Path(w["file"]).resolve() == SCRIPT for w in waits))  # the record's lock waits
+        finally:
+            os.close(fd)
+        self.assertEqual(log.read_bytes(), before)
+        # Occupied names: folders without project.json for the first 11 names of a new project.
+        other = self.root / "other"
+        other.mkdir()
+        git("init", "-q", "-b", "main", cwd=other)
+        git("remote", "add", "origin", "git@github.com:acme/other.git", cwd=other)
+        (other / ".fleet").mkdir()
+        names = fleet.project_names("github.com/acme/other")[:11]
+        for name in names:
+            (self.home / "projects" / name).mkdir(parents=True)
+        for event, hook in (("session_start", "session-start"), ("session_end", "session-end")):
+            patient_fleet.HOOK_CLOCK.reset()
+            run = fleet.HookRun(hook)
+            self.assertIsNone(fleet.hook_session_event(event, {"cwd": str(other)}, env, run))
+            self.assertLessEqual(patient_fleet.HOOK_CLOCK.now, run.end)
+        self.assertEqual(sorted(p.name for p in (self.home / "projects").iterdir() if not (p / "project.json").exists()),
+                         sorted(names))  # no second home was made for the keys
+        # No time left at all: nothing waits, nothing is recorded.
+        spent = fleet.HookRun("session-end", start=patient_fleet.HOOK_CLOCK.now - 3)
+        self.assertIsNone(fleet.hook_session_event("session_end", data, env, spent))
+        # A command: 1 s for each name, then the next free name.
+        patient_fleet.HOOK_CLOCK.reset()
+        home = fleet.ensure_project(["github.com/acme/other"])
+        self.assertEqual(home.name, "other-11")
+        self.assertAlmostEqual(patient_fleet.HOOK_CLOCK.now - patient_fleet.FakeClock.START, 11 * 20 * 0.05)
+
+    def test_a_held_project_lock_in_a_child_is_busy(self):
+        """In a child the fake clock moves with each sleep: a command that waits for a held project lock reports
+        busy, without real waiting and without hanging."""
+        import fcntl
+        self.orch_setup()
+        fd = os.open(self.project / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            cp = subprocess.run([*HELPER, "orch", "release"], cwd=self.repo, capture_output=True, text=True,
+                                timeout=CHILD_LIMIT, env={**os.environ, "FLEET_HOME": str(self.home),
+                                                          "HERDR_PANE_ID": "w1:p1"})
+        finally:
+            os.close(fd)
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("project app is busy", cp.stderr)
+
     def test_project_home_refusals(self):
-        """F6: the refusal tells "no repository" from "a repository without a home yet" and from a failed git."""
+        """F6: the refusal tells "no repository", "a repository but not a working tree here", "a repository without a
+        home yet" and "git failed" apart."""
         plain = self.root / "plain"
         plain.mkdir()
         fresh = self.root / "fresh"
         fresh.mkdir()
         git("init", "-q", "-b", "main", cwd=fresh)
+        bare = self.root / "bare.git"
+        bare.mkdir()
+        git("init", "-q", "--bare", cwd=bare)
+        broken = self.root / "broken"
+        broken.mkdir()
+        git("init", "-q", "-b", "main", cwd=broken)
+        (broken / ".git" / "config").write_text("[broken\n")
         args = fleet.build_parser().parse_args(["orch", "show"])
-        cases = ((plain, None, "this directory is in no git repository, so it is in no fleet project; run this in a "
-                               "checkout of the project, or pass --project NAME"),
-                 (fresh, None, f"the repository {fresh} has no fleet project home yet: `fleet orch claim` (registers "
-                               "this pane as its orchestrator) or `fleet board` creates it; or pass --project NAME"),
-                 (self.repo, patient_fleet.git_times_out, "git could not tell the project of this directory (a git "
-                                                          "call failed or timed out); try again, or pass --project NAME"))
+        no_repo = ("this directory is in no git repository, so it is in no fleet project; run this in a checkout of "
+                   "the project, or pass --project NAME")
+        no_tree = ("this directory is in a git repository but not in a working tree (a bare repository, or inside "
+                   ".git); run this in a checkout of the project, or pass --project NAME")
+        no_home = (f"the repository {fresh} has no fleet project home yet: `fleet orch claim` (registers this pane "
+                   "as its orchestrator) or `fleet board` creates it; or pass --project NAME")
+        failed = ("git could not tell the project of this directory (a git call failed or timed out); try again, or "
+                  "pass --project NAME")
+        cases = ((plain, None, no_repo), (bare, None, no_tree), (self.repo / ".git", None, no_tree),
+                 (fresh, None, no_home), (broken, None, failed), (self.repo, patient_fleet.git_times_out, failed))
         for where, scope, message in cases:
             with chdir(where), (scope() if scope else nullcontext()):
                 with self.assertRaises(fleet.FleetError) as caught:
                     fleet.project_home(args, create=False)
             self.assertEqual(str(caught.exception), message, where)
+        # Through the real entry: the same texts on stderr.
+        for where, message in ((plain, no_repo), (bare, no_tree), (fresh, no_home), (broken, failed)):
+            cp = subprocess.run([*HELPER, "orch", "show"], cwd=where, capture_output=True, text=True,
+                                timeout=CHILD_LIMIT, env={**os.environ, "FLEET_HOME": str(self.home)})
+            self.assertEqual((cp.returncode, cp.stderr), (1, f"fleet: {message}\n"), where)
         self.assertEqual(fleet.project_dirs(), [self.project])  # no refusal created a home
         with chdir(fresh):  # the command that the refusal names creates the home
             self.assertEqual(fleet.project_home(args).name, "fresh")
@@ -3882,10 +4101,10 @@ class OrchTests(unittest.TestCase):
         buf = io.StringIO()
         with chdir(plain), redirect_stdout(buf):
             self.assertEqual(fleet.main(["follow-up", "list"]), 2)
-        self.assertIn("in no git repository", json.loads(buf.getvalue())["refused"])
+        self.assertEqual(json.loads(buf.getvalue())["refused"], no_repo)
 
 
-class PatientFleetTests(unittest.TestCase):
+class PatientFleetTests(FleetTestCase):
     """The test harness's boundary (patient_fleet.py): its scopes nest, and a broken git limit expires at once."""
 
     GIT = ["git", "--version"]
@@ -3917,7 +4136,8 @@ class PatientFleetTests(unittest.TestCase):
     def test_git_takes_moves_only_the_hook_clock(self):
         clock = patient_fleet.HOOK_CLOCK
         start = clock.now
-        self.assertIs(fleet.hook_clock, clock)
+        self.assertIs(fleet.time, patient_fleet.FAKE_TIME)  # the product's own hook_clock reads it
+        self.assertEqual((fleet.HOOK_STARTED, fleet.hook_clock()), (patient_fleet.FakeClock.START, start))
         with patient_fleet.git_takes(2):
             patient_fleet.patient_run(self.GIT, capture_output=True, timeout=5)
             self.assertEqual(clock.now, start + 2)
@@ -3932,9 +4152,14 @@ class PatientFleetTests(unittest.TestCase):
         self.assertEqual((clock.now, patient_fleet._git_takes), (start, []))  # put back
         patient_fleet.patient_run(self.GIT, capture_output=True, timeout=5)
         self.assertEqual(clock.now, start)  # stands still outside the scope
+        fleet.time.sleep(0.3)  # a sleep of the helper moves it, at once
+        self.assertEqual((clock.now, fleet.hook_clock()), (start + 0.3, start + 0.3))
+        clock.reset()
+        self.assertEqual(clock.now, patient_fleet.FakeClock.START)
+        self.assertIs(time.monotonic, patient_fleet._real_monotonic)  # the tests' own clock stays real
 
 
-class FollowUpTests(unittest.TestCase):
+class FollowUpTests(FleetTestCase):
     """fleet follow-up, the cleanup close and the board's IDs, in a temporary FLEET_HOME. herdr and gh never run."""
 
     HAND = ("# Project: app\n\nThe memory.\n\n## Rules\n- Never push to main.\n\n## Follow-ups\n\n"

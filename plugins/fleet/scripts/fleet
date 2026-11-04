@@ -57,7 +57,7 @@ from datetime import datetime
 from pathlib import Path
 
 # The hooks count their git deadline from here, the first moment the script can read a clock. The start of the
-# interpreter and the compiling of this file come before it; HOOK_RESERVE covers them.
+# interpreter and the compiling of this file come before it; HOOK_BEFORE_CLOCK allows for them.
 HOOK_STARTED = time.monotonic()
 
 VERSION = "0.8.3"
@@ -1132,20 +1132,26 @@ PROJECT_FILE = "project.json"
 LOG_EVENTS = ("worktree", "spawn", "spawn_result", "send", "reset", "retire", "cleanup", "handoff",
               "session_start", "session_end", "orch_claim", "orch_release", "phase", "plan_approved", "risk_approved",
               "follow_up_added", "follow_up_taken", "follow_up_released", "follow_up_done")
-# The hooks' time. Claude Code stops a hook at its budget in hooks.json, and the hook's output is then lost (a test
-# checks that HOOK_BUDGET agrees with hooks.json). All git calls of one hook run share one deadline, HOOK_BUDGET -
-# HOOK_RESERVE seconds after HOOK_STARTED; the reserve is for what git cannot use (measured in the hook-git-deadline
-# lane, on 12 cores; the worst of each):
-# - the start of the interpreter and the compiling of this file, before HOOK_STARTED: 0.08 s idle, 1.5 s at load 190;
-# - after git: the files of the re-brief, the event record and the output: about 0.3 s at load 190;
-# - two waits that only a second fleet process can cause: ensure_project waits up to 1 s for a project.json that
-#   another process is writing, and record retries a locked log for up to 1 s.
-# That is 3.8 s; SessionStart keeps 4 s and SessionEnd 3 s (its record rarely waits on a lock: only one session ends
-# in a pane at a time). The deadlines left for git, 6 s and 2 s, are far above the three git calls of a hook: 0.06 s
-# idle, 0.34 s at most at load 234, where no single call took more than 0.23 s.
+# The hooks' time. Claude Code stops a hook at its budget in hooks.json, and the hook's output is then lost, also
+# what it printed before (a test checks that HOOK_BUDGET agrees with hooks.json). So the whole hook must end inside
+# the budget, not only git. Each hook run (HookRun) has one end time and one git deadline, both counted from
+# HOOK_STARTED, the first moment the script can read a clock:
+#   end      = HOOK_STARTED + HOOK_BUDGET - HOOK_BEFORE_CLOCK - HOOK_EXIT_MARGIN   (8 s; SessionEnd 3 s)
+#   deadline = end - HOOK_AFTER_GIT                                                 (6 s; SessionEnd 2 s)
+# All git calls of the run share the deadline. The work after git gets the rest up to the end: the files of the
+# re-brief and its output, then the session record. The record's waits (ensure_project waiting for a project.json
+# that another process is writing, over all candidate names together, and record retrying a locked event log) give
+# up at the end, and the record is skipped when no time is left: it is best effort, the output is not.
+# Measured in the hook-git-deadline lane, on 12 cores (the worst of each):
+# - before HOOK_STARTED, the start of the interpreter and the compiling of this file: 0.08 s idle, 1.5 s at load 190;
+# - the three git calls of a hook: 0.06 s idle, 0.34 s at load 234 (no single call above 0.23 s);
+# - after git, without waits: the re-brief's files, the record and the output, about 0.3 s at load 190.
 HOOK_BUDGET = {"session-start": 10, "session-end": 5}  # seconds, as hooks.json
-HOOK_RESERVE = {"session-start": 4, "session-end": 3}  # seconds of the budget that git cannot use
+HOOK_BEFORE_CLOCK = 1.5  # seconds before HOOK_STARTED: interpreter start-up and compile, measured up to 1.5 s
+HOOK_EXIT_MARGIN = 0.5  # seconds to write the last line and exit after the end
+HOOK_AFTER_GIT = {"session-start": 2, "session-end": 1}  # seconds kept after the git deadline for the rest
 HOOK_GIT_MIN = 0.25  # seconds: a hook git call that cannot get this much is not started (above the worst call seen)
+HOOK_WAIT_STEP = 0.05  # seconds of each wait in ensure_project and record
 # Types of the event fields that are not text. `fleet log` drops a field of another type, so one damaged
 # line cannot break it. Add each new field that is not text here.
 EVENT_FIELD_TYPES = {"ok": bool, "closed": bool, "removed": bool, "replace": bool, "force": bool, "by": dict,
@@ -1278,8 +1284,11 @@ def project_names(key: str) -> list[str]:
     return names + [f"{parts[-1]}-{i}" for i in range(2, 100)]
 
 
-def ensure_project(keys: list[str]) -> Path | None:
-    """The home of the project with these keys; keys[0] names a new one. The first call creates it."""
+def ensure_project(keys: list[str], until: float | None = None) -> Path | None:
+    """The home of the project with these keys; keys[0] names a new one. The first call creates it.
+
+    With `until` (a time of hook_clock), its waits for other processes, over all candidate names together, give up
+    at that time, and it returns None: a hook's end time. Without it, it waits up to 1 s for each name."""
     found = find_project(keys, learn=True)
     if found:
         return found
@@ -1297,7 +1306,9 @@ def ensure_project(keys: list[str]) -> Path | None:
                 if data:
                     known = project_keys(data)
                     break
-                time.sleep(0.05)
+                if until is not None and hook_clock() + HOOK_WAIT_STEP > until:
+                    return None  # never on to the next name: that could make a second home for these keys
+                time.sleep(HOOK_WAIT_STEP)
             if any(k in known for k in keys):
                 return d
             continue
@@ -1333,10 +1344,12 @@ def caller() -> dict:
     return {k: v for k, v in who.items() if v}
 
 
-def record(event: str, where: str | None, by: bool = True, home: Path | None = None, **fields) -> str | None:
+def record(event: str, where: str | None, by: bool = True, home: Path | None = None, until: float | None = None,
+           **fields) -> str | None:
     """Append one event to the log of the project that holds `where` (or to `home`).
 
-    Returns the log file, or None. Never raises, and gives up after about 1 s on a locked log.
+    Returns the log file, or None. Never raises, and gives up after about 1 s on a locked log, or at `until` (a time
+    of hook_clock: a hook's end time) when that comes first.
     """
     try:
         ensure_home()
@@ -1357,7 +1370,9 @@ def record(event: str, where: str | None, by: bool = True, home: Path | None = N
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     break
                 except BlockingIOError:
-                    time.sleep(0.05)
+                    if until is not None and hook_clock() + HOOK_WAIT_STEP > until:
+                        return None
+                    time.sleep(HOOK_WAIT_STEP)
             else:
                 return None
             # The time is taken under the lock, so that the order of the lines is the order of their times.
@@ -1383,69 +1398,89 @@ def hook_clock() -> float:
 
 
 class HookGitFailed(Exception):
-    """A git call of a hook gave no answer: no time was left, it timed out, git could not run, a signal ended it,
-    or its error is not an answer."""
+    """A git call of a hook gave no answer: no time was left, it timed out, git could not start or run, a signal
+    ended it, or its error does not establish an answer."""
+
+
+def no_git_entry(path: str) -> bool:
+    """True when nothing tells git where a repository is: GIT_DIR is not set, and no `.git` entry (a file or a
+    directory) exists in `path` or in any parent. Only then does git's exit code 128 mean "no repository"."""
+    if os.environ.get("GIT_DIR"):
+        return False
+    d = os.path.realpath(path)
+    while True:
+        if os.path.lexists(os.path.join(d, ".git")):
+            return False
+        parent = os.path.dirname(d)
+        if parent == d:
+            return True
+        d = parent
 
 
 class HookRun:
-    """One run of a hook: one git deadline, HOOK_BUDGET - HOOK_RESERVE seconds after `start`, shared by all its git
-    calls, and the repositories that git has described in this run. `start` is HOOK_STARTED in the hook command;
-    a hook function that is called without a run starts one now."""
+    """One run of a hook (see HOOK_BUDGET): its end time and its git deadline, both counted from `start`, and what
+    git has told it. `start` is HOOK_STARTED in the hook command; a hook function called without a run starts one
+    now."""
 
     def __init__(self, event: str = "session-start", start: float | None = None):
         start = hook_clock() if start is None else start
-        self.deadline = start + HOOK_BUDGET[event] - HOOK_RESERVE[event]
+        self.end = start + HOOK_BUDGET[event] - HOOK_BEFORE_CLOCK - HOOK_EXIT_MARGIN
+        self.deadline = self.end - HOOK_AFTER_GIT[event]
         self.identities: dict[str, dict | None] = {}
-        self.failures: dict[str, HookGitFailed] = {}
+        self.tops: dict[str, str] = {}  # the checkout top that rev-parse confirmed, also when the remote query failed
 
     def git(self, path: str, *args: str) -> subprocess.CompletedProcess:
-        """`git -C path args` with the time left as its limit. An exit code >= 0 is an answer; HookGitFailed when
-        less than HOOK_GIT_MIN is left (git does not start), on a timeout, or when git cannot run or a signal
-        ends it."""
+        """`git -C path args` with the time left until the deadline as its limit. An exit code >= 0 comes back for
+        the caller to judge; HookGitFailed when less than HOOK_GIT_MIN is left (git does not start), on a timeout,
+        when git cannot start or run, or when a signal ends it."""
         left = self.deadline - hook_clock()
         if left < HOOK_GIT_MIN:
             raise HookGitFailed(f"no time was left for git {args[0]}")
         try:
             cp = run(["git", "-C", path, *args], timeout=left)
-        except FleetError as e:
-            raise HookGitFailed(str(e))
+        except (FleetError, OSError, subprocess.SubprocessError) as e:
+            raise HookGitFailed(str(e) or type(e).__name__)
         if cp.returncode < 0:
             raise HookGitFailed(f"git {args[0]} was ended by signal {-cp.returncode}")
         return cp
 
     def identity(self, path: str) -> dict | None:
-        """repo_identity(path) within the deadline, asked once in a run: None when git answers that `path` is in no
-        repository. HookGitFailed when git does not answer, also for the remote URLs: without them the local key
-        alone could name another project. A failure is kept for the run too: the deadline is spent, or git fails
-        the same way again."""
-        if path in self.failures:
-            raise self.failures[path]
+        """repo_identity(path) within the deadline. None only when git answers that `path` is in no repository: exit
+        code 128 and no_git_entry(path). HookGitFailed for every other failure, also of the remote query: without
+        it the local key alone could name another project. A found identity is kept for the run; a failure is not,
+        so a later caller asks git again while time is left."""
         if path not in self.identities:
-            try:
-                self.identities[path] = self._identity(path)
-            except HookGitFailed as e:
-                self.failures[path] = e
-                raise
+            cp = self.git(path, "rev-parse", "--git-common-dir", "--show-toplevel")
+            lines = cp.stdout.strip().splitlines()
+            if cp.returncode == 128 and no_git_entry(path):
+                self.identities[path] = None  # git answered: no repository here
+                return None
+            if cp.returncode != 0 or len(lines) < 2:
+                raise HookGitFailed(f"git rev-parse failed with exit code {cp.returncode}")
+            self.tops[path] = lines[1]
+            remotes = self.git(path, "config", "--get-regexp", r"^remote\..*\.url$")
+            if remotes.returncode not in (0, 1):  # 1: no remote
+                raise HookGitFailed(f"git config failed with exit code {remotes.returncode}")
+            self.identities[path] = identity_from(path, lines, remotes.stdout if remotes.returncode == 0 else "")
         return self.identities[path]
 
-    def _identity(self, path: str) -> dict | None:
-        cp = self.git(path, "rev-parse", "--git-common-dir", "--show-toplevel")
-        lines = cp.stdout.strip().splitlines()
-        if cp.returncode != 0:
-            return None  # git answered: no repository here
-        if len(lines) < 2:
-            raise HookGitFailed("git rev-parse gave no top")
-        remotes = self.git(path, "config", "--get-regexp", r"^remote\..*\.url$")
-        if remotes.returncode not in (0, 1):  # 1: no remote
-            raise HookGitFailed(f"git config failed with exit code {remotes.returncode}")
-        return identity_from(path, lines, remotes.stdout if remotes.returncode == 0 else "")
+    def top(self, path: str) -> str | None:
+        """The checkout top of `path` within the deadline, for the lane files: from the identity, or from the
+        rev-parse that confirmed it when only the remote query failed. None when git gives none."""
+        try:
+            ident = self.identity(path)
+        except HookGitFailed:
+            return self.tops.get(path)
+        return ident["top"] if ident else None
 
 
 def hook_session_event(event: str, data: dict, env: dict | None = None, run: HookRun | None = None) -> str | None:
     """Record a Claude session that starts or ends in a Herdr pane, in a checkout that has .fleet/.
 
     Its git calls share the deadline of `run`, and it reuses the repository that the re-brief found in the same
-    run. Without an answer from git it records nothing; the branch is left out when no time is left for it.
+    run; after an earlier failure it asks git again while time is left. Without an answer from git it records
+    nothing; the branch is left out when no time is left for it. Its waits end at the run's end time, and it records
+    nothing when that has come: the record is best effort.
     """
     env = os.environ if env is None else env
     pane = text_or_none(env.get("HERDR_PANE_ID"))
@@ -1465,16 +1500,19 @@ def hook_session_event(event: str, data: dict, env: dict | None = None, run: Hoo
         branch = cp.stdout.strip() if cp.returncode == 0 else None
     except HookGitFailed:
         branch = None
+    if hook_clock() >= run.end:
+        return None
     try:
-        home = ensure_project(ident["keys"])
+        home = ensure_project(ident["keys"], until=run.end)
     except OSError:
+        return None
+    if not home:
         return None
     role = (load_panes(Path(top) / FLEET_DIR).get(pane) or {}).get("role")
     model = data.get("model")
     model = model.get("id") if isinstance(model, dict) else model
-    return record(event, top, by=False, home=home, pane=pane,
-                  workspace=text_or_none(env.get("HERDR_WORKSPACE_ID")), cwd=cwd,
-                  branch=branch,
+    return record(event, top, by=False, home=home, until=run.end, pane=pane,
+                  workspace=text_or_none(env.get("HERDR_WORKSPACE_ID")), cwd=cwd, branch=branch,
                   agent="claude", role=text_or_none(role), session=text_or_none(data.get("session_id")),
                   transcript=text_or_none(data.get("transcript_path")), source=text_or_none(data.get("source")),
                   reason=text_or_none(data.get("reason")), model=text_or_none(model),
@@ -3433,16 +3471,20 @@ def project_home(args: argparse.Namespace, create: bool = True) -> Path:
     d = project_for(cwd, create=create)
     if d:
         return d
-    # Why there is none: git answers that this is no repository, or that it is one without a home yet, or it fails.
-    # A short limit, as in git_toplevel: project_for may have waited for git already.
-    cp = run_git(cwd, "rev-parse", "--show-toplevel", timeout=3)
-    if cp is not None and cp.returncode > 0:
+    # Why there is none. Short limits, as in git_toplevel: project_for may have waited for git already.
+    cp = run_git(cwd, "rev-parse", "--is-inside-work-tree", timeout=3)
+    inside = cp.stdout.strip() if cp is not None and cp.returncode == 0 else None
+    if inside == "false":
+        raise FleetError("this directory is in a git repository but not in a working tree (a bare repository, or "
+                         "inside .git); run this in a checkout of the project, or pass --project NAME")
+    if cp is not None and cp.returncode == 128 and no_git_entry(cwd):
         raise FleetError("this directory is in no git repository, so it is in no fleet project; run this in a "
                          "checkout of the project, or pass --project NAME")
-    if cp is not None and cp.returncode == 0 and not create:
-        raise FleetError(f"the repository {cp.stdout.strip()} has no fleet project home yet: `fleet orch claim` "
-                         "(registers this pane as its orchestrator) or `fleet board` creates it; or pass "
-                         "--project NAME")
+    # In a working tree: "no home yet" only when git tells the whole identity (remotes too) and no home knows it.
+    ident = repo_identity(cwd, timeout=3, strict=True) if inside == "true" and not create else None
+    if ident and not find_project(ident["keys"]):
+        raise FleetError(f"the repository {ident['top']} has no fleet project home yet: `fleet orch claim` (registers "
+                         "this pane as its orchestrator) or `fleet board` creates it; or pass --project NAME")
     raise FleetError("git could not tell the project of this directory (a git call failed or timed out); try again, "
                      "or pass --project NAME")
 
@@ -4820,11 +4862,7 @@ def session_start_context(data: dict, env: dict | None = None, run: HookRun | No
     if source not in ("clear", "compact"):
         return None
     cwd = data.get("cwd") or os.getcwd()
-    try:
-        ident = run.identity(cwd) if isinstance(cwd, str) and os.path.isdir(cwd) else None
-    except HookGitFailed:
-        ident = None
-    top = ident["top"] if ident else cwd
+    top = (run.top(cwd) if isinstance(cwd, str) and os.path.isdir(cwd) else None) or cwd
     d = Path(top) / FLEET_DIR
     if not d.is_dir():
         return None

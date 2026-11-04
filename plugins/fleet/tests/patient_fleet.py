@@ -9,12 +9,16 @@ checks those. A limit below MIN_GIT_LIMIT, the product's smallest git limit (HOO
 with less time left), is broken: patient_run lets it expire at once (TimeoutExpired), as it would on any machine
 where git takes time, so the suite sees it in any git call.
 
-The hook deadline reads the helper's hook_clock(). In the tests that clock is HOOK_CLOCK, which stands still: in
-this process load() puts it in place of hook_clock and HOOK_STARTED, and in a child this file puts it in place of
-time.monotonic before the script starts. A hook therefore asks git for exactly its deadline, however long the test
-takes. Only git_takes() moves the clock: each git call then "takes" the given seconds, and expires (TimeoutExpired)
-when it asked for less, so a test can play a slow git without waiting for it. In a child, everything that reads
-time.monotonic by its attribute stands still too, also project_lock's wait (no child test takes that lock).
+The helper's clock is HOOK_CLOCK, a fake one, in this process and in a child: the product's own code (HOOK_STARTED,
+hook_clock(), project_lock, the waits of ensure_project and record) runs unchanged and reads it through
+time.monotonic and time.sleep. Its monotonic() stands still, so a hook asks git for exactly its deadline, however
+long the test takes. It moves only in two ways: git_takes() says that each git call took some seconds (a call that
+asked for less expires at its limit, TimeoutExpired), and each time.sleep of the helper moves it by the seconds asked
+and returns at once. So a slow git, a held lock and every wait of the helper end without real waiting. A sleep of
+the subprocess module (its wait loop while git runs) is a real sleep and does not move the clock. In this process
+load() gives the script a time module whose monotonic and sleep are HOOK_CLOCK's (the test's own time module stays
+real); in a child this file puts them in place of time.monotonic and time.sleep before the script starts. The clock
+goes back to its start before each test (reset(); test_fleet.FleetTestCase).
 
 test_fleet.py loads the helper with load(). A test that runs the helper in a child process runs this file, which
 runs the script as __main__ (its own `sys.exit(main())`, argument and exit handling):
@@ -23,9 +27,10 @@ A test that runs the script directly instead gets the product's own limits: use 
 test_fleet.py) unless the test is about those limits. A test of what happens when a limit expires uses
 git_times_out(), which raises subprocess.TimeoutExpired at the boundary; it never waits for a real limit.
 
-In a child, two environment variables name files that get one JSON line for each event:
+In a child, environment variables name files that get one JSON line for each event, and play a slow git:
     PATIENT_GIT_LOG    each git call: its arguments and the limit that the helper asked for (before widening);
-    PATIENT_SLEEP_LOG  each time.sleep request: the seconds and the file of the caller.
+    PATIENT_SLEEP_LOG  each time.sleep request: the seconds and the file of the caller;
+    PATIENT_GIT_TAKES  seconds: the child runs as inside git_takes(PATIENT_GIT_TAKES).
 """
 
 import importlib.machinery
@@ -39,28 +44,67 @@ import threading
 import time
 from contextlib import contextmanager
 
+# The script's other imports, loaded here with the real time module: load() lends the script its fake time module
+# while it runs the script's imports, and a module imported first then would keep the fake one.
+import argparse, concurrent.futures, datetime, fcntl, glob, shlex, shutil, textwrap, uuid  # noqa: E401,F401
+
 GIT_TEST_LIMIT = 300  # seconds
 MIN_GIT_LIMIT = 0.25  # seconds: the helper's smallest git limit, HOOK_GIT_MIN (a test checks that they agree)
 
 _real_run = subprocess.run  # taken before any patch, so that patient_run never calls itself
 _real_sleep = time.sleep
+_real_monotonic = time.monotonic
 _lock = threading.Lock()
 _records: list[list] = []  # the lists of record_git_limits() that are open, in this process
 _timing_out = [0]  # open git_times_out() scopes
 _git_takes: list[float] = []  # open git_takes() scopes: the innermost one counts
 
 
-class StoppedClock:
-    """A monotonic clock that stands still; git_takes() moves it."""
+class FakeClock:
+    """The helper's monotonic clock and sleep in the tests: it stands still, git_takes() and the helper's sleeps move
+    it, and a sleep of the subprocess module is real."""
 
-    def __init__(self, now: float = 1000.0):
-        self.now = now
+    START = 1000.0
 
-    def __call__(self) -> float:
+    def __init__(self):
+        self.now = self.START
+
+    def reset(self):
+        with _lock:
+            self.now = self.START
+
+    def monotonic(self) -> float:
         return self.now
 
+    def sleep(self, seconds) -> None:
+        caller = sys._getframe(1).f_code.co_filename
+        _note("PATIENT_SLEEP_LOG", {"seconds": seconds, "file": caller})
+        if os.path.realpath(caller) == os.path.realpath(subprocess.__file__):
+            return _real_sleep(seconds)  # subprocess waits for git in short steps: real time, not the helper's
+        with _lock:
+            self.now += max(0.0, float(seconds))
 
-HOOK_CLOCK = StoppedClock()
+
+HOOK_CLOCK = FakeClock()
+
+
+class FakeTime:
+    """The time module as load() gives it to the script: monotonic and sleep are HOOK_CLOCK's, the rest is real."""
+
+    def monotonic(self):
+        return HOOK_CLOCK.monotonic()
+
+    def sleep(self, seconds):
+        caller = sys._getframe(1).f_code.co_filename
+        _note("PATIENT_SLEEP_LOG", {"seconds": seconds, "file": caller})
+        with _lock:
+            HOOK_CLOCK.now += max(0.0, float(seconds))
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+FAKE_TIME = FakeTime()
 
 
 def _note(path_var: str, entry: dict) -> None:
@@ -138,12 +182,6 @@ def git_takes(seconds: float):
             HOOK_CLOCK.now = start
 
 
-def noting_sleep(seconds):
-    """time.sleep, which notes each request and the file of its caller in PATIENT_SLEEP_LOG."""
-    _note("PATIENT_SLEEP_LOG", {"seconds": seconds, "file": sys._getframe(1).f_code.co_filename})
-    return _real_sleep(seconds)
-
-
 class PatientSubprocess:
     """The subprocess module, whose run is patient_run."""
 
@@ -154,23 +192,29 @@ class PatientSubprocess:
 
 
 def load(script):
-    """The helper at `script` as a module named fleet_cli, whose git calls go through patient_run and whose hook
-    deadline reads HOOK_CLOCK."""
+    """The helper at `script` as a module named fleet_cli, whose git calls go through patient_run and whose time
+    module is FAKE_TIME, from its first line on: its own HOOK_STARTED and hook_clock() read HOOK_CLOCK."""
     loader = importlib.machinery.SourceFileLoader("fleet_cli", str(script))
     spec = importlib.util.spec_from_loader("fleet_cli", loader)
     module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
+    real_time = sys.modules["time"]
+    sys.modules["time"] = FAKE_TIME  # the script's `import time` binds it
+    try:
+        loader.exec_module(module)
+    finally:
+        sys.modules["time"] = real_time
     module.subprocess = PatientSubprocess()
-    module.hook_clock = HOOK_CLOCK
-    module.HOOK_STARTED = HOOK_CLOCK.now
     return module
 
 
 if __name__ == "__main__":
     script = sys.argv[1]
     subprocess.run = patient_run  # in place: the script's `import subprocess` binds this module
-    time.monotonic = HOOK_CLOCK  # in place, before the script reads HOOK_STARTED (subprocess keeps its own clock)
-    if os.environ.get("PATIENT_SLEEP_LOG"):
-        time.sleep = noting_sleep
+    # In place, before the script reads HOOK_STARTED. subprocess and threading keep their own monotonic (bound when
+    # they were imported); subprocess's sleeps stay real (FakeClock.sleep).
+    time.monotonic = HOOK_CLOCK.monotonic
+    time.sleep = HOOK_CLOCK.sleep
+    if os.environ.get("PATIENT_GIT_TAKES"):
+        _git_takes.append(float(os.environ["PATIENT_GIT_TAKES"]))
     sys.argv = [script, *sys.argv[2:]]
     runpy.run_path(script, run_name="__main__")  # the script's own `sys.exit(main())` ends the process
