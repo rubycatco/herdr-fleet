@@ -2810,7 +2810,7 @@ class OrchTests(FleetTestCase):
         code, out = self.main("orch", "claim", pane="w1:p1", CLAUDE_CODE_SESSION_ID="sess-orch-1")
         res = json.loads(out)
         self.assertEqual((code, res["ok"], res["previous"], res["project_md_created"]), (0, True, None, True))
-        rec = fleet.read_json(self.project / "orch.json")
+        rec = fleet.read_orchs(self.project)["default"]
         self.assertEqual((rec["pane"], rec["workspace"], rec["session"], rec["checkout"]),
                          ("w1:p1", "w1", "sess-orch-1", str(self.repo)))
         self.assertIn("claimed_at", rec)
@@ -2824,7 +2824,7 @@ class OrchTests(FleetTestCase):
         for argv in (("orch", "claim"), ("orch", "claim", "--replace"), ("orch", "claim", "--pane", "w2:p1")):
             code, out = self.main(*argv, pane="w2:p1")
             self.assertEqual((code, json.loads(out)["ok"]), (2, False), argv)
-            self.assertEqual(fleet.read_json(self.project / "orch.json")["pane"], "w1:p1")
+            self.assertEqual(fleet.read_orchs(self.project)["default"]["pane"], "w1:p1")
         self.assertIn("--replace works only from that pane",
                       json.loads(self.main("orch", "claim", "--replace", pane="w2:p1")[1])["refused"])
         # The registered pane hands over to a successor; the session is not the caller's.
@@ -2832,7 +2832,7 @@ class OrchTests(FleetTestCase):
             code, out = self.main("orch", "claim", "--pane", "w3:p1", "--replace", pane="w1:p1",
                                   CLAUDE_CODE_SESSION_ID="sess-orch-1")
         self.assertEqual((code, json.loads(out)["previous"]), (0, "w1:p1"))
-        rec = fleet.read_json(self.project / "orch.json")
+        rec = fleet.read_orchs(self.project)["default"]
         self.assertEqual((rec["pane"], rec["workspace"], rec.get("session")), ("w3:p1", "w3", None))
         self.assertEqual((self.project / "PROJECT.md").read_text(), "# mine\n")  # never overwritten
         # A dead registered pane never blocks.
@@ -2853,8 +2853,240 @@ class OrchTests(FleetTestCase):
         self.assertIn("no orch", json.loads(self.main("orch", "release", pane="w4:p1")[1])["note"])
         # The new events read well in the log.
         text = self.main("log")[1]
-        self.assertIn("orch pane w1:p1 -> w3:p1 (replace)", text)
-        self.assertIn("released orch pane w4:p1 (force)", text)
+        self.assertIn("orch default pane w1:p1 -> w3:p1 (replace)", text)
+        self.assertIn("released orch default pane w4:p1 (force)", text)
+        self.assertEqual({e["orch"] for e in self.events() if e["event"].startswith("orch_")}, {"default"})
+
+    # several orchs ------------------------------------------------------
+
+    def legacy_bytes(self, rec):
+        """orch.json as 0.8.3 writes it: one record, write_json's format, no `format` key."""
+        return (json.dumps(rec, indent=2, ensure_ascii=False) + "\n").encode()
+
+    def digest_and_board(self, pane, *argv):
+        with mock.patch.object(fleet, "collect_lanes", return_value=([], [], [])), \
+                mock.patch.object(fleet.shutil, "which", return_value="/usr/bin/herdr"):
+            self.assertEqual(self.main("digest", *argv, pane=pane)[0], 0)
+            self.assertEqual(self.main("board", *argv, pane=pane)[0], 0)
+
+    def test_a_single_orch_keeps_the_legacy_files(self):
+        """A project with one orch, `default`, keeps 0.8.3's orch.json, digest.json and board.json: the legacy shape
+        and the root files, after a claim, a re-claim, a consuming digest and a board; no orchs/ folder."""
+        orch = self.project / "orch.json"
+        self.main("orch", "claim", pane="w1:p1", CLAUDE_CODE_SESSION_ID="sess-1")
+        rec = json.loads(orch.read_text())
+        self.assertEqual(set(rec), {"pane", "workspace", "checkout", "session", "claimed_at"})
+        self.assertEqual(orch.read_bytes(), self.legacy_bytes(rec))
+        self.assertEqual(fleet.read_orchs(self.project), {"default": rec})
+        self.main("orch", "claim", pane="w1:p1", CLAUDE_CODE_SESSION_ID="sess-2")  # a re-claim
+        rec = json.loads(orch.read_text())
+        self.assertEqual((rec["session"], orch.read_bytes()), ("sess-2", self.legacy_bytes(rec)))
+        self.digest_and_board("w1:p1")
+        self.assertEqual(orch.read_bytes(), self.legacy_bytes(rec))
+        for name in ("digest.json", "board.json"):
+            self.assertTrue((self.project / name).is_file(), name)
+        self.assertFalse((self.project / "orchs").exists())
+        self.assertEqual(fleet.orch_files(self.project, "default")["digest"], self.project / "digest.json")
+        self.assertIsNone(fleet.orch_files(self.project, "default")["orch_md"])
+        # A legacy file written by 0.8.3 reads as `default`, and `show` names it.
+        self.alive.add("w1:p1")
+        self.assertIn("orch        default: pane w1:p1 (this pane), alive", self.main("orch", "show", pane="w1:p1")[1])
+        # A release of the only orch removes the file, as before.
+        self.assertEqual(self.main("orch", "release", pane="w1:p1")[0], 0)
+        self.assertFalse(orch.exists())
+
+    def test_the_switch_to_format_2(self):
+        """The claim of a second name switches orch.json to format 2 once: the root digest.json and board.json move
+        into orchs/default/, and each orch gets its ORCH.md. A release never switches back."""
+        self.main("orch", "claim", pane="w1:p1", CLAUDE_CODE_SESSION_ID="sess-1")
+        self.digest_and_board("w1:p1")
+        digest, board = ((self.project / n).read_bytes() for n in ("digest.json", "board.json"))
+        self.alive.add("w1:p1")
+        code, out = self.main("orch", "claim", "--name", "billing", pane="w2:p1", CLAUDE_CODE_SESSION_ID="sess-2")
+        res = json.loads(out)
+        self.assertEqual((code, res["name"], res["format_switched"], res["previous"]), (0, "billing", True, None))
+        self.assertEqual(res["board"], str(self.project / "orchs" / "billing" / "board.json"))
+        self.assertEqual(res["orch_md"], str(self.project / "orchs" / "billing" / "ORCH.md"))
+        data = fleet.read_json(self.project / "orch.json")
+        self.assertEqual((data["format"], sorted(data["orchs"])), (2, ["billing", "default"]))
+        self.assertEqual((data["orchs"]["billing"]["pane"], data["orchs"]["default"]["session"]), ("w2:p1", "sess-1"))
+        self.assertFalse((self.project / "digest.json").exists())
+        self.assertFalse((self.project / "board.json").exists())
+        self.assertEqual((self.project / "orchs" / "default" / "digest.json").read_bytes(), digest)
+        self.assertEqual((self.project / "orchs" / "default" / "board.json").read_bytes(), board)
+        for name in ("default", "billing"):
+            md = (self.project / "orchs" / name / "ORCH.md").read_text()
+            self.assertTrue(md.startswith(f"# Orch: {name} (project app)\n"), md)
+            self.assertEqual(fleet.section_text(md, "Decisions") + fleet.section_text(md, "Notes"), [])
+        self.assertFalse((self.project / "orchs" / "billing" / "digest.json").exists())  # a new orch starts fresh
+        self.assertEqual(self.events("orch_claim")[-1].get("switched"), True)
+        self.assertIn("orch billing pane - -> w2:p1; orch.json now holds several orchs (format 2)", self.main("log")[1])
+        # With two orchs, a bare claim of a third pane refuses and lists them; --name NEW opens a theme.
+        self.alive.add("w2:p1")
+        code, out = self.main("orch", "claim", pane="w3:p1")
+        res = json.loads(out)
+        self.assertEqual((code, res["orchs"]), (2, {"billing": "w2:p1", "default": "w1:p1"}))
+        self.assertIn("has 2 orchs (billing, default); `fleet orch claim --name NEW` opens a theme", res["refused"])
+        # A pane that holds one orch cannot claim another name in the same project.
+        code, out = self.main("orch", "claim", "--name", "docs", pane="w2:p1")
+        self.assertEqual(code, 2)
+        self.assertIn("pane w2:p1 is already orch billing of project app", json.loads(out)["refused"])
+        # A live orch of the name refuses another pane, as one orch did before.
+        code, out = self.main("orch", "claim", "--name", "billing", pane="w3:p1")
+        self.assertIn("pane w2:p1 is orch billing of project app and is alive", json.loads(out)["refused"])
+        # A re-claim from the holder refreshes the session and the checkout; the other record stays.
+        lane = self.add_lane("x")
+        with chdir(lane):
+            with self.env("w2:p1", CLAUDE_CODE_SESSION_ID="sess-3"), redirect_stdout(io.StringIO()):
+                self.assertEqual(fleet.main(["orch", "claim"]), 0)
+        orchs = fleet.read_orchs(self.project)
+        self.assertEqual((orchs["billing"]["session"], orchs["billing"]["checkout"]), ("sess-3", str(lane)))
+        self.assertEqual(orchs["default"]["session"], "sess-1")
+        # --replace from the holder hands the name to the new pane and clears the session.
+        with mock.patch.object(fleet, "pane_info", return_value={"workspace_id": "w4"}):
+            code, out = self.main("orch", "claim", "--pane", "w4:p1", "--replace", pane="w2:p1",
+                                  CLAUDE_CODE_SESSION_ID="sess-3")
+        self.assertEqual((code, json.loads(out)["name"]), (0, "billing"))
+        rec = fleet.read_orchs(self.project)["billing"]
+        self.assertEqual((rec["pane"], rec.get("session")), ("w4:p1", None))
+        # A release never switches back: one orch left, then none, and the file stays in format 2.
+        self.assertEqual(self.main("orch", "release", pane="w4:p1")[0], 0)
+        self.assertEqual(fleet.read_json(self.project / "orch.json")["format"], 2)
+        self.assertEqual(sorted(fleet.read_orchs(self.project)), ["default"])
+        self.assertEqual(self.main("orch", "release", pane="w1:p1")[0], 0)
+        self.assertEqual(fleet.read_json(self.project / "orch.json"), {"format": 2, "orchs": {}})
+        self.assertTrue((self.project / "orchs" / "billing" / "ORCH.md").exists())  # its history stays
+        # A claim of `default` again keeps format 2 and the folder's files.
+        self.main("orch", "claim", pane="w1:p1")
+        self.assertEqual(fleet.orch_files(self.project, "default")["digest"],
+                         self.project / "orchs" / "default" / "digest.json")
+        self.assertTrue(fleet.orch_files(self.project, "default")["digest"].exists())
+
+    def test_a_first_claim_of_another_name_starts_in_format_2(self):
+        """A project with no orch that claims a name other than `default` starts in format 2; its root files (a
+        digest made with no orch) become that orch's."""
+        self.digest_and_board(None)
+        digest = (self.project / "digest.json").read_bytes()
+        code, out = self.main("orch", "claim", "--name", "billing", pane="w1:p1")
+        self.assertEqual((code, json.loads(out)["format_switched"]), (0, True))
+        self.assertEqual(sorted(fleet.read_json(self.project / "orch.json")["orchs"]), ["billing"])
+        self.assertEqual((self.project / "orchs" / "billing" / "digest.json").read_bytes(), digest)
+        self.assertTrue((self.project / "orchs" / "billing" / "ORCH.md").exists())
+        self.assertFalse((self.project / "orchs" / "default").exists())
+
+    def test_orch_names_and_unknown_formats(self):
+        for bad in ("-x", ".x", "a/b", "x" * 41, "", "a b", "é"):
+            with self.assertRaises(fleet.FleetError, msg=bad):
+                fleet.check_orch_name(bad)
+        self.assertEqual(fleet.check_orch_name("x" * 40), "x" * 40)
+        with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+            self.assertEqual(self.main("orch", "claim", "--name", "a/b", pane="w1:p1")[0], 1)
+        self.assertIn("not an orch name: 'a/b'", err.getvalue())
+        self.assertFalse((self.project / "orch.json").exists())
+        # A format that this helper does not know: no writer replaces the file.
+        fleet.write_json(self.project / "orch.json", {"format": 3, "orchs": {}})
+        with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+            self.assertEqual(self.main("orch", "claim", pane="w1:p1")[0], 1)
+        self.assertIn("has format 3, which this helper does not know", err.getvalue())
+        self.assertEqual(fleet.read_json(self.project / "orch.json"), {"format": 3, "orchs": {}})
+        # A format 2 record with a bad name, or that is no object, is skipped.
+        fleet.write_json(self.project / "orch.json", {"format": 2, "orchs": {"../x": {"pane": "w1:p1"},
+                                                                             "ok": "w2:p1", "good": {"pane": "w3:p1"}}})
+        self.assertEqual(fleet.read_orchs(self.project), {"good": {"pane": "w3:p1"}})
+
+    def test_show_list_and_release_with_several_orchs(self):
+        self.main("orch", "claim", pane="w1:p1", CLAUDE_CODE_SESSION_ID="aaaaaaaa-1")
+        self.main("orch", "claim", "--name", "billing", pane="w2:p1")
+        self.alive.add("w1:p1")
+        self.unknown.add("w2:p1")
+        data = json.loads(self.main("orch", "show", "--json", pane="w2:p1")[1])
+        self.assertEqual((data["name"], data["orch"]["pane"], data["alive"], data["self"], data["format"]),
+                         ("billing", "w2:p1", None, True, 2))
+        self.assertEqual(data["orchs"], [{"name": "billing", "pane": "w2:p1", "alive": None, "self": True},
+                                         {"name": "default", "pane": "w1:p1", "alive": True, "self": False}])
+        text = self.main("orch", "show", pane="w2:p1")[1]
+        self.assertIn("orch        billing: pane w2:p1 (this pane), alive or not: herdr cannot tell", text)
+        self.assertIn("other orchs default: pane w1:p1, alive", text)
+        self.assertIn(f"ORCH.md     {self.project / 'orchs' / 'billing' / 'ORCH.md'}", text)
+        # A caller that is neither orch: show names none and lists both; --orch picks one.
+        text = self.main("orch", "show", pane="w9:p9")[1]
+        self.assertIn("orch        none of the 2 orchs is this pane's: pass --orch NAME", text)
+        self.assertIn("other orchs billing: pane w2:p1", text)
+        self.assertEqual(json.loads(self.main("orch", "show", "--orch", "default", "--json")[1])["name"], "default")
+        with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+            self.assertEqual(self.main("orch", "show", "--orch", "nope")[0], 1)
+        self.assertIn("no orch 'nope' in project app; its orchs: billing, default", err.getvalue())
+        # list: every orch, its pane's state and its cached board.
+        fleet.save_board(self.project / "orchs" / "default", [{"lane": "a", "phase": "idle"},
+                                                              {"lane": "b", "phase": "removed"}], fleet.precise_now())
+        rows = json.loads(self.main("orch", "list", "--json")[1])["orchs"]
+        self.assertEqual([(r["name"], r["pane"], r["state"], r["lanes"]) for r in rows],
+                         [("billing", "w2:p1", "unknown", None), ("default", "w1:p1", "alive", 1)])
+        self.assertEqual(rows[1]["session"], "aaaaaaaa-1")
+        text = self.main("orch", "list", pane="w1:p1")[1]
+        self.assertIn("project app: 2 orchs", text)
+        self.assertRegex(text, r"default\s+w1:p1 \(this pane\)\s+alive\s+aaaaaaaa\s+\S+\s+\S+ \S+\s+1 lane, \d+s old")
+        self.assertRegex(text, r"billing\s+w2:p1\s+unknown\s+-\s+.*none yet")
+        # release: the caller's own; another one only with --force; a caller with none names it.
+        code, out = self.main("orch", "release", pane="w9:p9")
+        self.assertEqual(code, 2)
+        self.assertIn("name the orch: --orch NAME", json.loads(out)["refused"])
+        code, out = self.main("orch", "release", "--orch", "default", pane="w2:p1")
+        self.assertIn("pane w1:p1 is orch default of project app, not this pane; --force", json.loads(out)["refused"])
+        self.assertEqual(self.main("orch", "release", "--orch", "default", "--force", pane="w2:p1")[0], 0)
+        self.assertEqual(sorted(fleet.read_orchs(self.project)), ["billing"])
+        self.assertEqual(self.events("orch_release")[-1]["orch"], "default")
+        self.assertIn("released orch default pane w1:p1 (force)", self.main("log")[1])
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(self.main("orch", "release", "a", "b")[0], 1)  # names belong to rename only
+
+    def test_rename(self):
+        """rename moves the record, the orch's folder (a legacy file switches to format 2 first, its root files into
+        the new folder) and the lane.json of each lane of the project that names the old name."""
+        self.main("orch", "claim", pane="w1:p1")
+        self.digest_and_board("w1:p1")
+        digest = (self.project / "digest.json").read_bytes()
+        mine, theirs, unowned = self.add_lane("a"), self.add_lane("b"), self.add_lane("c")
+        fleet.write_json(mine / ".fleet" / "lane.json", {"orch": "default", "project": "app", "branch": "feat/a"})
+        fleet.write_json(theirs / ".fleet" / "lane.json", {"orch": "docs", "project": "app"})
+        stubs = [{"workspace": f"w{i}", "label": None, "path": str(p), "panes": []}
+                 for i, p in enumerate((mine, theirs, unowned), start=5)]
+
+        def rename(*argv, pane="w1:p1"):
+            with mock.patch.object(fleet, "enumerate_lanes", return_value=([dict(s) for s in stubs], [])), \
+                    mock.patch.object(fleet.shutil, "which", return_value="/usr/bin/herdr"):
+                code, out = self.main("orch", "rename", *argv, pane=pane)
+            return code, (json.loads(out) if out.strip() else None)
+        code, res = rename("default", "billing")
+        self.assertEqual((code, res["name"], res["old"], res["format_switched"], res["lanes"]),
+                         (0, "billing", "default", True, [str(mine)]))
+        self.assertEqual(sorted(fleet.read_json(self.project / "orch.json")["orchs"]), ["billing"])
+        self.assertEqual((self.project / "orchs" / "billing" / "digest.json").read_bytes(), digest)
+        self.assertFalse((self.project / "digest.json").exists())
+        self.assertTrue((self.project / "orchs" / "billing" / "ORCH.md").exists())
+        self.assertEqual(fleet.read_json(mine / ".fleet" / "lane.json"),
+                         {"orch": "billing", "project": "app", "branch": "feat/a"})
+        self.assertEqual(fleet.read_json(theirs / ".fleet" / "lane.json")["orch"], "docs")
+        self.assertFalse((unowned / ".fleet" / "lane.json").exists())
+        self.assertIn("renamed orch default to billing; 1 lane moved with it; orch.json now holds several orchs",
+                      self.main("log")[1])
+        # In format 2: the folder moves.
+        code, res = rename("billing", "money")
+        self.assertEqual((code, res["format_switched"]), (0, False))
+        self.assertTrue((self.project / "orchs" / "money" / "digest.json").exists())
+        self.assertFalse((self.project / "orchs" / "billing").exists())
+        self.assertEqual(fleet.read_json(mine / ".fleet" / "lane.json")["orch"], "money")
+        # Refusals change nothing: an unknown or existing name, a folder left by a released orch, a bad name.
+        self.main("orch", "claim", "--name", "docs", pane="w2:p1")
+        before = (self.project / "orch.json").read_bytes()
+        self.assertIn("no orch 'nope'", rename("nope", "x")[1]["refused"])
+        self.assertIn("already has an orch 'docs'", rename("money", "docs")[1]["refused"])
+        (self.project / "orchs" / "old").mkdir()
+        self.assertIn("orchs/old exists", rename("money", "old")[1]["refused"])
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(rename("money", "a/b")[0], 1)
+            self.assertEqual(rename("money")[0], 1)
+        self.assertEqual((self.project / "orch.json").read_bytes(), before)
 
     def test_claim_needs_a_pane_and_a_project(self):
         with self.assertRaises(fleet.FleetError):

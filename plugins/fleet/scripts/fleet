@@ -1131,7 +1131,7 @@ PROJECTS_DIR = "projects"
 EVENTS_DIR = "events"
 PROJECT_FILE = "project.json"
 LOG_EVENTS = ("worktree", "spawn", "spawn_result", "send", "reset", "retire", "cleanup", "handoff",
-              "session_start", "session_end", "orch_claim", "orch_release", "phase", "plan_approved", "risk_approved",
+              "session_start", "session_end", "orch_claim", "orch_release", "orch_rename", "adopt", "phase", "plan_approved", "risk_approved",
               "follow_up_added", "follow_up_taken", "follow_up_released", "follow_up_done")
 # The hooks' time. Claude Code stops a hook at its budget in hooks.json, and the hook's output is then lost, also
 # what it printed before (a test checks that HOOK_BUDGET agrees with hooks.json). So the whole hook must end inside
@@ -1157,7 +1157,7 @@ HOOK_WAIT_STEP = 0.05  # seconds of each wait in ensure_project and record
 # line cannot break it. Add each new field that is not text here.
 EVENT_FIELD_TYPES = {"ok": bool, "closed": bool, "removed": bool, "replace": bool, "force": bool, "by": dict,
                      "exited": list, "reasons": list, "round": int, "files": int, "high_risk": list, "matches": list,
-                     "follow_ups_closed": list, "follow_ups_released": list}
+                     "follow_ups_closed": list, "follow_ups_released": list, "switched": bool, "lanes": list}
 DICT_LIST_FIELDS = ("exited", "high_risk", "matches")  # lists of objects with text fields; other lists hold text
 
 
@@ -1686,9 +1686,18 @@ def describe_event(e: dict) -> str:
     elif kind == "handoff":
         text = f"handoff file {short_path(e.get('path') or '')}"
     elif kind == "orch_claim":
-        text = f"orch pane {e.get('old') or '-'} -> {e.get('pane') or '-'}" + (" (replace)" if e.get("replace") else "")
+        text = (f"orch {e['orch'] + ' ' if e.get('orch') else ''}pane {e.get('old') or '-'} -> {e.get('pane') or '-'}"
+                + (" (replace)" if e.get("replace") else "") + ("; orch.json now holds several orchs (format 2)"
+                                                                if e.get("switched") else ""))
     elif kind == "orch_release":
-        text = f"released orch pane {e.get('pane') or '-'}" + (" (force)" if e.get("force") else "")
+        text = (f"released orch {e['orch'] + ' ' if e.get('orch') else ''}pane {e.get('pane') or '-'}"
+                + (" (force)" if e.get("force") else ""))
+    elif kind == "orch_rename":
+        text = (f"renamed orch {e.get('old') or '?'} to {e.get('orch') or '?'}"
+                + (f"; {plural(len(e['lanes']), 'lane')} moved with it" if e.get("lanes") else "")
+                + ("; orch.json now holds several orchs (format 2)" if e.get("switched") else ""))
+    elif kind == "adopt":
+        text = (f"{short_path(e.get('lane') or '')}: orch {e.get('old') or 'none'} -> {e.get('orch') or '?'}")
     elif kind == "plan_approved":
         text = f"plan round {e.get('round', '?')} approved by {e.get('approved_by') or '?'}, risk {e.get('risk') or '?'}"
         text += f"; high-risk paths: {event_matches(e.get('high_risk'))}" if e.get("high_risk") else ""
@@ -2282,13 +2291,10 @@ def match_target(target: str, stubs: list[dict]) -> dict | None:
     return next((s for s in stubs if os.path.realpath(s["path"]) == path), None)
 
 
-def collect_lanes(targets: list[str] | None = None, pr_lookup=None,
-                  select=None) -> tuple[list[dict], list[dict], list[str]]:
-    """(lanes with their verdicts, other worktrees, targets that name no lane). Only `targets`, when given.
-
-    `select` (a stub -> bool) keeps only some lanes before their facts are read, so that `board` looks up the
-    pull requests of its own project only.
-    """
+def lane_stubs() -> tuple[list[dict], list[dict]]:
+    """(lane stubs, other worktrees): herdr's worktree workspaces and the checkouts in its worktrees directory, then
+    each linked worktree with a .fleet/ folder that the `git worktree list` of a clone shows. Each stub has its
+    repo_paths and `locked`. Runs herdr and git, never gh."""
     stubs, checkouts = enumerate_lanes()
     for s in stubs:
         s.update(repo_paths(s["path"]))
@@ -2312,6 +2318,17 @@ def collect_lanes(targets: list[str] | None = None, pr_lookup=None,
             else:
                 others.append({"repo": os.path.basename(root), "path": e["path"], "branch": e["branch"],
                                "kind": other_kind(e["path"]), "prunable": e["prunable"]})
+    return stubs, others
+
+
+def collect_lanes(targets: list[str] | None = None, pr_lookup=None,
+                  select=None) -> tuple[list[dict], list[dict], list[str]]:
+    """(lanes with their verdicts, other worktrees, targets that name no lane). Only `targets`, when given.
+
+    `select` (a stub -> bool) keeps only some lanes before their facts are read, so that `board` looks up the
+    pull requests of its own project only.
+    """
+    stubs, others = lane_stubs()
     missing: list[str] = []
     if targets is not None:
         chosen: list[dict] = []
@@ -2528,18 +2545,30 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 # orchestrator: orch, board, digest
 #
-# One orchestrator (orch) per project, known by its Herdr pane in <home>/orch.json. The helper derives the
-# lane table (`board`) and what changed since the orch last looked (`digest`); the orch writes only
-# decisions, follow-ups and rules, in <home>/PROJECT.md. board.json caches the newest board for the
-# SessionStart re-brief and never consumes a change. digest.json holds the digest's baseline: its cursor (a
-# time), the byte offset that it read each monthly log up to, and the phase of each lane; only digest moves
-# it. <home>/.lock serializes claim, release, a digest that consumes, board.json writes and follow-up writes.
-# --peek and the SessionStart hook never take it.
+# A project has orchestrators (orchs), one for each theme, each known by its name and its Herdr pane in
+# <home>/orch.json. The helper derives the lane table (`board`) and what changed since an orch last looked
+# (`digest`); the orchs write only decisions, follow-ups and rules: in <home>/PROJECT.md what the whole project
+# shares, in <home>/orchs/<name>/ORCH.md the decisions and notes of one theme. board.json caches an orch's newest
+# board for the SessionStart re-brief and never consumes a change. digest.json holds an orch's digest baseline: its
+# cursor (a time), the byte offset that it read each monthly log up to, and the phase of each lane; only digest
+# moves it. <home>/.lock serializes claim, release, rename, adopt, a digest that consumes, board.json writes and
+# follow-up writes. --peek and the SessionStart hook never take it.
+#
+# orch.json has two shapes. The legacy one (0.8.x), one record with its `pane` at the top level, stays while the
+# only orch of the project is `default`: that record is the orch `default`, and the root digest.json and board.json
+# are its files. Format 2, {"format": 2, "orchs": {<name>: record}}, begins at the first claim of another name or
+# at a rename (the root files then move into orchs/<name>/), and the file never goes back. read_orchs and
+# write_orchs are the only way in and out; orch_files names an orch's files for either shape.
 
 ORCH_FILE = "orch.json"
 BOARD_FILE = "board.json"
 DIGEST_FILE = "digest.json"
 PROJECT_MD = "PROJECT.md"
+ORCHS_DIR = "orchs"
+ORCH_MD = "ORCH.md"
+DEFAULT_ORCH = "default"
+ORCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}")  # also a folder name under orchs/
+LANE_FILE = "lane.json"  # <lane>/.fleet/lane.json: the orch that owns the lane, by name
 LOCK_FILE = ".lock"
 LOCK_WAIT = 30  # seconds to wait for the project lock
 DIGEST_EVENTS_MAX = 30
@@ -2564,6 +2593,18 @@ what nothing else knows. Keep each entry to one line.
 - none
 
 ## High-risk paths
+- none
+"""
+ORCH_TEMPLATE = """\
+# Orch: {name} (project {project})
+
+The memory of orch {name}: the decisions and notes of its theme. The rules, the high-risk paths, the follow-ups
+and what concerns the whole project stay in PROJECT.md. Keep each entry to one line.
+
+## Decisions
+- none
+
+## Notes
 - none
 """
 REVIEW_REQUEST_FILE = re.compile(r"^REVIEW-REQUEST-(\d+)\.md$")
@@ -3592,9 +3633,107 @@ def fleet_md_warnings(home: Path, pane: str) -> list[str]:
     return warnings
 
 
-def orch_out(home: Path) -> dict:
-    return {"project": home.name, "home": str(home), "project_md": str(home / PROJECT_MD),
-            "board": str(home / BOARD_FILE)}
+def orch_registry(home: Path) -> tuple[dict[str, dict], bool]:
+    """(the orchs of the project by name, whether orch.json is in format 2). The legacy shape (one record with its
+    pane at the top level, as 0.8.x writes it) reads as the orch `default`; no file, or one that cannot be read,
+    holds none. A format that this helper does not know raises: no writer may then replace the file."""
+    data = read_json(home / ORCH_FILE)
+    if "format" in data:
+        if data.get("format") != 2:
+            raise FleetError(f"{home / ORCH_FILE} has format {data.get('format')!r}, which this helper does not know; "
+                             "upgrade the fleet plugin")
+        orchs = as_dict(data.get("orchs"))
+        return {k: v for k, v in orchs.items()
+                if isinstance(k, str) and ORCH_NAME.fullmatch(k) and isinstance(v, dict)}, True
+    return ({DEFAULT_ORCH: data} if data else {}), False
+
+
+def read_orchs(home: Path) -> dict[str, dict]:
+    """The orchs of the project by name, from either shape of orch.json."""
+    return orch_registry(home)[0]
+
+
+def write_orchs(home: Path, orchs: dict[str, dict], root_owner: str | None = None) -> bool:
+    """Write the project's orchs; the caller holds the project lock. While the file is legacy (or absent) and the
+    only orch is `default`, the legacy shape (no orch: no file), as 0.8.x writes it. Otherwise format 2, and the file
+    never goes back. The switch to format 2 moves the root digest.json and board.json into orchs/<root_owner>/ (the
+    orch whose files they were: `default`, or the first orch of a project that had none) before it writes, so a
+    crash between the two leaves files that a retry finds. Every orch of a format 2 file gets its ORCH.md. Returns
+    whether this write switched the format."""
+    _, is2 = orch_registry(home)
+    if not is2 and set(orchs) <= {DEFAULT_ORCH}:
+        if orchs:
+            write_json(home / ORCH_FILE, orchs[DEFAULT_ORCH])
+        else:
+            (home / ORCH_FILE).unlink(missing_ok=True)
+        return False
+    if not is2 and root_owner:
+        dest = home / ORCHS_DIR / root_owner
+        dest.mkdir(parents=True, exist_ok=True)
+        for name in (DIGEST_FILE, BOARD_FILE):
+            if (home / name).exists() and not (dest / name).exists():
+                os.replace(home / name, dest / name)
+    write_json(home / ORCH_FILE, {"format": 2, "orchs": orchs})
+    for name in orchs:
+        ensure_orch_md(home, name)
+    return not is2
+
+
+def ensure_orch_md(home: Path, name: str) -> bool:
+    """Create orchs/<name>/ORCH.md from the template when it is missing; never overwrite it. Returns whether it did."""
+    path = home / ORCHS_DIR / name / ORCH_MD
+    if path.exists():
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(ORCH_TEMPLATE.format(name=name, project=home.name))
+    return True
+
+
+def orch_files(home: Path, name: str | None, is2: bool | None = None) -> dict:
+    """The files of orch `name`: in format 2 its folder orchs/<name>/ with its digest.json, board.json and ORCH.md;
+    in the legacy shape, and for no orch, the root digest.json and board.json, and no ORCH.md."""
+    is2 = orch_registry(home)[1] if is2 is None else is2
+    own = bool(is2 and name)
+    d = home / ORCHS_DIR / name if own else home
+    return {"dir": d, "digest": d / DIGEST_FILE, "board": d / BOARD_FILE, "orch_md": d / ORCH_MD if own else None}
+
+
+def check_orch_name(name: str) -> str:
+    if not isinstance(name, str) or not ORCH_NAME.fullmatch(name):
+        raise FleetError(f"not an orch name: {name!r}; use letters, digits, '.', '_' and '-' (at most 40, the first a "
+                         "letter or a digit)")
+    return name
+
+
+def current_orch(home: Path, name: str | None = None,
+                 orchs: dict[str, dict] | None = None) -> tuple[str | None, dict | None]:
+    """The orch that a command acts for: `name` (--orch) when given, which must exist; else the orch whose pane is
+    the caller's (HERDR_PANE_ID); else, when the project has exactly one orch, that one; else (None, None)."""
+    orchs = read_orchs(home) if orchs is None else orchs
+    if name:
+        if name not in orchs:
+            raise FleetError(f"no orch {name!r} in project {home.name}; its orchs: {', '.join(sorted(orchs)) or 'none'}")
+        return name, orchs[name]
+    me = os.environ.get("HERDR_PANE_ID") or None
+    mine = next((n for n, r in orchs.items() if me and r.get("pane") == me), None)
+    if mine:
+        return mine, orchs[mine]
+    if len(orchs) == 1:
+        only = next(iter(orchs))
+        return only, orchs[only]
+    return None, None
+
+
+def orch_title(home: Path, name: str) -> str:
+    return f"orch {name} of project {home.name}"
+
+
+def orch_out(home: Path, name: str | None = None, is2: bool | None = None) -> dict:
+    files = orch_files(home, name, is2)
+    out = {"project": home.name, "home": str(home), "project_md": str(home / PROJECT_MD), "board": str(files["board"])}
+    if files["orch_md"]:
+        out["orch_md"] = str(files["orch_md"])
+    return out
 
 
 def refuse(**fields) -> int:
@@ -3602,29 +3741,92 @@ def refuse(**fields) -> int:
     return 2
 
 
+ALIVE_WORDS = {"alive": "alive", "dead": "not alive", "unknown": "alive or not: herdr cannot tell"}
+
+
+def orch_rows(home: Path, orchs: dict[str, dict], is2: bool, states: dict[str, str]) -> list[dict]:
+    """One row for each orch, by name: its record's fields, its pane's state and its cached board."""
+    me = os.environ.get("HERDR_PANE_ID") or None
+    rows = []
+    for name, rec in sorted(orchs.items()):
+        board = read_json(orch_files(home, name, is2)["board"])
+        lanes = [r for r in board.get("lanes") if isinstance(r, dict)] if isinstance(board.get("lanes"), list) else []
+        state = states[name]
+        rows.append({"name": name, "pane": rec.get("pane"), "state": state,
+                     "alive": {"alive": True, "dead": False}.get(state), "self": bool(me and rec.get("pane") == me),
+                     "session": rec.get("session"), "checkout": rec.get("checkout"),
+                     "claimed_at": rec.get("claimed_at"), "board_made": board.get("made"),
+                     "lanes": sum(1 for r in lanes if r.get("phase") != "removed") if board.get("made") else None})
+    return rows
+
+
+def project_lane_stubs(home: Path) -> list[dict]:
+    """The lane stubs of the project at `home` (lane_stubs with the project filter): herdr and git, no gh."""
+    select = lane_selector(home)
+    return [s for s in lane_stubs()[0] if select(s)]
+
+
 def cmd_orch(args: argparse.Namespace) -> int:
     action = args.action or "show"
     me = os.environ.get("HERDR_PANE_ID") or None
-    if action == "show":
+    if args.names and action != "rename":
+        raise FleetError(f"orch {action} takes no names; `fleet orch rename OLD NEW` renames, and --orch NAME names "
+                         "the orch of show and release")
+    if action in ("show", "list"):
         home = project_home(args, create=False)
-        rec = read_json(home / ORCH_FILE) or None
-        state = pane_state(rec.get("pane")) if rec else None
+        orchs, is2 = orch_registry(home)
+        states = {n: pane_state(r.get("pane")) for n, r in orchs.items()}
+        rows = orch_rows(home, orchs, is2, states)
+        if action == "list":
+            if args.json:
+                print(json.dumps({"project": home.name, "format": 2 if is2 else 1, "orchs": rows}, indent=2,
+                                 ensure_ascii=False))
+                return 0
+            if not rows:
+                print(f"project {home.name}: no orch registered: `fleet orch claim` registers the calling pane")
+                return 0
+            table = [["NAME", "PANE", "STATE", "SESSION", "CHECKOUT", "CLAIMED", "BOARD"]]
+            for r in rows:
+                made = r["board_made"]
+                board = (f"{plural(r['lanes'], 'lane')}, {age_text(time.time() - event_time({'ts': made}))} old"
+                         if made else "none yet")
+                table.append([r["name"], (r["pane"] or "-") + (" (this pane)" if r["self"] else ""),
+                              {"dead": "not alive", "unknown": "unknown"}.get(r["state"], r["state"]),
+                              short_id(r["session"]), short_path(r["checkout"] or "-"),
+                              clock({"ts": r["claimed_at"]}) if r["claimed_at"] else "-", board])
+            print(f"project {home.name}: {plural(len(rows), 'orch')}")
+            widths = [max(len(row[i]) for row in table) for i in range(len(table[0]) - 1)]
+            for row in table:
+                print("  ".join([c.ljust(widths[i]) for i, c in enumerate(row[:-1])] + [row[-1]]).rstrip())
+            return 0
+        name, rec = current_orch(home, args.orch, orchs)
+        state = states.get(name) if rec else None
         alive = {"alive": True, "dead": False}.get(state) if state else None
-        out = {**orch_out(home), "orch": rec, "alive": alive, "self": bool(rec and me and rec.get("pane") == me)}
-        board = read_json(home / BOARD_FILE)
+        out = {**orch_out(home, name, is2), "name": name, "orch": rec, "alive": alive,
+               "self": bool(rec and me and rec.get("pane") == me), "format": 2 if is2 else 1,
+               "orchs": [{k: r[k] for k in ("name", "pane", "alive", "self")} for r in rows]}
+        board = read_json(orch_files(home, name, is2)["board"])
         out["board_made"] = board.get("made")
         if args.json:
             print(json.dumps(out, indent=2, ensure_ascii=False))
             return 0
         print(f"project     {home.name}  {short_path(str(home))}")
         if rec:
-            words = {"alive": "alive", "dead": "not alive", "unknown": "alive or not: herdr cannot tell"}[state]
-            print(f"orch        pane {rec.get('pane')}" + (" (this pane)" if out["self"] else "") + f", {words}")
+            print(f"orch        {name}: pane {rec.get('pane')}" + (" (this pane)" if out["self"] else "")
+                  + f", {ALIVE_WORDS[state]}")
             print(f"            claimed {rec.get('claimed_at') or '-'}, workspace {rec.get('workspace') or '-'}, "
                   f"session {short_id(rec.get('session'))}, checkout {short_path(rec.get('checkout') or '-')}")
+        elif orchs:
+            print(f"orch        none of the {len(orchs)} orchs is this pane's: pass --orch NAME")
         else:
             print("orch        none registered: `fleet orch claim` registers the calling pane")
+        others = [r for r in rows if r["name"] != name]
+        for i, r in enumerate(others):
+            print(("other orchs " if i == 0 else " " * 12) + f"{r['name']}: pane {r['pane'] or '-'}"
+                  + (" (this pane)" if r["self"] else "") + f", {ALIVE_WORDS[r['state']]}")
         print(f"PROJECT.md  {short_path(out['project_md'])}" + ("" if Path(out["project_md"]).is_file() else "  (missing)"))
+        if out.get("orch_md"):
+            print(f"ORCH.md     {short_path(out['orch_md'])}" + ("" if Path(out["orch_md"]).is_file() else "  (missing)"))
         made = board.get("made")
         age = age_text(time.time() - event_time({"ts": made})) + " old" if made else "none yet"
         print(f"board.json  {short_path(out['board'])}  ({age})")
@@ -3634,6 +3836,8 @@ def cmd_orch(args: argparse.Namespace) -> int:
         pane = args.pane or me
         if not pane:
             raise FleetError("no pane to register: pass --pane P or run inside Herdr")
+        if args.name:
+            check_orch_name(args.name)
         # Slow lookups first; the check and the write run under the lock.
         warnings = fleet_md_warnings(home, pane)
         workspace = os.environ.get("HERDR_WORKSPACE_ID") if pane == me else None
@@ -3643,53 +3847,115 @@ def cmd_orch(args: argparse.Namespace) -> int:
             except (FleetError, KeyError, TypeError, AttributeError):
                 workspace = None
         with project_lock(home):
-            current = read_json(home / ORCH_FILE)
+            orchs, is2 = orch_registry(home)
+            held = next((n for n, r in orchs.items() if r.get("pane") == pane), None)
+            mine = next((n for n, r in orchs.items() if me and r.get("pane") == me), None)
+            if args.name:
+                name = args.name
+            elif args.replace and mine:
+                name = mine  # a handoff from the caller's orch
+            elif held:
+                name = held  # a re-claim
+            elif not orchs:
+                name = DEFAULT_ORCH
+            elif len(orchs) == 1:
+                name = next(iter(orchs))  # the rules below decide, as with one orch before
+            else:
+                return refuse(orchs={n: r.get("pane") for n, r in sorted(orchs.items())},
+                              refused=f"project {home.name} has {len(orchs)} orchs ({', '.join(sorted(orchs))}); "
+                                      "`fleet orch claim --name NEW` opens a theme, `--name NAME` takes an orch whose "
+                                      "pane is dead")
+            if held and held != name:
+                return refuse(orch=orchs[held], refused=f"pane {pane} is already {orch_title(home, held)}; a pane is "
+                                                        "the orch of one theme: `fleet orch release` first, or "
+                                                        f"`fleet orch rename {held} {name}`")
+            current = orchs.get(name, {})
             old = current.get("pane") if isinstance(current.get("pane"), str) else None
             handoff = bool(args.replace and me and me == old)
+            title = orch_title(home, name)
             if old and old != pane and not handoff:
                 if args.replace:
-                    return refuse(orch=current, refused=f"pane {old} is the orch of project {home.name}; --replace "
-                                                         "works only from that pane")
+                    return refuse(orch=current, refused=f"pane {old} is {title}; --replace works only from that "
+                                                        "pane")
                 state = pane_state(old)
                 if state == "alive":
-                    return refuse(orch=current, refused=f"pane {old} is the orch of project {home.name} and is "
-                                                         "alive; from that pane, `fleet orch claim --pane <new pane> "
-                                                         "--replace` hands it over")
+                    return refuse(orch=current, refused=f"pane {old} is {title} and is alive; from that pane, "
+                                                        "`fleet orch claim --pane <new pane> --replace` hands it over")
                 if state == "unknown" and not args.force:
-                    return refuse(orch=current, refused=f"pane {old} is the orch of project {home.name}, and herdr "
-                                                         "cannot tell whether it is alive; check that pane, then "
-                                                         "`fleet orch claim --force` takes over")
+                    return refuse(orch=current, refused=f"pane {old} is {title}, and herdr cannot tell whether it is "
+                                                        "alive; check that pane, then `fleet orch claim --force` "
+                                                        "takes over")
             rec = {"pane": pane, "workspace": workspace, "checkout": git_toplevel(os.getcwd()) or os.getcwd(),
                    "session": os.environ.get("CLAUDE_CODE_SESSION_ID") if pane == me else None,
                    "claimed_at": now_iso()}
             rec = {k: v for k, v in rec.items() if v}
-            write_json(home / ORCH_FILE, rec)
+            root_owner = DEFAULT_ORCH if DEFAULT_ORCH in orchs else name
+            switched = write_orchs(home, {**orchs, name: rec}, root_owner)
             project_md = home / PROJECT_MD
             created = not project_md.exists()
             if created:
                 project_md.write_text(PROJECT_TEMPLATE.format(name=home.name))
-            record("orch_claim", None, home=home, pane=pane, old=old, workspace=rec.get("workspace"),
+            record("orch_claim", None, home=home, orch=name, pane=pane, old=old, workspace=rec.get("workspace"),
                    checkout=rec.get("checkout"), replace=True if args.replace else None,
-                   force=True if args.force else None)
-        print(json.dumps({"ok": True, **orch_out(home), "orch": rec, "previous": old, "project_md_created": created,
-                          "warnings": warnings}, indent=2, ensure_ascii=False))
+                   force=True if args.force else None, switched=True if switched else None)
+        print(json.dumps({"ok": True, **orch_out(home, name), "name": name, "orch": rec, "previous": old,
+                          "project_md_created": created, "format_switched": switched, "warnings": warnings},
+                         indent=2, ensure_ascii=False))
+        return 0
+    if action == "rename":
+        if len(args.names) != 2:
+            raise FleetError("orch rename takes two names: OLD NEW")
+        old_name, new_name = (check_orch_name(n) for n in args.names)
+        home = project_home(args, create=False)
+        if old_name not in read_orchs(home):
+            return refuse(refused=f"no orch {old_name!r} in project {home.name}")
+        require_herdr()
+        stubs = project_lane_stubs(home)  # herdr and git, before the lock
+        with project_lock(home):
+            orchs, is2 = orch_registry(home)
+            if old_name not in orchs:
+                return refuse(refused=f"no orch {old_name!r} in project {home.name}")
+            if new_name in orchs:
+                return refuse(refused=f"project {home.name} already has an orch {new_name!r}")
+            folder = home / ORCHS_DIR / new_name
+            if folder.exists():
+                return refuse(refused=f"{folder} exists (the files of an orch that was released); pick another name")
+            if is2 and (home / ORCHS_DIR / old_name).exists():
+                os.replace(home / ORCHS_DIR / old_name, folder)
+            renamed = {(new_name if n == old_name else n): r for n, r in orchs.items()}
+            switched = write_orchs(home, renamed, root_owner=new_name)
+            lanes = []
+            for s in stubs:
+                path = Path(s["path"]) / FLEET_DIR / LANE_FILE
+                owner = read_json(path)
+                if owner.get("orch") == old_name:
+                    write_json(path, {**owner, "orch": new_name})
+                    lanes.append(s["path"])
+            record("orch_rename", None, home=home, orch=new_name, old=old_name, pane=orchs[old_name].get("pane"),
+                   lanes=lanes, switched=True if switched else None)
+        print(json.dumps({"ok": True, **orch_out(home, new_name), "name": new_name, "old": old_name,
+                          "format_switched": switched, "lanes": lanes}, indent=2, ensure_ascii=False))
         return 0
     home = project_home(args, create=False)
     with project_lock(home):
-        current = read_json(home / ORCH_FILE)
-        if not current:
+        orchs, is2 = orch_registry(home)
+        if not orchs:
             print(json.dumps({"ok": True, "changed": "nothing", "note": f"project {home.name} has no orch"},
                              indent=2))
             return 0
+        name, current = current_orch(home, args.orch, orchs)
+        if name is None:
+            return refuse(orchs={n: r.get("pane") for n, r in sorted(orchs.items())},
+                          refused=f"project {home.name} has {len(orchs)} orchs and this pane is none of them: name "
+                                  "the orch: --orch NAME")
         if current.get("pane") != me and not args.force:
-            return refuse(orch=current, refused=f"pane {current.get('pane')} is the orch, not this pane; --force "
-                                                "releases it")
-        try:
-            (home / ORCH_FILE).unlink()
-        except FileNotFoundError:
-            pass
-        record("orch_release", None, home=home, pane=current.get("pane"), force=True if args.force else None)
-    print(json.dumps({"ok": True, "project": home.name, "released": current}, indent=2, ensure_ascii=False))
+            return refuse(orch=current, refused=f"pane {current.get('pane')} is {orch_title(home, name)}, not this "
+                                                "pane; --force releases it")
+        write_orchs(home, {n: r for n, r in orchs.items() if n != name})
+        record("orch_release", None, home=home, orch=name, pane=current.get("pane"),
+               force=True if args.force else None)
+    print(json.dumps({"ok": True, "project": home.name, "name": name, "released": current}, indent=2,
+                     ensure_ascii=False))
     return 0
 
 
@@ -3869,7 +4135,7 @@ def orch_candidates(env) -> tuple[str | None, list[Path]]:
     homes = []
     for p in sorted((fleet_home() / PROJECTS_DIR).glob(f"*/{ORCH_FILE}")):
         try:
-            if read_json(p).get("pane") == pane:
+            if any(r.get("pane") == pane for r in read_orchs(p.parent).values()):
                 homes.append(p.parent)
         except Exception:
             continue
@@ -5231,18 +5497,25 @@ def build_parser() -> argparse.ArgumentParser:
     lg.add_argument("--json", action="store_true")
     lg.set_defaults(func=cmd_log)
 
-    o = sub.add_parser("orch", help="the project's orchestrator pane: show, claim or release it",
-                       description="show (the default) prints the orch record of the project and whether its pane "
-                                   "is alive. claim registers a pane as the orch; release removes the record.")
-    o.add_argument("action", nargs="?", choices=("show", "claim", "release"), default="show")
+    o = sub.add_parser("orch", help="the project's orchestrators: show, list, claim, rename or release one",
+                       description="A project has one orch for each theme, each with a name ('default' for the "
+                                   "first). show (the default) prints the caller's orch (the one whose pane is the "
+                                   "caller's, else the only one) and the others; list prints them all. claim "
+                                   "registers a pane as an orch: --name NEW opens a theme; rename OLD NEW renames one "
+                                   "and its lanes; release removes the caller's record.")
+    o.add_argument("action", nargs="?", choices=("show", "list", "claim", "rename", "release"), default="show")
+    o.add_argument("names", nargs="*", metavar="NAME", help="rename: OLD NEW")
     o.add_argument("--project", help="a project name (default: the project of this directory)")
+    o.add_argument("--name", help="claim: the orch's name (default: the caller's own orch, else 'default' in a "
+                                  "project with none, else the only orch)")
+    o.add_argument("--orch", help="show, release: the orch by name (default: the caller's)")
     o.add_argument("--pane", help="claim: the pane to register (default: the calling pane)")
     o.add_argument("--replace", action="store_true",
                    help="claim: hand the orch over from the registered pane, which must be the caller")
     o.add_argument("--force", action="store_true",
                    help="claim: take over when herdr cannot tell whether the registered pane is alive; "
                         "release: remove the record of another pane")
-    o.add_argument("--json", action="store_true", help="show: print JSON")
+    o.add_argument("--json", action="store_true", help="show, list: print JSON")
     o.set_defaults(func=cmd_orch)
 
     b = sub.add_parser("board", help="one row per lane of this project: phase, pull request, panes, newest event",
