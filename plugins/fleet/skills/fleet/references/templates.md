@@ -216,7 +216,7 @@ what nothing else knows. Keep each entry to one line.
 - <date> <decision and reason; who decided>
 
 ## Follow-ups
-- <work left for later: a finding below the blocking level, a lane to open, an issue to file>
+- <work left for later, one item each, as `fleet follow-up add` writes it: "[F1] text (from source)">
 
 ## Notes
 - <anything else the next orchestrator session needs>
@@ -226,6 +226,16 @@ what nothing else knows. Keep each entry to one line.
 ```
 
 An empty section, `-`, `none` and `- none` count as empty.
+
+`## Follow-ups` holds one list item per follow-up, `- [F1] <text>`, which `fleet follow-up` manages:
+
+```markdown
+## Follow-ups
+- [F1] Add a CHANGELOG entry for 0.8.0. (from feat/a REVIEW-2.md)
+- [F2] Retry the flaky upload test. (lane: fix/upload-retry)
+```
+
+Only the helper writes the `[F<n>]` IDs and the ` (lane: <branch>)` marks: `add` writes the ID (and ` (from <source>)` with `--source`), `take` the lane mark, `release` removes the mark, and `done` removes the line, whose event keeps its text. An ID is never used twice, also after `done` removed it. A line that the orchestrator writes by hand, without an ID, still counts: the next `follow-up` command gives it the next ID. Indented lines under an item belong to it. The helper changes only the lines that it must and keeps the rest of the file as it is; `- none` goes with the first item and comes back when the last one goes. `fleet cleanup` closes the follow-ups of a merged lane that it removes.
 
 `## High-risk paths` has one pattern per line: `- <category>: <pattern>`, with a category of `migration`, `auth-payments`, `deletion` or `hotfix`. Patterns match paths relative to the top of the repository, case-sensitive. `*` and `?` stay inside one directory, `**` crosses directories, and `[...]` is a character class. A pattern without a `/` matches at any depth (`*.sql`); a pattern that ends in `/` matches everything under that directory (`app/auth/`), and a pattern that names a directory matches everything under it too. A leading `/` anchors a pattern at the top. The built-in patterns always apply: `**/migrations/**`, `**/migration/**`, `**/migrate/**` and `**/alembic/**` (category `migration`). Put the project's own files and folders here, such as `db/schema.rb`, `*.sql` or `db/cache_migrate/`. There is no way to turn a built-in off: a false match costs one yes from the user. A line of another form, an unknown category or a pattern that does not compile makes `approve-plan` refuse for both approvers, and the board and `fleet risk` say that the diff cannot be told, until the line is fixed.
 

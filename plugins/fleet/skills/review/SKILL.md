@@ -64,4 +64,10 @@ Read each review file yourself. For each finding, decide: fix, decline with a re
 
 ## 5. Stop
 
-Enforce the stop rule from the conventions. Once it applies, a finding below the blocking level becomes a follow-up in PROJECT.md (or an issue, if the user wants one), not another round. Each declined finding that the user may want later is a follow-up too. Retire critic panes you no longer need: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" retire <critic pane> --close`.
+Enforce the stop rule from the conventions. Once it applies, a finding below the blocking level becomes a follow-up in PROJECT.md (or an issue, if the user wants one), not another round. Each declined finding that the user may want later is a follow-up too. Add each one with the lane and the review file as its source:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" follow-up add "<the finding in one line>" --source "<branch> REVIEW-<n>.md"
+```
+
+It prints the follow-up's ID; a later lane takes it with `/fleet:lane --from <ID>`. Retire critic panes you no longer need: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" retire <critic pane> --close`.

@@ -1,7 +1,7 @@
 ---
 name: lane
 description: Open a fleet lane for a task — a worktree and branch, a written brief, and an implementer agent in its own Herdr pane (on the right remuda account when remuda is installed) — then watch it until it is ready for review. Use when the user asks to open, start or dispatch a lane, or to put an agent on a task in parallel.
-argument-hint: "<task, issue or plan> [branch] [account]"
+argument-hint: "<task, issue or plan> | --from <ID> [branch] [account]"
 allowed-tools:
   - Read
   - Write
@@ -17,14 +17,15 @@ allowed-tools:
 
 # Open a lane
 
-The task comes from the arguments. If there are none, ask the user what the lane should do.
+The task comes from the arguments. If there are none, ask the user what the lane should do. With `--from <ID>` (for example `--from F7`), the task is a follow-up of the project's PROJECT.md.
 
 ## 1. Prepare
 
 1. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" conventions`. Use its implementer, critic, planning and account rules.
-2. Learn enough to write the brief: read the issue, plan or code that the task names. Settle the scope with the user when the goal is unclear or another lane could touch the same files.
-3. Names: a short lane label (for example `fix-login-redirect`) and a branch (the project's naming, else the label). Base: the remote default branch after `git fetch`, unless the user names one.
-4. Account: in remuda mode, choose by the conventions. When the rules depend on usage, run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" accounts`. In plain mode there is no account.
+2. With `--from <ID>`: run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" follow-up list --json` and find the ID. Its `text` (and `detail`, when present) is the task. When it has a `lane`, another lane holds it: ask the user whether to open a second lane for it, wait for that lane, or release it first (`follow-up release <ID>`, only after the user's yes). An unknown ID: tell the user and stop.
+3. Learn enough to write the brief: read the issue, plan or code that the task names. Settle the scope with the user when the goal is unclear or another lane could touch the same files.
+4. Names: a short lane label (for example `fix-login-redirect`) and a branch (the project's naming, else the label). Base: the remote default branch after `git fetch`, unless the user names one.
+5. Account: in remuda mode, choose by the conventions. When the rules depend on usage, run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" accounts`. In plain mode there is no account.
 
 ## 2. Create the worktree
 
@@ -34,6 +35,14 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" worktree <branch> --base <base> --
 
 It returns `pane_id` (a shell pane in a new workspace), `cwd` (the worktree) and `fleet_dir`.
 
+With `--from <ID>`, link the follow-up to the lane right away:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" follow-up take <ID> --lane <branch>
+```
+
+Exit code 2 with `held_by` means that another lane took it since step 1: ask the user. From now on the board shows the ID on the lane, and `fleet cleanup` closes the follow-up when it removes the merged lane.
+
 ## 3. Write the brief
 
 Write `<cwd>/.fleet/BRIEF.md` from the BRIEF template in `${CLAUDE_PLUGIN_ROOT}/skills/fleet/references/templates.md`:
@@ -42,6 +51,7 @@ Write `<cwd>/.fleet/BRIEF.md` from the BRIEF template in `${CLAUDE_PLUGIN_ROOT}/
 - Link to sources instead of copying them. Name exact files and commands. Keep it under about 80 lines.
 - Give the lane the goal and the design points, not a step list. The lane writes its own plan into STATUS.md, or a planner writes PLAN.md (step 4b).
 - Link to research files in the project home instead of copying them.
+- With `--from <ID>`: quote the ID and its text under Sources (`- Follow-up F7 in PROJECT.md: "<text>"`).
 
 ### Triage: research or plan first?
 
@@ -92,7 +102,7 @@ The board shows `planning`, `plan ready <n>` and `plan approved <n>` for the lan
 
 ## 5. Record and watch
 
-1. Nothing to write down for the lane itself: `fleet board` finds it, and the event log holds the spawn with its agent, account, model and prompt. Write a decision or a follow-up from step 1 to the project's PROJECT.md (`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" orch show` prints its path). An orchestrator that still keeps the old `.fleet/FLEET.md` adds the lane there.
+1. Nothing to write down for the lane itself: `fleet board` finds it, and the event log holds the spawn with its agent, account, model and prompt. A lane opened `--from <ID>` is already linked: `follow-up take` marked it, and the board shows the ID. Write a decision from step 1 to the project's PROJECT.md (`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" orch show` prints its path); add a follow-up with `follow-up add "<text>" --source "<where>"`. An orchestrator that still keeps the old `.fleet/FLEET.md` adds the lane there.
 2. Start a watcher with the Bash tool and `run_in_background: true`:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" watch <pane_id> --marker "READY FOR REVIEW: round 1"

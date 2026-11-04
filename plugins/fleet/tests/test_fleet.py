@@ -2177,6 +2177,33 @@ class DocsTests(unittest.TestCase):
         self.assertIn("high-risk pattern", (self.PLUGIN / "defaults" / "conventions.md").read_text())
 
 
+    def test_docs_name_the_follow_up_commands(self):
+        skills = self.PLUGIN / "skills"
+        for name in ("fleet", "lane", "review", "cleanup", "context", "handoff"):
+            self.assertIn("follow-up", (skills / name / "SKILL.md").read_text(), name)
+        lane = (skills / "lane" / "SKILL.md").read_text()
+        self.assertIn("--from <ID>", lane.split("\n---\n", 1)[0])  # the argument hint
+        for text in ("follow-up list --json", "follow-up take <ID> --lane <branch>", "held_by"):
+            self.assertIn(text, lane)
+        self.assertIn('follow-up add "<the finding in one line>" --source "<branch> REVIEW-<n>.md"',
+                      (skills / "review" / "SKILL.md").read_text())
+        self.assertIn("follow_ups_closed", (skills / "cleanup" / "SKILL.md").read_text())
+        templates = (skills / "fleet" / "references" / "templates.md").read_text()
+        readme = (self.PLUGIN.parent.parent / "README.md").read_text()
+        for doc in (templates, readme):
+            self.assertIn("[F1]" if doc is templates else "[F7]", doc)
+            self.assertIn("(lane: ", doc)
+        for kind in fleet.FOLLOW_UP_EVENTS:
+            self.assertIn(f"`{kind}`", readme)
+        self.assertIn("/fleet:lane --from", readme)
+        # The template's Follow-ups section is empty, and its example parses as the helper writes it.
+        doc = fleet.parse_follow_ups(self.template("PROJECT.md"))
+        self.assertEqual((doc["items"], len(doc["placeholders"]), doc["other_lines"]), ([], 1, 0))
+        example = templates.split("`## Follow-ups` holds one list item", 1)[1].split("```markdown\n", 1)[1]
+        items = fleet.parse_follow_ups(example.split("\n```", 1)[0])["items"]
+        self.assertEqual([(i["id"], i["lane"]) for i in items], [("F1", None), ("F2", "fix/upload-retry")])
+
+
 class OrchTests(unittest.TestCase):
     """orch, board, digest and the orch re-brief, in a temporary FLEET_HOME. herdr and gh never run."""
 
