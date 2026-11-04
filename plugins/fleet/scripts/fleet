@@ -56,7 +56,11 @@ from contextlib import ExitStack, contextmanager
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.8.2"
+# The hooks count their git deadline from here, the first moment the script can read a clock. The start of the
+# interpreter and the compiling of this file come before it; HOOK_RESERVE covers them.
+HOOK_STARTED = time.monotonic()
+
+VERSION = "0.8.3"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 FLEET_DIR = ".fleet"
 LANE_FILES = ("BRIEF.md", "STATUS.md", "HANDOFF.md", "PLAN.md")
@@ -1128,7 +1132,20 @@ PROJECT_FILE = "project.json"
 LOG_EVENTS = ("worktree", "spawn", "spawn_result", "send", "reset", "retire", "cleanup", "handoff",
               "session_start", "session_end", "orch_claim", "orch_release", "phase", "plan_approved", "risk_approved",
               "follow_up_added", "follow_up_taken", "follow_up_released", "follow_up_done")
-HOOK_GIT_TIMEOUT = 1  # seconds for each git call in a hook; SessionEnd has 5 s in all, SessionStart 10 s
+# The hooks' time. Claude Code stops a hook at its budget in hooks.json, and the hook's output is then lost (a test
+# checks that HOOK_BUDGET agrees with hooks.json). All git calls of one hook run share one deadline, HOOK_BUDGET -
+# HOOK_RESERVE seconds after HOOK_STARTED; the reserve is for what git cannot use (measured in the hook-git-deadline
+# lane, on 12 cores; the worst of each):
+# - the start of the interpreter and the compiling of this file, before HOOK_STARTED: 0.08 s idle, 1.5 s at load 190;
+# - after git: the files of the re-brief, the event record and the output: about 0.3 s at load 190;
+# - two waits that only a second fleet process can cause: ensure_project waits up to 1 s for a project.json that
+#   another process is writing, and record retries a locked log for up to 1 s.
+# That is 3.8 s; SessionStart keeps 4 s and SessionEnd 3 s (its record rarely waits on a lock: only one session ends
+# in a pane at a time). The deadlines left for git, 6 s and 2 s, are far above the three git calls of a hook: 0.06 s
+# idle, 0.34 s at most at load 234, where no single call took more than 0.23 s.
+HOOK_BUDGET = {"session-start": 10, "session-end": 5}  # seconds, as hooks.json
+HOOK_RESERVE = {"session-start": 4, "session-end": 3}  # seconds of the budget that git cannot use
+HOOK_GIT_MIN = 0.25  # seconds: a hook git call that cannot get this much is not started (above the worst call seen)
 # Types of the event fields that are not text. `fleet log` drops a field of another type, so one damaged
 # line cannot break it. Add each new field that is not text here.
 EVENT_FIELD_TYPES = {"ok": bool, "closed": bool, "removed": bool, "replace": bool, "force": bool, "by": dict,
@@ -1198,9 +1215,6 @@ def repo_identity(path: str, timeout: float = 15, strict: bool = False) -> dict 
     lines = (git_out(path, "rev-parse", "--git-common-dir", "--show-toplevel", timeout=timeout) or "").splitlines()
     if len(lines) < 2:
         return None
-    common = os.path.realpath(os.path.join(path, lines[0]))
-    main_root = os.path.dirname(common) if os.path.basename(common) == ".git" else common
-    urls: dict[str, str] = {}
     if strict:
         cp = run_git(path, "config", "--get-regexp", r"^remote\..*\.url$", timeout=timeout)
         if cp is None or cp.returncode not in (0, 1):
@@ -1208,6 +1222,15 @@ def repo_identity(path: str, timeout: float = 15, strict: bool = False) -> dict 
         remote_lines = cp.stdout if cp.returncode == 0 else ""
     else:
         remote_lines = git_out(path, "config", "--get-regexp", r"^remote\..*\.url$", timeout=timeout) or ""
+    return identity_from(path, lines, remote_lines)
+
+
+def identity_from(path: str, lines: list[str], remote_lines: str) -> dict:
+    """repo_identity from the output of its two git calls: `rev-parse --git-common-dir --show-toplevel` (at least
+    two lines) and `config --get-regexp` of the remote URLs."""
+    common = os.path.realpath(os.path.join(path, lines[0]))
+    main_root = os.path.dirname(common) if os.path.basename(common) == ".git" else common
+    urls: dict[str, str] = {}
     for line in remote_lines.splitlines():
         name, _, url = line.partition(" ")
         urls.setdefault(name[len("remote."):-len(".url")], url.strip())
@@ -1353,20 +1376,95 @@ def pane_lane_fields(info: dict) -> dict:
     return {"cwd": cwd, "workspace": info.get("workspace_id"), "branch": (git_branch(cwd) or None) if cwd else None}
 
 
-def hook_session_event(event: str, data: dict, env: dict | None = None) -> str | None:
+def hook_clock() -> float:
+    """The clock of the hooks' git deadline (see HOOK_BUDGET). The tests control it: in-process they replace this
+    function, and in a child patient_fleet.py stops time.monotonic."""
+    return time.monotonic()
+
+
+class HookGitFailed(Exception):
+    """A git call of a hook gave no answer: no time was left, it timed out, git could not run, a signal ended it,
+    or its error is not an answer."""
+
+
+class HookRun:
+    """One run of a hook: one git deadline, HOOK_BUDGET - HOOK_RESERVE seconds after `start`, shared by all its git
+    calls, and the repositories that git has described in this run. `start` is HOOK_STARTED in the hook command;
+    a hook function that is called without a run starts one now."""
+
+    def __init__(self, event: str = "session-start", start: float | None = None):
+        start = hook_clock() if start is None else start
+        self.deadline = start + HOOK_BUDGET[event] - HOOK_RESERVE[event]
+        self.identities: dict[str, dict | None] = {}
+        self.failures: dict[str, HookGitFailed] = {}
+
+    def git(self, path: str, *args: str) -> subprocess.CompletedProcess:
+        """`git -C path args` with the time left as its limit. An exit code >= 0 is an answer; HookGitFailed when
+        less than HOOK_GIT_MIN is left (git does not start), on a timeout, or when git cannot run or a signal
+        ends it."""
+        left = self.deadline - hook_clock()
+        if left < HOOK_GIT_MIN:
+            raise HookGitFailed(f"no time was left for git {args[0]}")
+        try:
+            cp = run(["git", "-C", path, *args], timeout=left)
+        except FleetError as e:
+            raise HookGitFailed(str(e))
+        if cp.returncode < 0:
+            raise HookGitFailed(f"git {args[0]} was ended by signal {-cp.returncode}")
+        return cp
+
+    def identity(self, path: str) -> dict | None:
+        """repo_identity(path) within the deadline, asked once in a run: None when git answers that `path` is in no
+        repository. HookGitFailed when git does not answer, also for the remote URLs: without them the local key
+        alone could name another project. A failure is kept for the run too: the deadline is spent, or git fails
+        the same way again."""
+        if path in self.failures:
+            raise self.failures[path]
+        if path not in self.identities:
+            try:
+                self.identities[path] = self._identity(path)
+            except HookGitFailed as e:
+                self.failures[path] = e
+                raise
+        return self.identities[path]
+
+    def _identity(self, path: str) -> dict | None:
+        cp = self.git(path, "rev-parse", "--git-common-dir", "--show-toplevel")
+        lines = cp.stdout.strip().splitlines()
+        if cp.returncode != 0:
+            return None  # git answered: no repository here
+        if len(lines) < 2:
+            raise HookGitFailed("git rev-parse gave no top")
+        remotes = self.git(path, "config", "--get-regexp", r"^remote\..*\.url$")
+        if remotes.returncode not in (0, 1):  # 1: no remote
+            raise HookGitFailed(f"git config failed with exit code {remotes.returncode}")
+        return identity_from(path, lines, remotes.stdout if remotes.returncode == 0 else "")
+
+
+def hook_session_event(event: str, data: dict, env: dict | None = None, run: HookRun | None = None) -> str | None:
     """Record a Claude session that starts or ends in a Herdr pane, in a checkout that has .fleet/.
 
-    Each of its three git calls gets HOOK_GIT_TIMEOUT, so that it ends well within the hook's time.
+    Its git calls share the deadline of `run`, and it reuses the repository that the re-brief found in the same
+    run. Without an answer from git it records nothing; the branch is left out when no time is left for it.
     """
     env = os.environ if env is None else env
     pane = text_or_none(env.get("HERDR_PANE_ID"))
     if not pane:
         return None
+    run = run or HookRun("session-start" if event == "session_start" else "session-end")
     cwd = text_or_none(data.get("cwd")) or os.getcwd()
-    ident = repo_identity(cwd, HOOK_GIT_TIMEOUT)
+    try:
+        ident = run.identity(cwd)
+    except HookGitFailed:
+        return None
     if not ident or not (Path(ident["top"]) / FLEET_DIR).is_dir():
         return None
     top = ident["top"]
+    try:
+        cp = run.git(top, "rev-parse", "--abbrev-ref", "HEAD")
+        branch = cp.stdout.strip() if cp.returncode == 0 else None
+    except HookGitFailed:
+        branch = None
     try:
         home = ensure_project(ident["keys"])
     except OSError:
@@ -1376,7 +1474,7 @@ def hook_session_event(event: str, data: dict, env: dict | None = None) -> str |
     model = model.get("id") if isinstance(model, dict) else model
     return record(event, top, by=False, home=home, pane=pane,
                   workspace=text_or_none(env.get("HERDR_WORKSPACE_ID")), cwd=cwd,
-                  branch=git_out(top, "rev-parse", "--abbrev-ref", "HEAD", timeout=HOOK_GIT_TIMEOUT),
+                  branch=branch,
                   agent="claude", role=text_or_none(role), session=text_or_none(data.get("session_id")),
                   transcript=text_or_none(data.get("transcript_path")), source=text_or_none(data.get("source")),
                   reason=text_or_none(data.get("reason")), model=text_or_none(model),
@@ -3331,10 +3429,21 @@ def project_home(args: argparse.Namespace, create: bool = True) -> Path:
             known = ", ".join(p.name for p in project_dirs()) or "none yet"
             raise FleetError(f"no project {args.project!r}. Projects: {known}")
         return d
-    d = project_for(os.getcwd(), create=create)
-    if not d:
-        raise FleetError("this directory is in no fleet project (no git repository here); pass --project NAME")
-    return d
+    cwd = os.getcwd()
+    d = project_for(cwd, create=create)
+    if d:
+        return d
+    # Why there is none: git answers that this is no repository, or that it is one without a home yet, or it fails.
+    cp = run_git(cwd, "rev-parse", "--show-toplevel")
+    if cp is not None and cp.returncode > 0:
+        raise FleetError("this directory is in no git repository, so it is in no fleet project; run this in a "
+                         "checkout of the project, or pass --project NAME")
+    if cp is not None and cp.returncode == 0 and not create:
+        raise FleetError(f"the repository {cp.stdout.strip()} has no fleet project home yet: `fleet orch claim` "
+                         "(registers this pane as its orchestrator) or `fleet board` creates it; or pass "
+                         "--project NAME")
+    raise FleetError("git could not tell the project of this directory (a git call failed or timed out); try again, "
+                     "or pass --project NAME")
 
 
 def pane_state(pane: str | None) -> str:
@@ -3660,20 +3769,49 @@ def helper_command(env) -> str:
     return f'python3 "{base}/scripts/fleet"'
 
 
-def orch_match(data: dict, env) -> tuple[Path, str] | None:
+class OrchUnconfirmed(Exception):
+    """An orch.json names this pane, but git did not answer, so the hook cannot tell the session's project."""
+
+    def __init__(self, homes: list[Path], pane: str, why: str):
+        super().__init__(why)
+        self.homes, self.pane = homes, pane
+
+
+def orch_match(data: dict, env, run: HookRun | None = None) -> tuple[Path, str] | None:
     """(project home, pane) when the session runs in the registered orch pane of the project that holds its
-    directory. Reads files, and runs git (two calls, each with HOOK_GIT_TIMEOUT) only when an orch.json
-    names this pane."""
+    directory; None when no orch.json names this pane, or git answers that the directory is in another project or
+    in none. OrchUnconfirmed when an orch.json names this pane and git gives no answer. Reads files, and runs git
+    (two calls, within the deadline of `run`) only when an orch.json names this pane."""
     pane = text_or_none(env.get("HERDR_PANE_ID"))
     if not pane:
         return None
     homes = [p.parent for p in (fleet_home() / PROJECTS_DIR).glob(f"*/{ORCH_FILE}") if read_json(p).get("pane") == pane]
     if not homes:
         return None
-    home = project_for(text_or_none(data.get("cwd")) or os.getcwd(), create=False, timeout=HOOK_GIT_TIMEOUT)
+    cwd = text_or_none(data.get("cwd")) or os.getcwd()
+    if not os.path.isdir(cwd):
+        return None
+    try:
+        ident = (run or HookRun()).identity(cwd)
+    except HookGitFailed as e:
+        raise OrchUnconfirmed(sorted(homes), pane, str(e))
+    home = find_project(ident["keys"]) if ident else None
     if not home or all(os.path.realpath(home) != os.path.realpath(h) for h in homes):
         return None
     return home, pane
+
+
+def orch_unconfirmed_note(e: OrchUnconfirmed, env) -> str:
+    """The note for the orch pane when git did not answer: what is known, and how to get the re-brief by hand.
+    Never the lane or FLEET.md text: the pane may be the orch."""
+    names = ", ".join(h.name for h in e.homes)
+    which = f"project {names}" if len(e.homes) == 1 else f"one of the projects {names}"
+    digest = f"{helper_command(env)} digest --project {e.homes[0].name if len(e.homes) == 1 else 'NAME'}"
+    files = ", ".join(str(h / PROJECT_MD) for h in e.homes)
+    return (f"Fleet orchestrator: this pane ({e.pane}) is registered as the orchestrator of {which}. git failed or "
+            "did not answer in time, so this hook could not confirm that this session works in that project, and it "
+            f"gives no re-brief. If you orchestrate it, run `{digest}` first, then read {files} and load the "
+            "fleet:fleet skill.")
 
 
 def orch_fallback(home: Path, pane: str, env) -> str:
@@ -4655,16 +4793,21 @@ def task_rebrief(role: str | None, entry: dict, d: Path, pane: str, what: str) -
             f"{task} and continue that task.")
 
 
-def session_start_context(data: dict, env: dict | None = None) -> str | None:
+def session_start_context(data: dict, env: dict | None = None, run: HookRun | None = None) -> str | None:
     """Text for a session that was just cleared or compacted in a fleet checkout.
 
     The registered orch pane of a project gets a re-brief from the project home on every source. For any
     other pane, the pane's role comes from .fleet/panes.json (written by `fleet spawn --role`), so a critic
-    or an unrelated session in the same checkout is not told that it implements the lane.
+    or an unrelated session in the same checkout is not told that it implements the lane. When an orch.json names
+    the pane and git does not answer, the pane gets a short note instead (orch_unconfirmed_note). Its git calls
+    share the deadline of `run`.
     """
     env = os.environ if env is None else env
+    run = run or HookRun()
     try:
-        match = orch_match(data, env)
+        match = orch_match(data, env, run)
+    except OrchUnconfirmed as e:
+        return orch_unconfirmed_note(e, env)
     except Exception:
         match = None  # an error before the pane is known as the orch: behave as for any other pane
     if match:
@@ -4676,7 +4819,11 @@ def session_start_context(data: dict, env: dict | None = None) -> str | None:
     if source not in ("clear", "compact"):
         return None
     cwd = data.get("cwd") or os.getcwd()
-    top = git_toplevel(cwd) or cwd
+    try:
+        ident = run.identity(cwd) if isinstance(cwd, str) and os.path.isdir(cwd) else None
+    except HookGitFailed:
+        ident = None
+    top = ident["top"] if ident else cwd
     d = Path(top) / FLEET_DIR
     if not d.is_dir():
         return None
@@ -4740,7 +4887,9 @@ def session_start_context(data: dict, env: dict | None = None) -> str | None:
 
 
 def cmd_hook(args: argparse.Namespace) -> int:
-    """SessionStart: record the session, and re-brief after /clear or compaction. SessionEnd: record the end."""
+    """SessionStart: record the session, and re-brief after /clear or compaction. SessionEnd: record the end.
+    All git calls share one deadline, counted from HOOK_STARTED (see HOOK_BUDGET); the re-brief comes first."""
+    run = HookRun(args.event, start=HOOK_STARTED)
     try:
         raw = sys.stdin.read() if not sys.stdin.isatty() else ""
         data = json.loads(raw) if raw.strip() else {}
@@ -4750,14 +4899,14 @@ def cmd_hook(args: argparse.Namespace) -> int:
         return 0
     if args.event == "session-start":
         try:
-            context = session_start_context(data)
+            context = session_start_context(data, run=run)
         except Exception:
             context = None
         if context:
             print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}))
             sys.stdout.flush()
     try:
-        hook_session_event("session_start" if args.event == "session-start" else "session_end", data)
+        hook_session_event("session_start" if args.event == "session-start" else "session_end", data, run=run)
     except Exception:
         pass
     return 0

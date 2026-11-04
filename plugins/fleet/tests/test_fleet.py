@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -3656,76 +3656,233 @@ class OrchTests(unittest.TestCase):
         text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)}, env={"HERDR_PANE_ID": "w1:p1"})
         self.assertIn("you orchestrate project app", text)
 
+    def hook_child(self, event, payload, path_dirs=(), **env):
+        """The real hook entry in a child (HELPER: the script as __main__, with the stopped hook clock). PATH holds
+        only `path_dirs`, so herdr and gh cannot run. Returns (completed process, git limits asked, waits asked)."""
+        limits, sleeps = self.root / "git-limits.jsonl", self.root / "sleeps.jsonl"
+        for f in (limits, sleeps):
+            f.unlink(missing_ok=True)
+        env = {"PATH": os.pathsep.join(map(str, path_dirs)) or str(self.root / "no-bin"), "FLEET_HOME": str(self.home),
+               "HERDR_PANE_ID": "w1:p1", "HOME": str(self.root), "PATIENT_GIT_LOG": str(limits),
+               "PATIENT_SLEEP_LOG": str(sleeps), **env}
+        cp = subprocess.run([*HELPER, "hook", event], input=json.dumps(payload), cwd=self.repo, capture_output=True,
+                            text=True, timeout=CHILD_LIMIT, env=env)
+        asked = [json.loads(line)["timeout"] for line in limits.read_text().splitlines()] if limits.exists() else []
+        waits = [json.loads(line) for line in sleeps.read_text().splitlines()] if sleeps.exists() else []
+        return cp, asked, waits
+
+    def git_wrapper(self, body=None):
+        """A bin directory whose git notes each call in <root>/git-calls, then runs `body` (default: the real git)."""
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        calls = self.root / "git-calls"
+        body = body or f'exec "{shutil.which("git")}" "$@"'
+        (bin_dir / "git").write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{calls}"\n{body}\n')
+        (bin_dir / "git").chmod(0o755)
+        return bin_dir, calls
+
     def test_rebrief_hook_is_fast_and_offline(self):
-        """The hook's work is bounded: four git calls, each with the hook's 1 s limit, and files; never herdr, gh, a
+        """The hook's work is bounded: two git calls within the hook's one deadline, and files; never herdr, gh, a
         scan of the lanes or a wait (time.sleep) of the helper. The test counts that work instead of timing it, so
         a loaded machine cannot fail it, and a wait of any length can."""
         self.orch_setup()
-        bin_dir = self.root / "bin"
-        bin_dir.mkdir()
-        calls = self.root / "git-calls"
-        # git only, through a wrapper that notes each call: herdr and gh cannot run.
-        (bin_dir / "git").write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{calls}"\nexec "{shutil.which("git")}" "$@"\n')
-        (bin_dir / "git").chmod(0o755)
-        limits, sleeps = self.root / "git-limits.jsonl", self.root / "sleeps.jsonl"
-        env = {"PATH": str(bin_dir), "FLEET_HOME": str(self.home), "HERDR_PANE_ID": "w1:p1", "HOME": str(self.root),
-               "PATIENT_GIT_LOG": str(limits), "PATIENT_SLEEP_LOG": str(sleeps)}
-        payload = json.dumps({"source": "startup", "cwd": str(self.repo), "session_id": "s-9"})
-        cp = subprocess.run([*HELPER, "hook", "session-start"], input=payload, cwd=self.repo,
-                            capture_output=True, text=True, timeout=CHILD_LIMIT, env=env)
+        bin_dir, calls = self.git_wrapper()  # git only, through a wrapper that notes each call
+        cp, asked, waits = self.hook_child("session-start", {"source": "startup", "cwd": str(self.repo),
+                                                             "session_id": "s-9"}, [bin_dir])
         self.assertEqual((cp.returncode, cp.stderr), (0, ""))
         context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
         self.assertIn("you orchestrate project app (pane w1:p1)", context)
-        # The re-brief finds the project (two calls), then the session record finds it again and stops: no .fleet/.
-        identity = [f"-C {self.repo} rev-parse --git-common-dir --show-toplevel",
-                    f"-C {self.repo} config --get-regexp ^remote\\..*\\.url$"]
-        self.assertEqual(calls.read_text().splitlines(), identity * 2)
-        self.assertEqual([json.loads(line)["timeout"] for line in limits.read_text().splitlines()], [1] * 4)
+        # The re-brief finds the project (two calls); the session record reuses it and stops: no .fleet/.
+        self.assertEqual(calls.read_text().splitlines(),
+                         [f"-C {self.repo} rev-parse --git-common-dir --show-toplevel",
+                          f"-C {self.repo} config --get-regexp ^remote\\..*\\.url$"])
+        # The child's clock stands still: each call asks for the whole deadline, budget - reserve.
+        self.assertEqual(asked, [6, 6])
         # The helper asks for no wait on this path. The subprocess module's own wait loop sleeps in short steps
         # while git runs; that is not a wait of the hook.
-        asked = [json.loads(line) for line in sleeps.read_text().splitlines()] if sleeps.exists() else []
-        self.assertEqual([e for e in asked if Path(e["file"]).resolve() == SCRIPT], [])
-        self.assertTrue(all(Path(e["file"]).name == "subprocess.py" for e in asked), asked)
+        self.assertEqual([e for e in waits if Path(e["file"]).resolve() == SCRIPT], [])
+        self.assertTrue(all(Path(e["file"]).name == "subprocess.py" for e in waits), waits)
+
+    def test_hook_budgets_agree_with_hooks_json(self):
+        """HOOK_BUDGET is the time that hooks.json gives each hook; the git deadline keeps a reserve inside it."""
+        hooks = json.loads((SCRIPT.parent.parent / "hooks" / "hooks.json").read_text())["hooks"]
+        budgets = {name: {h["timeout"] for group in hooks[name] for h in group["hooks"]}
+                   for name in ("SessionStart", "SessionEnd")}
+        self.assertEqual(budgets, {"SessionStart": {fleet.HOOK_BUDGET["session-start"]},
+                                   "SessionEnd": {fleet.HOOK_BUDGET["session-end"]}})
+        self.assertEqual((fleet.HOOK_BUDGET, fleet.HOOK_RESERVE),
+                         ({"session-start": 10, "session-end": 5}, {"session-start": 4, "session-end": 3}))
+        self.assertEqual(patient_fleet.MIN_GIT_LIMIT, fleet.HOOK_GIT_MIN)  # a smaller git limit expires at once
+        for event in fleet.HOOK_BUDGET:  # a deadline that leaves git less than the floor would never run git
+            self.assertGreaterEqual(fleet.HOOK_BUDGET[event] - fleet.HOOK_RESERVE[event], 4 * fleet.HOOK_GIT_MIN)
 
     def test_hooks_pass_their_git_limit(self):
         """The tests give each git call a long limit (patient_fleet.py), so that a slow git cannot change a result;
-        the hooks still ask for their own limit, HOOK_GIT_TIMEOUT (1 s), on each git call. The limits come from
-        the subprocess boundary, before patient_run widens them: what the helper really passes to git."""
+        the hooks still ask for the time left until their one deadline, budget - reserve after the start of the
+        run. The limits come from the subprocess boundary, before patient_run widens them: what the helper really
+        passes to git. The hook clock stands still here, so the limits are exact."""
         self.assertIsInstance(fleet.subprocess, patient_fleet.PatientSubprocess)
-        self.assertEqual(fleet.HOOK_GIT_TIMEOUT, 1)
-        self.assertEqual(patient_fleet.MIN_GIT_LIMIT, fleet.HOOK_GIT_TIMEOUT)  # a smaller git limit expires at once
         self.orch_setup()
         (self.repo / ".fleet").mkdir()
         data, env = {"source": "startup", "cwd": str(self.repo)}, {"HERDR_PANE_ID": "w1:p1"}
+        run = fleet.HookRun("session-start")
         with patient_fleet.record_git_limits() as calls:
-            self.assertEqual(fleet.orch_match(data, env), (self.project, "w1:p1"))
-            self.assertEqual([limit for _, limit in calls], [1, 1])
-            self.assertIsNotNone(fleet.hook_session_event("session_start", data, env))
-        # And the session record: the project twice more, then the branch.
-        self.assertEqual([limit for _, limit in calls], [1] * 5)
-        self.assertEqual([args[2] for args, _ in calls], ["rev-parse", "config"] * 2 + ["rev-parse"])
+            self.assertEqual(fleet.orch_match(data, env, run), (self.project, "w1:p1"))
+            self.assertEqual([limit for _, limit in calls], [6, 6])
+            self.assertIsNotNone(fleet.hook_session_event("session_start", data, env, run))
+        # The session record reuses the project of the run, and asks only for the branch.
+        self.assertEqual([limit for _, limit in calls], [6] * 3)
+        self.assertEqual([args[2] for args, _ in calls], ["rev-parse", "config", "rev-parse"])
+        self.assertEqual(self.events("session_start")[-1]["branch"], "main")
+        # SessionEnd: a shorter deadline. A record without a run starts its own: the project, then the branch.
+        with patient_fleet.record_git_limits() as calls:
+            self.assertIsNotNone(fleet.hook_session_event("session_end", data, env))
+        self.assertEqual([limit for _, limit in calls], [2] * 3)
+        # The same through the real entry, in a child.
+        cp, asked, _ = self.hook_child("session-end", {**data, "reason": "exit"}, [Path(shutil.which("git")).parent])
+        self.assertEqual((cp.returncode, cp.stdout, asked), (0, "", [2, 2, 2]))
+        self.assertEqual(self.events("session_end")[-1]["reason"], "exit")
+
+    def test_slow_git_shares_one_deadline(self):
+        """With git at 2 s for each call the orch pane still gets its full re-brief, and git ends by the deadline,
+        inside the budget less the reserve; the session record keeps what time is left. The clock moves only by
+        git_takes(): nothing waits."""
+        self.orch_setup()
+        self.stop_clock(fleet.read_json(self.project / "board.json"), 5)
+        (self.repo / ".fleet").mkdir()
+        data, env = {"source": "clear", "cwd": str(self.repo)}, {"HERDR_PANE_ID": "w1:p1"}
+        full = fleet.session_start_context(data, env)
+        for takes, limits, branch in ((2, [6, 4, 2], "main"), (2.5, [6, 3.5, 1], None)):
+            with patient_fleet.record_git_limits() as calls, patient_fleet.git_takes(takes) as clock:
+                start = clock.now
+                run = fleet.HookRun("session-start")
+                self.assertEqual(fleet.session_start_context(data, env, run), full, takes)
+                self.assertIsNotNone(fleet.hook_session_event("session_start", data, env, run))
+                self.assertLessEqual(clock.now - start, fleet.HOOK_BUDGET["session-start"]
+                                     - fleet.HOOK_RESERVE["session-start"])
+            self.assertEqual([limit for _, limit in calls], limits, takes)
+            self.assertEqual(self.events("session_start")[-1].get("branch"), branch, takes)  # 2.5 s: no time left
+
+    def test_git_slower_than_the_deadline_gives_the_orch_a_note(self):
+        """A git slower than the whole deadline: the first call expires at the deadline, and the orch pane gets the
+        note, never silence or the lane text; nothing is recorded, and no second call starts."""
+        self.orch_setup()
+        d = self.repo / ".fleet"
+        d.mkdir()
+        (d / "BRIEF.md").write_text("brief")
+        data, env = {"source": "clear", "cwd": str(self.repo)}, {"HERDR_PANE_ID": "w1:p1"}
+        before = self.log_file().read_bytes()
+        with patient_fleet.record_git_limits() as calls, patient_fleet.git_takes(7) as clock:
+            start = clock.now
+            run = fleet.HookRun("session-start")
+            text = fleet.session_start_context(data, env, run)
+            self.assertIsNone(fleet.hook_session_event("session_start", data, env, run))
+            self.assertEqual(clock.now - start, 6)
+        self.assertEqual([limit for _, limit in calls], [6])
+        self.assertEqual(self.log_file().read_bytes(), before)
+        self.assertIn("this pane (w1:p1) is registered as the orchestrator of project app", text)
+        self.assertNotIn("Fleet lane", text)
 
     def test_hooks_when_git_times_out(self):
-        """Each git call raises TimeoutExpired at the subprocess boundary, as when its 1 s limit expires: no hook
-        raises, the orch pane is not matched, nothing is recorded, and the re-brief is the one for a pane that is in
-        no panes.json."""
+        """Each git call raises TimeoutExpired at the subprocess boundary, as when the deadline expires: no hook
+        raises and nothing is recorded. A pane that an orch.json names gets the note, on every source and also in a
+        checkout with lane files; with no orch.json it is a pane in no panes.json, as before."""
         self.orch_setup()
         d = self.repo / ".fleet"
         d.mkdir()
         (d / "BRIEF.md").write_text("brief")
         (d / "STATUS.md").write_text("status")
-        data, env = {"source": "clear", "cwd": str(self.repo)}, {"HERDR_PANE_ID": "w1:p1"}
+        env = {"HERDR_PANE_ID": "w1:p1", "CLAUDE_PLUGIN_ROOT": "/plugins/fleet"}
         log = self.log_file()  # orch_setup recorded events in it
         before = log.read_bytes()
         with patient_fleet.record_git_limits() as calls, patient_fleet.git_times_out():
-            self.assertIsNone(fleet.orch_match(data, env))
+            data = {"source": "clear", "cwd": str(self.repo)}
+            with self.assertRaises(fleet.OrchUnconfirmed):
+                fleet.orch_match(data, env)
             self.assertIsNone(fleet.hook_session_event("session_start", data, env))
-            text = fleet.session_start_context(data, env)
+            texts = {source: fleet.session_start_context({**data, "source": source}, env)
+                     for source in ("startup", "resume", "clear", "compact")}
+            (self.project / "orch.json").rename(self.root / "orch.json")
+            lane = fleet.session_start_context(data, env)
+            (self.root / "orch.json").rename(self.project / "orch.json")
         self.assertTrue(calls)  # git was asked, and timed out each time
         self.assertEqual(log.read_bytes(), before)
-        (self.project / "orch.json").unlink()  # with git answering, the same pane is no orch: the lane text
-        self.assertEqual(text, fleet.session_start_context(data, env))
-        self.assertIn("This worktree has fleet lane files", text)
+        note = ("Fleet orchestrator: this pane (w1:p1) is registered as the orchestrator of project app. git failed or "
+                "did not answer in time, so this hook could not confirm that this session works in that project, and "
+                'it gives no re-brief. If you orchestrate it, run `python3 "/plugins/fleet/scripts/fleet" digest '
+                f'--project app` first, then read {self.project / "PROJECT.md"} and load the fleet:fleet skill.')
+        self.assertEqual(texts, dict.fromkeys(texts, note))
+        # With no orch.json naming the pane: the lane text, the same as when git answers.
+        self.assertIn("This worktree has fleet lane files", lane)
+        (self.project / "orch.json").unlink()
+        self.assertEqual(lane, fleet.session_start_context(data, env))
+        # Two projects name the pane: the note names both, and asks which.
+        self.main("orch", "claim", pane="w1:p1")
+        other = fleet.ensure_project(["local:/elsewhere"])
+        fleet.write_json(other / "orch.json", {"pane": "w1:p1"})
+        with patient_fleet.git_times_out():
+            text = fleet.session_start_context(data, env)
+        self.assertIn(f"orchestrator of one of the projects app, {other.name}.", text)
+        self.assertIn("digest --project NAME` first", text)
+
+    def test_git_that_answers_gives_no_note(self):
+        """git answers that the directory is in no repository, or in another project: the orch pane is then simply
+        not this project's orch (no note); only a git that fails gives the note."""
+        self.orch_setup()
+        plain = self.root / "plain"
+        plain.mkdir()
+        env = {"HERDR_PANE_ID": "w1:p1"}
+        for source in ("startup", "clear"):
+            self.assertIsNone(fleet.orch_match({"source": source, "cwd": str(plain)}, env))
+            self.assertIsNone(fleet.session_start_context({"source": source, "cwd": str(plain)}, env))
+        # git's own errors that are answers (exit code 128) and those that are not (a config error).
+        bin_dir, _ = self.git_wrapper('echo "fatal: not a git repository" >&2; exit 128')
+        cp, _, _ = self.hook_child("session-start", {"source": "startup", "cwd": str(self.repo)}, [bin_dir])
+        self.assertEqual((cp.returncode, cp.stdout, cp.stderr), (0, "", ""))
+        real = shutil.which("git")
+        bin_dir, _ = self.git_wrapper(f'case "$*" in *config*) exit 3;; esac; exec "{real}" "$@"')
+        cp, _, _ = self.hook_child("session-start", {"source": "startup", "cwd": str(self.repo)}, [bin_dir])
+        self.assertIn("registered as the orchestrator of project app", cp.stdout)
+
+    def test_hook_entry_without_git_gives_the_note(self):
+        """The real entry with no git on PATH: git cannot run, which is no answer; the orch pane gets the note in the
+        hook's JSON, at once, and the hook ends cleanly."""
+        self.orch_setup()
+        cp, asked, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(self.repo)})
+        self.assertEqual((cp.returncode, cp.stderr, asked), (0, "", [6]))
+        context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("this pane (w1:p1) is registered as the orchestrator of project app. git failed or did not "
+                      "answer in time", context)
+        cp, _, _ = self.hook_child("session-end", {"cwd": str(self.repo)})
+        self.assertEqual((cp.returncode, cp.stdout, cp.stderr), (0, "", ""))
+
+    def test_project_home_refusals(self):
+        """F6: the refusal tells "no repository" from "a repository without a home yet" and from a failed git."""
+        plain = self.root / "plain"
+        plain.mkdir()
+        fresh = self.root / "fresh"
+        fresh.mkdir()
+        git("init", "-q", "-b", "main", cwd=fresh)
+        args = fleet.build_parser().parse_args(["orch", "show"])
+        cases = ((plain, None, "this directory is in no git repository, so it is in no fleet project; run this in a "
+                               "checkout of the project, or pass --project NAME"),
+                 (fresh, None, f"the repository {fresh} has no fleet project home yet: `fleet orch claim` (registers "
+                               "this pane as its orchestrator) or `fleet board` creates it; or pass --project NAME"),
+                 (self.repo, patient_fleet.git_times_out, "git could not tell the project of this directory (a git "
+                                                          "call failed or timed out); try again, or pass --project NAME"))
+        for where, scope, message in cases:
+            with chdir(where), (scope() if scope else nullcontext()):
+                with self.assertRaises(fleet.FleetError) as caught:
+                    fleet.project_home(args, create=False)
+            self.assertEqual(str(caught.exception), message, where)
+        self.assertEqual(fleet.project_dirs(), [self.project])  # no refusal created a home
+        with chdir(fresh):  # the command that the refusal names creates the home
+            self.assertEqual(fleet.project_home(args).name, "fresh")
+        # follow-up gives the same refusal in its JSON.
+        buf = io.StringIO()
+        with chdir(plain), redirect_stdout(buf):
+            self.assertEqual(fleet.main(["follow-up", "list"]), 2)
+        self.assertIn("in no git repository", json.loads(buf.getvalue())["refused"])
 
 
 class PatientFleetTests(unittest.TestCase):
@@ -3750,9 +3907,31 @@ class PatientFleetTests(unittest.TestCase):
     def test_a_limit_below_the_smallest_expires_at_once(self):
         with self.assertRaises(subprocess.TimeoutExpired) as caught:
             patient_fleet.patient_run(self.GIT, capture_output=True, timeout=0)
-        self.assertIn("below the smallest product limit, 1 s", caught.exception.output)
-        self.assertEqual(patient_fleet.patient_run(self.GIT, capture_output=True, timeout=1).returncode, 0)
+        self.assertIn("below the smallest product limit, 0.25 s", caught.exception.output)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            patient_fleet.patient_run(self.GIT, capture_output=True, timeout=0.2)
+        self.assertEqual(patient_fleet.patient_run(self.GIT, capture_output=True, timeout=0.25).returncode, 0)
         self.assertEqual(patient_fleet.patient_run(self.GIT, capture_output=True).returncode, 0)  # no limit
+
+
+    def test_git_takes_moves_only_the_hook_clock(self):
+        clock = patient_fleet.HOOK_CLOCK
+        start = clock.now
+        self.assertIs(fleet.hook_clock, clock)
+        with patient_fleet.git_takes(2):
+            patient_fleet.patient_run(self.GIT, capture_output=True, timeout=5)
+            self.assertEqual(clock.now, start + 2)
+            with patient_fleet.git_takes(3):  # the inner scope counts; a call that asks for less expires at its limit
+                with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                    patient_fleet.patient_run(self.GIT, capture_output=True, timeout=1)
+                self.assertIn("git takes 3 s, the helper asked for 1 s", caught.exception.output)
+                self.assertEqual(clock.now, start + 3)
+            self.assertEqual(clock.now, start + 2)  # each scope puts back the clock it found
+            self.assertEqual(patient_fleet.patient_run(["true"], capture_output=True).returncode, 0)  # not git
+            self.assertEqual(clock.now, start + 2)
+        self.assertEqual((clock.now, patient_fleet._git_takes), (start, []))  # put back
+        patient_fleet.patient_run(self.GIT, capture_output=True, timeout=5)
+        self.assertEqual(clock.now, start)  # stands still outside the scope
 
 
 class FollowUpTests(unittest.TestCase):
