@@ -4017,6 +4017,15 @@ class OrchTests(FleetTestCase):
         finally:
             os.close(fd)
         self.assertEqual(log.read_bytes(), before)
+        # With the log free but the run's end come, the record is skipped: it is best effort.
+        for hook in ("session-start", "session-end"):
+            run = fleet.HookRun(hook)
+            run.identity(str(self.repo))
+            clock.now = run.end
+            self.assertIsNone(fleet.hook_session_event("session_end", data, env, run))
+        self.assertEqual(log.read_bytes(), before)
+        run = fleet.HookRun("session-end")  # and with time left, it records
+        self.assertIsNotNone(fleet.hook_session_event("session_end", data, env, run))
         # Occupied names: folders without project.json for the first 11 names of a new project.
         other = self.root / "other"
         other.mkdir()
