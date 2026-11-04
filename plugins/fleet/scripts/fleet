@@ -4436,34 +4436,42 @@ HOOK_BAD_INPUT = "the hook input could not be read"
 REBRIEF, ORDINARY, NOTE = "re-brief", "ordinary", "note"  # the outcomes of orch_decide
 
 
-def orch_candidates(env) -> tuple[str | None, list[Path]]:
-    """(this pane, the homes whose orch.json names it). Reads files only, never git, and each file alone: a file that
-    cannot be read or parsed names no pane and drops no other file's candidate. No candidate: the pane is no orch,
-    and the hook treats it as any other pane. The hook reads this once, as its snapshot."""
+def orch_candidates(env) -> tuple[str | None, list[tuple[Path, str, dict]]]:
+    """(this pane, the orchs that name it: (home, orch name, record) for each). Reads files only, never git, and each
+    orch.json alone (read_orchs, either shape): a file that cannot be read or parsed names no pane and drops no other
+    file's candidate. No candidate: the pane is no orch, and the hook treats it as any other pane. The hook reads
+    this once, as its snapshot. A pane is the orch of at most one theme in a project, so of one candidate in each."""
     pane = text_or_none(env.get("HERDR_PANE_ID"))
     if not pane:
         return None, []
-    homes = []
+    found = []
     for p in sorted((fleet_home() / PROJECTS_DIR).glob(f"*/{ORCH_FILE}")):
         try:
-            if any(r.get("pane") == pane for r in read_orchs(p.parent).values()):
-                homes.append(p.parent)
+            found += [(p.parent, name, rec) for name, rec in sorted(read_orchs(p.parent).items())
+                      if rec.get("pane") == pane][:1]
         except Exception:
             continue
-    return pane, homes
+    return pane, found
 
 
-def orch_decide(data: dict, homes: list[Path], run: HookRun) -> tuple[str, object]:
-    """The outcome for a pane that the orch candidates `homes` name (the hook's one snapshot), as a value:
-    (REBRIEF, home): git gives the identity of the session's directory (top and remotes), and find_project's key
-        rule (pick_project) picks a candidate's project;
+def orch_decide(data: dict, cands: list[tuple[Path, str, dict]], run: HookRun) -> tuple[str, object]:
+    """The outcome for a pane that the orch candidates `cands` name (the hook's one snapshot), as a value:
+    (REBRIEF, candidate): the session match (F9): the input's session_id is not empty and exactly one candidate's
+        record holds it (a consuming digest and a claim record it). No git: compaction and resume keep the
+        session, and the match also works from another project's checkout. Else the directory rule: git gives the
+        identity of the session's directory (top and remotes), and find_project's key rule (pick_project) picks a
+        candidate's project;
     (ORDINARY, None): git gives the identity, the rule picks no candidate, and the project.json of every candidate
         was read and has keys: the pane is not this project's orch;
     (NOTE, cause): anything else. That is every failure of git (exit code 128 for any reason, "no repository" too:
         `orch claim` needs a checkout, so a registered pane without one has usually lost it), a timeout, no time
         left, a candidate's project.json that cannot be read or has no keys, and an exception of any type.
-    Runs git (two calls, within the deadline of `run`) and reads each project.json once."""
+    The directory rule runs git (two calls, within the deadline of `run`) and reads each project.json once."""
     try:
+        session = text_or_none(data.get("session_id"))
+        matched = [c for c in cands if session and c[2].get("session") == session]
+        if len(matched) == 1:
+            return REBRIEF, matched[0]
         cwd = text_or_none(data.get("cwd")) or os.getcwd()
         if not os.path.isdir(cwd):
             return NOTE, HOOK_NO_REPOSITORY
@@ -4471,11 +4479,11 @@ def orch_decide(data: dict, homes: list[Path], run: HookRun) -> tuple[str, objec
         projects = [(d, read_json(d / PROJECT_FILE)) for d in project_dirs()]
         picked = pick_project(keys, projects)
         if picked is not None:
-            for h in homes:
-                if os.path.realpath(h) == os.path.realpath(picked[0]):
-                    return REBRIEF, h
+            for c in cands:
+                if os.path.realpath(c[0]) == os.path.realpath(picked[0]):
+                    return REBRIEF, c
         known = {os.path.realpath(d): project_keys(d_data) for d, d_data in projects}
-        unread = [h.name for h in homes if not known.get(os.path.realpath(h))]
+        unread = [c[0].name for c in cands if not known.get(os.path.realpath(c[0]))]
         if unread:
             return NOTE, f"the project file of {', '.join(unread)} could not be read"
         return ORDINARY, None
@@ -4485,10 +4493,11 @@ def orch_decide(data: dict, homes: list[Path], run: HookRun) -> tuple[str, objec
         return NOTE, f"an error in the hook: {type(e).__name__}"
 
 
-def orch_context(data: dict, env, run: HookRun, pane: str, homes: list[Path]) -> tuple[str, str | None]:
-    """(outcome, text) for a pane that the orch candidates `homes` name: the re-brief, the ordinary path's text (it
+def orch_context(data: dict, env, run: HookRun, pane: str,
+                 cands: list[tuple[Path, str, dict]]) -> tuple[str, str | None]:
+    """(outcome, text) for a pane that the orch candidates `cands` name: the re-brief, the ordinary path's text (it
     may be None) or the note. A re-brief that fails or is empty gives the note."""
-    kind, value = orch_decide(data, homes, run)
+    kind, value = orch_decide(data, cands, run)
     if kind == REBRIEF:
         try:
             text = orch_rebrief(value, pane, data, env)
@@ -4502,37 +4511,41 @@ def orch_context(data: dict, env, run: HookRun, pane: str, homes: list[Path]) ->
         try:
             return ORDINARY, lane_context(data, env, run)
         except Exception as e:
-            return NOTE, orch_note(homes, pane, f"an error in the hook: {type(e).__name__}", env)
-    return NOTE, orch_note(homes, pane, value, env)
+            return NOTE, orch_note(cands, pane, f"an error in the hook: {type(e).__name__}", env)
+    return NOTE, orch_note(cands, pane, value, env)
 
 
-def orch_note(homes: list[Path], pane: str, cause: str, env) -> str:
+def orch_note(cands: list[tuple[Path, str, dict]], pane: str, cause: str, env) -> str:
     """orch_unconfirmed_note; when that fails, a fixed text that calls no helper function."""
     try:
-        return orch_unconfirmed_note(homes, pane, cause, env)
+        return orch_unconfirmed_note(cands, pane, cause, env)
     except Exception:
-        return orch_fixed_note(homes, pane, cause)
+        return orch_fixed_note(cands, pane, cause)
 
 
-def orch_fixed_note(homes: list[Path], pane: str, cause: str) -> str:
-    """The note when orch_unconfirmed_note cannot be built: the pane, the candidate project names, the cause and the
-    digest command. It calls no helper function."""
-    return (f"Fleet orchestrator: this pane ({pane}) is registered as the orchestrator of "
-            f"{', '.join(h.name for h in homes)}, but this hook could not confirm that this session works in that "
-            f"project ({cause}), so it gives no re-brief. If you orchestrate it, run the fleet helper's `digest` "
-            f"command first, then read the project's PROJECT.md.")
+def orch_fixed_note(cands: list[tuple[Path, str, dict]], pane: str, cause: str) -> str:
+    """The note when orch_unconfirmed_note cannot be built: the pane, each candidate as <project>/<orch>, the cause
+    and the digest command. It calls no helper function."""
+    return (f"Fleet orchestrator: this pane ({pane}) is registered as orch "
+            f"{', '.join(f'{c[0].name}/{c[1]}' for c in cands)}, but this hook could not confirm that this session "
+            f"works in that project ({cause}), so it gives no re-brief. If you orchestrate it, run the fleet "
+            f"helper's `digest` command first, then read the project's PROJECT.md.")
 
 
-def orch_unconfirmed_note(homes: list[Path], pane: str, cause: str, env) -> str:
+def orch_unconfirmed_note(cands: list[tuple[Path, str, dict]], pane: str, cause: str, env) -> str:
     """The note for a pane that orch candidates name, when the hook cannot give it the re-brief: what is known, why
     not, and how to get the re-brief by hand. Never the lane or FLEET.md text: the pane may be the orch."""
-    names = ", ".join(h.name for h in homes)
-    which = f"project {names}" if len(homes) == 1 else f"one of the projects {names}"
-    digest = f"{helper_command(env)} digest --project {homes[0].name if len(homes) == 1 else 'NAME'}"
-    files = ", ".join(str(h / PROJECT_MD) for h in homes)
-    return (f"Fleet orchestrator: this pane ({pane}) is registered as the orchestrator of {which}, but this hook could "
-            f"not confirm that this session works in that project ({cause}), so it gives no re-brief. If you "
-            f"orchestrate it, run `{digest}` first, then read {files} and load the fleet:fleet skill.")
+    if len(cands) == 1:
+        which = f"orch {cands[0][1]} of project {cands[0][0].name}"
+    else:
+        which = f"an orch of one of the projects {', '.join(f'{c[0].name}/{c[1]}' for c in cands)}"
+    digest = f"{helper_command(env)} digest --project {cands[0][0].name if len(cands) == 1 else 'NAME'}"
+    files = [str(c[0] / PROJECT_MD) for c in cands]
+    if len(cands) == 1 and orch_files(cands[0][0], cands[0][1])["orch_md"]:
+        files.append(str(orch_files(cands[0][0], cands[0][1])["orch_md"]))
+    return (f"Fleet orchestrator: this pane ({pane}) is registered as {which}, but this hook could not confirm that "
+            f"this session works in that project ({cause}), so it gives no re-brief. If you orchestrate it, run "
+            f"`{digest}` first, then read {', '.join(files)} and load the fleet:fleet skill.")
 
 
 def cached_board(path: Path) -> list[dict]:
@@ -4559,27 +4572,36 @@ def cached_view(home: Path, name: str | None, orchs: dict[str, dict], is2: bool)
     return {"name": name, "lanes": lanes, "branches": branches}
 
 
-def orch_rebrief(home: Path, pane: str, data: dict, env) -> str:
-    """The re-brief for the registered orch pane, from the project home. Reads files only, and at most
-    REBRIEF_READ_BUDGET bytes of unread log: never the history that a digest consumed."""
+def orch_rebrief(cand: tuple[Path, str, dict], pane: str, data: dict, env) -> str:
+    """The re-brief for the registered orch pane of candidate `cand` (home, orch name, record), from the project home
+    and the orch's own files (orch_files). Reads files only, and at most REBRIEF_READ_BUDGET bytes of unread log:
+    never the history that a digest consumed."""
+    home, name, _ = cand
     source = data.get("source")
     what = {"clear": "Your context was just cleared.", "compact": "Your context was just compacted.",
             "resume": "This session was resumed.", "startup": "This session just started."}.get(source, "")
     project_md = home / PROJECT_MD
     text = read_text(project_md)
-    head = [f"Fleet orchestrator: you orchestrate project {home.name} (pane {pane}). {what}".rstrip(),
-            f"Your memory is the project home {home}. Decisions, follow-ups and rules go to {project_md}; "
-            "the board and the event log keep the lanes."]
-    body: list[str] = []
-    for title, pattern in (("Rules", "Rules"), ("Follow-ups", r"Follow-?ups?")):
-        lines = section_text(text, pattern)
-        body.append(f"## {title} (PROJECT.md)")
-        body += lines[:15] or ["- none"]
-        if len(lines) > 15:
-            body.append(f"- ... {len(lines) - 15} more in PROJECT.md")
     orchs, is2 = orch_registry(home)
-    name = next((n for n, r in orchs.items() if r.get("pane") == pane), None)
     files = orch_files(home, name, is2)
+    orch_md = files["orch_md"] if files["orch_md"] and files["orch_md"].is_file() else None
+    memory = (f"Your memory is the project home {home}. Rules, follow-ups and project-wide decisions go to "
+              f"{project_md}; the decisions and notes of your theme go to {orch_md}; the board and the event log "
+              "keep the lanes." if orch_md else
+              f"Your memory is the project home {home}. Decisions, follow-ups and rules go to {project_md}; "
+              "the board and the event log keep the lanes.")
+    head = [f"Fleet orchestrator: you orchestrate project {home.name} as orch {name} (pane {pane}). {what}".rstrip(),
+            memory]
+    body: list[str] = []
+    sections = [("Rules", "Rules", text, "PROJECT.md", 15), ("Follow-ups", r"Follow-?ups?", text, "PROJECT.md", 15)]
+    if orch_md:
+        sections.append(("Notes", "Notes", read_text(orch_md), "ORCH.md", 10))
+    for title, pattern, source_text, where, cap in sections:
+        lines = section_text(source_text, pattern)
+        body.append(f"## {title} ({where})")
+        body += lines[:cap] or ["- none"]
+        if len(lines) > cap:
+            body.append(f"- ... {len(lines) - cap} more in {where}")
     records = cached_board(files["board"])
     board = read_json(files["board"])
     if board.get("made"):
@@ -4596,7 +4618,7 @@ def orch_rebrief(home: Path, pane: str, data: dict, env) -> str:
         paths = [r["path"] for r in records if isinstance(r.get("path"), str)]
         count = len(digest_events(events, pane, paths, cached_view(home, name, orchs, is2)))
         tail = [("More than " if cut else "") + f"{plural(count, 'event')} since the last digest."]
-    tail.append(f"Run `{helper_command(env)} digest` first, then load the fleet:fleet skill.")
+    tail.append(f"Run `{helper_command(env)} digest --project {home.name}` first, then load the fleet:fleet skill.")
     room = REBRIEF_LINES_MAX - len(head) - len(tail)
     if len(body) > room:
         body = body[:room - 1] + ["... (cut; read PROJECT.md and run `board`)"]
@@ -5544,11 +5566,11 @@ def session_start_context(data: dict, env: dict | None = None, run: HookRun | No
     env = os.environ if env is None else env
     run = run or HookRun()
     try:
-        pane, homes = orch_candidates(env)
+        pane, cands = orch_candidates(env)
     except Exception:
-        pane, homes = None, []
-    if homes:
-        return orch_context(data, env, run, pane, homes)[1]
+        pane, cands = None, []
+    if cands:
+        return orch_context(data, env, run, pane, cands)[1]
     return lane_context(data, env, run)
 
 
@@ -5645,23 +5667,23 @@ def print_session_start(text: str) -> None:
     sys.stdout.flush()
 
 
-def orch_session_start(run: HookRun, pane: str, homes: list[Path], env) -> dict | None:
-    """SessionStart for a pane that the orch candidates `homes` name (the snapshot): it prints the output of one of
+def orch_session_start(run: HookRun, pane: str, cands: list[tuple[Path, str, dict]], env) -> dict | None:
+    """SessionStart for a pane that the orch candidates `cands` name (the snapshot): it prints the output of one of
     orch_context's outcomes, or the note when the input cannot be read. From here to the output (print and flush
     included), an Exception, SystemExit or KeyboardInterrupt gives the note and no record. Not BaseException: the
     test harness's FakeClockLimit must still end the process. Returns the input to record, or None."""
     try:
         data = read_hook_input()
         if data is None:
-            text = orch_note(homes, pane, HOOK_BAD_INPUT, env)
+            text = orch_note(cands, pane, HOOK_BAD_INPUT, env)
         else:
-            text = orch_context(data, env, run, pane, homes)[1]
+            text = orch_context(data, env, run, pane, cands)[1]
         if text:
             print_session_start(text)
         return data
     except (Exception, SystemExit, KeyboardInterrupt) as e:
         try:
-            print_session_start(orch_note(homes, pane, f"an error in the hook: {type(e).__name__}", env))
+            print_session_start(orch_note(cands, pane, f"an error in the hook: {type(e).__name__}", env))
         except (Exception, SystemExit, KeyboardInterrupt):
             pass  # the output itself fails: nothing more can reach the session
         return None
@@ -5673,14 +5695,14 @@ def cmd_hook(args: argparse.Namespace) -> int:
     SessionStart reads the orch candidates first, once, before its input (orch_session_start); a pane that none
     names keeps the ordinary behaviour, where an input that cannot be read gives no output."""
     run = HookRun(args.event, start=HOOK_STARTED)
-    homes: list[Path] = []
+    cands: list[tuple[Path, str, dict]] = []
     if args.event == "session-start":
         try:
-            pane, homes = orch_candidates(os.environ)
+            pane, cands = orch_candidates(os.environ)
         except Exception:
-            pane, homes = None, []  # no candidate known: the ordinary behaviour
-    if homes:
-        data = orch_session_start(run, pane, homes, os.environ)
+            pane, cands = None, []  # no candidate known: the ordinary behaviour
+    if cands:
+        data = orch_session_start(run, pane, cands, os.environ)
     else:
         data = read_hook_input()
         if data is not None and args.event == "session-start":

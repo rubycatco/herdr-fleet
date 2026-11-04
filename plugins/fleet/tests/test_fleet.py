@@ -4019,7 +4019,7 @@ class OrchTests(FleetTestCase):
             path = str(lanes[name])
             fleet.record("send", path, by=False, pane="w8:p1", cwd=path, branch=f"feat/{name}", text=name)
         with mock.patch.object(fleet, "collect_lanes", side_effect=AssertionError("no scan")):
-            text = fleet.orch_rebrief(self.project, "w1:p1", {"source": "clear"}, {})
+            text = fleet.orch_rebrief(self.cands()[0], "w1:p1", {"source": "clear"}, {})
         self.assertIn("2 events since the last digest.", text)  # a and c, not b
         self.assertRegex(text, r"feat/c .*unowned: adopt it")
 
@@ -4322,7 +4322,7 @@ class OrchTests(FleetTestCase):
         with mock.patch.object(fleet, "orch_rebrief", side_effect=RuntimeError("boom")):
             text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)},
                                                env={"HERDR_PANE_ID": "w1:p1", "CLAUDE_PLUGIN_ROOT": "/plugins/fleet"})
-        self.assertIn(f"orchestrator of project app, but this hook {NOTE} (its re-brief failed: RuntimeError)", text)
+        self.assertIn(f"orch default of project app, but this hook {NOTE} (its re-brief failed: RuntimeError)", text)
         self.assertIn('`python3 "/plugins/fleet/scripts/fleet" digest --project app`', text)
         self.assertNotIn("You implement", text)
         # The same through the real entry: an exception in orch_rebrief, then one before any git call.
@@ -4368,6 +4368,10 @@ class OrchTests(FleetTestCase):
             fleet.record("send", str(self.repo), by=False, pane="w2:p1", text=text)
         fleet.record("send", str(self.repo), by=False, pane="w1:p1", text="the orch's own")
 
+    def cands(self, pane="w1:p1"):
+        """The orch candidates of `pane`: (home, orch name, record) for each orch that names it."""
+        return fleet.orch_candidates({"HERDR_PANE_ID": pane})[1]
+
     def stop_clock(self, board, seconds):
         """Stop the helper's wall clock `seconds` after the board was made: its age is then always the same."""
         self.clock.stopped = fleet.event_time({"ts": board["made"]}) + seconds
@@ -4378,7 +4382,7 @@ class OrchTests(FleetTestCase):
         for source in ("startup", "resume", "clear", "compact"):
             text = fleet.session_start_context({"source": source, "cwd": str(self.repo)},
                                                env={"HERDR_PANE_ID": "w1:p1"})
-            self.assertIn("you orchestrate project app (pane w1:p1)", text, source)
+            self.assertIn("you orchestrate project app as orch default (pane w1:p1)", text, source)
             self.assertIn(str(self.project / "PROJECT.md"), text)
             self.assertIn("Never push to main.", text)
             self.assertIn("Add a CHANGELOG entry.", text)
@@ -4386,14 +4390,14 @@ class OrchTests(FleetTestCase):
             self.assertIn("\nBoard from 5s ago (cached; `board` refreshes it):\n", text)
             self.assertRegex(text, r"lane-a\s+review 1")
             self.assertIn("2 events since the last digest.", text)
-            self.assertIn("digest` first, then load the fleet:fleet skill.", text)
+            self.assertIn("digest --project app` first, then load the fleet:fleet skill.", text)
         self.assertIn("just cleared", fleet.session_start_context({"source": "clear", "cwd": str(self.repo)},
                                                                   env={"HERDR_PANE_ID": "w1:p1"}))
         # The command matches the skills' allowed-tools when the hook knows the plugin root.
         text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)},
                                            env={"HERDR_PANE_ID": "w1:p1", "CLAUDE_PLUGIN_ROOT": "/plugins/fleet"})
-        self.assertIn('Run `python3 "/plugins/fleet/scripts/fleet" digest` first', text)
-        self.assertIn(f'Run `python3 "{SCRIPT.resolve().parent.parent}/scripts/fleet" digest` first', fleet.session_start_context(
+        self.assertIn('Run `python3 "/plugins/fleet/scripts/fleet" digest --project app` first', text)
+        self.assertIn(f'Run `python3 "{SCRIPT.resolve().parent.parent}/scripts/fleet" digest --project app` first', fleet.session_start_context(
             {"source": "clear", "cwd": str(self.repo)}, env={"HERDR_PANE_ID": "w1:p1"}))
         # In a checkout of another project, the orch pane is not briefed as this project's orch.
         other = self.root / "other"
@@ -4407,6 +4411,114 @@ class OrchTests(FleetTestCase):
         text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)}, env={"HERDR_PANE_ID": "w1:p1"})
         self.assertIn("No board yet.", text)
         self.assertIn("No digest yet.", text)
+
+    def test_the_session_match(self):
+        """F9: a payload whose session_id one candidate's record holds gets that orch's re-brief with no git call,
+        also in another project's checkout and outside any repository. A stale or empty session, a payload without
+        one, and two candidates with one session fall to the directory rule."""
+        self.orch_setup()
+        self.main("orch", "claim", pane="w1:p1", CLAUDE_CODE_SESSION_ID="sess-orch")  # a re-claim records it
+        self.assertEqual(fleet.read_orchs(self.project)["default"]["session"], "sess-orch")
+        plain, other = self.root / "plain", self.root / "other"
+        plain.mkdir()
+        other.mkdir()
+        git("init", "-q", "-b", "main", cwd=other)
+        env = {"HERDR_PANE_ID": "w1:p1"}
+        full = fleet.session_start_context({"source": "compact", "cwd": str(self.repo)}, env)
+        self.assertIn("you orchestrate project app as orch default (pane w1:p1)", full)
+        for where in (self.repo, other, plain, self.root / "missing"):
+            for source in ("startup", "resume", "clear", "compact"):
+                data = {"source": source, "cwd": str(where), "session_id": "sess-orch"}
+                with patient_fleet.record_git_limits() as calls:
+                    text = fleet.session_start_context(data, env)
+                self.assertEqual(calls, [], (where, source))  # no git at all
+                self.assertIn("you orchestrate project app as orch default (pane w1:p1)", text, (where, source))
+                self.assertNotIn(NOTE, text)
+        # Git that does not answer does not matter on the session path.
+        with patient_fleet.git_times_out():
+            self.assertEqual(fleet.orch_decide({"cwd": str(self.repo), "session_id": "sess-orch"}, self.cands(),
+                                               fleet.HookRun()), (fleet.REBRIEF, self.cands()[0]))
+        # The directory rule decides without a match: another project gives the ordinary path, no repository the note.
+        for session in ("sess-old", "", None):
+            data = {"source": "compact", "cwd": str(other), **({"session_id": session} if session is not None else {})}
+            with patient_fleet.record_git_limits() as calls:
+                self.assertIsNone(fleet.session_start_context(data, env), session)
+            self.assertEqual(len(calls), 2, session)
+            self.assertIn(NOTE, fleet.session_start_context({**data, "cwd": str(plain)}, env))
+        # Two candidates with one session (a pane claimed in two projects from one session): the directory rule.
+        elsewhere = fleet.ensure_project(["local:/elsewhere"])
+        fleet.write_json(elsewhere / "orch.json", {"pane": "w1:p1", "session": "sess-orch"})
+        self.assertEqual(len(self.cands()), 2)
+        text = fleet.session_start_context({"source": "compact", "cwd": str(plain), "session_id": "sess-orch"}, env)
+        self.assertIn(f"an orch of one of the projects app/default, {elsewhere.name}/default, but this hook {NOTE}",
+                      text)
+        self.assertIn("you orchestrate project app", fleet.session_start_context(
+            {"source": "compact", "cwd": str(self.repo), "session_id": "sess-orch"}, env))
+        elsewhere_orch = elsewhere / "orch.json"
+        elsewhere_orch.unlink()
+        # The real entry with no git on PATH: today the note; with the session match the full re-brief, and only the
+        # session record asks git (once, and gives up).
+        cp, asked, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(self.repo),
+                                                         "session_id": "sess-orch"})
+        self.assertEqual((cp.returncode, cp.stderr, asked), (0, "", [6]))
+        context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(context, fleet.session_start_context({"source": "compact", "cwd": str(self.repo),
+                                                               "session_id": "sess-orch"}, env))
+        cp, asked, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(self.repo),
+                                                         "session_id": "sess-other"})
+        self.assertEqual(asked, [6, 6])
+        self.assertIn(NOTE, json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
+        # The session record still runs after a session match, with its calls as before.
+        (self.repo / ".fleet").mkdir()
+        bin_dir, calls = self.git_wrapper()
+        cp, asked, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(self.repo),
+                                                         "session_id": "sess-orch"}, [bin_dir])
+        self.assertIn("you orchestrate project app", json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(calls.read_text().splitlines(),
+                         [f"-C {self.repo} rev-parse --git-common-dir --show-toplevel",
+                          f"-C {self.repo} config --get-regexp ^remote\\..*\\.url$",
+                          f"-C {self.repo} rev-parse --abbrev-ref HEAD"])
+        self.assertEqual(self.events("session_start")[-1]["session"], "sess-orch")
+
+    def test_rebrief_of_an_orch_with_a_theme(self):
+        """In format 2 the re-brief names the orch, its ORCH.md and that file's Notes, reads the orch's own board
+        and cursor, and the note names the orch and its ORCH.md."""
+        self.orch_setup()
+        self.main("orch", "claim", "--name", "billing", pane="w2:p1", CLAUDE_CODE_SESSION_ID="sess-b")
+        orch_md = self.project / "orchs" / "billing" / "ORCH.md"
+        orch_md.write_text("# Orch: billing\n\n## Decisions\n- 11-05 Bill monthly.\n\n## Notes\n- Invoices lag a day.\n")
+        fleet.save_board(self.project, [{"lane": "feat/bill", "path": str(self.root / "bill"), "phase": "idle",
+                                         "orch": "billing", "panes": []}], fleet.precise_now(),
+                         fleet.orch_files(self.project, "billing")["board"])
+        env = {"HERDR_PANE_ID": "w2:p1", "CLAUDE_PLUGIN_ROOT": "/plugins/fleet"}
+        text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo), "session_id": "sess-b"}, env)
+        lines = text.splitlines()
+        self.assertEqual(lines[0], "Fleet orchestrator: you orchestrate project app as orch billing (pane w2:p1). "
+                                   "Your context was just cleared.")
+        self.assertEqual(lines[1], f"Your memory is the project home {self.project}. Rules, follow-ups and "
+                                   f"project-wide decisions go to {self.project / 'PROJECT.md'}; the decisions and "
+                                   f"notes of your theme go to {orch_md}; the board and the event log keep the lanes.")
+        self.assertIn("## Notes (ORCH.md)\n- Invoices lag a day.\n", text)
+        self.assertIn("Never push to main.", text)  # the shared rules
+        self.assertNotIn("Bill monthly", text)  # decisions stay in the file
+        self.assertRegex(text, r"feat/bill\s+idle")
+        self.assertNotIn("lane-a", text)  # the default orch's board
+        self.assertIn("No digest yet.", text)  # billing's own cursor: none yet
+        self.assertTrue(lines[-1].startswith('Run `python3 "/plugins/fleet/scripts/fleet" digest --project app` first'))
+        # The default orch, now in format 2, reads its moved files.
+        text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)}, {"HERDR_PANE_ID": "w1:p1"})
+        self.assertIn("as orch default (pane w1:p1)", text)
+        self.assertRegex(text, r"lane-a\s+review 1")
+        self.assertIn("3 events since the last digest.", text)  # two sends and billing's claim (a project event)
+        self.assertIn(str(self.project / "orchs" / "default" / "ORCH.md"), text)
+        # The note names the orch and both memory files.
+        with patient_fleet.git_times_out():
+            text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)}, env)
+        self.assertIn(f"registered as orch billing of project app, but this hook {NOTE} (git did not answer in time)",
+                      text)
+        self.assertIn(f"then read {self.project / 'PROJECT.md'}, {orch_md} and load", text)
+        self.assertTrue(fleet.orch_fixed_note(self.cands("w2:p1"), "w2:p1", "x").startswith(
+                        "Fleet orchestrator: this pane (w2:p1) is registered as orch app/billing, but this"))
 
     def test_rebrief_is_capped(self):
         self.orch_setup(rules=[f"- rule {i}" for i in range(40)], follow_ups=[f"- follow-up {i}" for i in range(40)])
@@ -4477,7 +4589,7 @@ class OrchTests(FleetTestCase):
                                                              "session_id": "s-9"}, [bin_dir])
         self.assertEqual((cp.returncode, cp.stderr), (0, ""))
         context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("you orchestrate project app (pane w1:p1)", context)
+        self.assertIn("you orchestrate project app as orch default (pane w1:p1)", context)
         # The re-brief finds the project (two calls); the session record reuses it and stops: no .fleet/.
         self.assertEqual(calls.read_text().splitlines(),
                          [f"-C {self.repo} rev-parse --git-common-dir --show-toplevel",
@@ -4517,8 +4629,8 @@ class OrchTests(FleetTestCase):
         data, env = {"source": "startup", "cwd": str(self.repo)}, {"HERDR_PANE_ID": "w1:p1"}
         run = fleet.HookRun("session-start")
         with patient_fleet.record_git_limits() as calls:
-            self.assertEqual(fleet.orch_candidates(env), ("w1:p1", [self.project]))  # files only
-            self.assertEqual(fleet.orch_decide(data, [self.project], run), (fleet.REBRIEF, self.project))
+            self.assertEqual(fleet.orch_candidates(env), ("w1:p1", self.cands()))  # files only
+            self.assertEqual(fleet.orch_decide(data, self.cands(), run), (fleet.REBRIEF, self.cands()[0]))
             self.assertEqual([limit for _, limit in calls], [6, 6])
             self.assertIsNotNone(fleet.hook_session_event("session_start", data, env, run))
         # The session record reuses the project of the run, and asks only for the branch.
@@ -4571,7 +4683,7 @@ class OrchTests(FleetTestCase):
             self.assertEqual(clock.now - start, 6)
         self.assertEqual([limit for _, limit in calls], [6])
         self.assertEqual(self.log_file().read_bytes(), before)
-        self.assertIn(f"this pane (w1:p1) is registered as the orchestrator of project app, but this hook {NOTE} "
+        self.assertIn(f"this pane (w1:p1) is registered as orch default of project app, but this hook {NOTE} "
                       "(git did not answer in time)", text)
         self.assertNotIn("Fleet lane", text)
 
@@ -4589,7 +4701,7 @@ class OrchTests(FleetTestCase):
         before = log.read_bytes()
         with patient_fleet.record_git_limits() as calls, patient_fleet.git_times_out():
             data = {"source": "clear", "cwd": str(self.repo)}
-            self.assertEqual(fleet.orch_decide(data, [self.project], fleet.HookRun()),
+            self.assertEqual(fleet.orch_decide(data, self.cands(), fleet.HookRun()),
                              (fleet.NOTE, fleet.HOOK_NO_ANSWER))
             self.assertIsNone(fleet.hook_session_event("session_start", data, env))
             texts = {source: fleet.session_start_context({**data, "source": source}, env)
@@ -4599,7 +4711,7 @@ class OrchTests(FleetTestCase):
             (self.root / "orch.json").rename(self.project / "orch.json")
         self.assertTrue(calls)  # git was asked, and timed out each time
         self.assertEqual(log.read_bytes(), before)
-        note = ("Fleet orchestrator: this pane (w1:p1) is registered as the orchestrator of project app, but this hook "
+        note = ("Fleet orchestrator: this pane (w1:p1) is registered as orch default of project app, but this hook "
                 "could not confirm that this session works in that project (git did not answer in time), so it gives "
                 'no re-brief. If you orchestrate it, run `python3 "/plugins/fleet/scripts/fleet" digest --project app` '
                 f'first, then read {self.project / "PROJECT.md"} and load the fleet:fleet skill.')
@@ -4614,7 +4726,7 @@ class OrchTests(FleetTestCase):
         fleet.write_json(other / "orch.json", {"pane": "w1:p1"})
         with patient_fleet.git_times_out():
             text = fleet.session_start_context(data, env)
-        self.assertIn(f"orchestrator of one of the projects app, {other.name}, but", text)
+        self.assertIn(f"registered as an orch of one of the projects app/default, {other.name}/default, but", text)
         self.assertIn("digest --project NAME` first", text)
 
     def test_orch_outcomes(self):
@@ -4633,7 +4745,7 @@ class OrchTests(FleetTestCase):
             cp, asked, _ = self.hook_child("session-start", {"source": source, "cwd": str(plain)}, [git_dir])
             self.assertEqual((cp.returncode, cp.stderr, asked), (0, "", [6, 6]), source)  # the record asks again
             context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
-            self.assertIn(f"orchestrator of project app, but this hook {NOTE} (git found no repository here)",
+            self.assertIn(f"orch default of project app, but this hook {NOTE} (git found no repository here)",
                           context)
             # (b) another project's checkout: no note.
             cp, _, _ = self.hook_child("session-start", {"source": source, "cwd": str(other)}, [git_dir])
@@ -4644,18 +4756,21 @@ class OrchTests(FleetTestCase):
             self.assertEqual((cp.returncode, cp.stdout, cp.stderr), (0, "", ""), source)
         # (a) the project's checkout: the re-brief.
         cp, _, _ = self.hook_child("session-start", {"source": "startup", "cwd": str(self.repo)}, [git_dir])
-        self.assertIn("you orchestrate project app (pane w1:p1)",
+        self.assertIn("you orchestrate project app as orch default (pane w1:p1)",
                       json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
         # In-process, the same outcomes.
         env = {"HERDR_PANE_ID": "w1:p1"}
-        self.assertEqual(fleet.orch_candidates(env), ("w1:p1", [self.project]))
+        [cand] = self.cands()
+        self.assertEqual(cand[:2], (self.project, "default"))
+        self.assertEqual(cand[2]["pane"], "w1:p1")
+        self.assertEqual(fleet.orch_candidates(env), ("w1:p1", [cand]))
         self.assertEqual(fleet.orch_candidates({"HERDR_PANE_ID": "w5:p5"}), ("w5:p5", []))
-        homes = [self.project]
+        homes = [cand]
         self.assertEqual(fleet.orch_decide({"cwd": str(plain)}, homes, fleet.HookRun()),
                          (fleet.NOTE, fleet.HOOK_NO_REPOSITORY))
         self.assertEqual(fleet.orch_decide({"cwd": str(other)}, homes, fleet.HookRun()), (fleet.ORDINARY, None))
         self.assertEqual(fleet.orch_decide({"cwd": str(self.repo)}, homes, fleet.HookRun()),
-                         (fleet.REBRIEF, self.project))
+                         (fleet.REBRIEF, cand))
         # project_home's refusal still tells "no repository" by the .git entries; the hook does not use that.
         with mock.patch.dict(os.environ, {"GIT_DIR": str(plain / "nowhere")}):
             self.assertFalse(fleet.no_git_entry(str(self.root)))
@@ -4683,7 +4798,7 @@ class OrchTests(FleetTestCase):
             cp, _, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(self.repo)}, [bin_dir])
             self.assertEqual((cp.returncode, cp.stderr), (0, ""), name)
             context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
-            self.assertIn(f"orchestrator of project app, but this hook {NOTE} ({causes[name]})", context, name)
+            self.assertIn(f"orch default of project app, but this hook {NOTE} ({causes[name]})", context, name)
             self.assertNotIn("Fleet lane", context, name)
         # A git that cannot start: not executable (PermissionError), not a program (OSError).
         for name, text, mode in (("not executable", "#!/bin/sh\nexit 0\n", 0o644), ("not a program", "junk\n", 0o755)):
@@ -4791,7 +4906,7 @@ class OrchTests(FleetTestCase):
         cp, asked, _ = self.hook_child("session-start", {"source": "compact", "cwd": str(self.repo)})
         self.assertEqual((cp.returncode, cp.stderr, asked), (0, "", [6, 6]))
         context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn(f"this pane (w1:p1) is registered as the orchestrator of project app, but this hook {NOTE} "
+        self.assertIn(f"this pane (w1:p1) is registered as orch default of project app, but this hook {NOTE} "
                       "(a git error)", context)
         cp, _, _ = self.hook_child("session-end", {"cwd": str(self.repo)})
         self.assertEqual((cp.returncode, cp.stdout, cp.stderr), (0, "", ""))
@@ -4806,7 +4921,7 @@ class OrchTests(FleetTestCase):
         payload = {"source": "compact", "cwd": str(self.repo), "session_id": "s-2"}
         cp, asked, _ = self.hook_child("session-start", payload, [git_dir], PATIENT_GIT_TAKES="2")
         self.assertEqual(asked, [6, 4, 2])
-        self.assertIn("you orchestrate project app (pane w1:p1)",
+        self.assertIn("you orchestrate project app as orch default (pane w1:p1)",
                       json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
         self.assertEqual(self.events("session_start")[-1]["branch"], "main")
         cp, asked, _ = self.hook_child("session-start", payload, [git_dir], PATIENT_GIT_TAKES="2.5")
@@ -4892,7 +5007,7 @@ class OrchTests(FleetTestCase):
         payload = {"source": "compact", "cwd": str(self.repo)}
         cp, _, _ = self.hook_child("session-start", payload, [git_dir], PATIENT_RAISE_IN="orch_context")
         self.assertEqual((cp.returncode, cp.stderr), (0, ""))
-        self.assertIn(f"orchestrator of project app, but this hook {NOTE} (an error in the hook: RuntimeError)",
+        self.assertIn(f"orch default of project app, but this hook {NOTE} (an error in the hook: RuntimeError)",
                       json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
         cp, _, _ = self.hook_child("session-start", payload, [git_dir], PATIENT_RAISE_IN="lane_context",
                                    HERDR_PANE_ID="w5:p5")
@@ -4930,7 +5045,7 @@ class OrchTests(FleetTestCase):
         with self.assertRaises(RecursionError):
             json.loads((deep / "orch.json").read_text())
         self.assertEqual(fleet.read_json(deep / "orch.json"), {})
-        self.assertEqual(fleet.orch_candidates({"HERDR_PANE_ID": "w1:p1"}), ("w1:p1", [self.project]))
+        self.assertEqual(fleet.orch_candidates({"HERDR_PANE_ID": "w1:p1"}), ("w1:p1", self.cands()))
         real_read = fleet.read_json
 
         def read_fails_for_deep(path):  # each file is read alone, also when a read itself raises
@@ -4938,14 +5053,14 @@ class OrchTests(FleetTestCase):
                 raise RecursionError("maximum recursion depth exceeded")
             return real_read(path)
         with mock.patch.object(fleet, "read_json", side_effect=read_fails_for_deep):
-            self.assertEqual(fleet.orch_candidates({"HERDR_PANE_ID": "w1:p1"}), ("w1:p1", [self.project]))
+            self.assertEqual(fleet.orch_candidates({"HERDR_PANE_ID": "w1:p1"}), ("w1:p1", self.cands()))
         project_json = self.project / "project.json"
         good = project_json.read_text()
         for source in ("startup", "resume", "clear", "compact"):
             payload = {"source": source, "cwd": str(self.repo)}
             cp, _, _ = self.hook_child("session-start", payload, [git_dir])
             self.assertEqual((cp.returncode, cp.stderr), (0, ""), source)
-            self.assertIn("you orchestrate project app (pane w1:p1)",
+            self.assertIn("you orchestrate project app as orch default (pane w1:p1)",
                           json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"], source)
             # app's project.json truncated: git still names the checkout, but the comparison cannot be made.
             project_json.write_text("{")
@@ -4955,17 +5070,17 @@ class OrchTests(FleetTestCase):
                 project_json.write_text(good)
             self.assertEqual((cp.returncode, cp.stderr), (0, ""), source)
             context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
-            self.assertIn(f"orchestrator of project app, but this hook {NOTE} (the project file of app could not be "
+            self.assertIn(f"orch default of project app, but this hook {NOTE} (the project file of app could not be "
                           "read)", context, source)
             self.assertNotIn("You implement", context, source)
         # A project.json with no keys is no comparison either; another project's checkout with readable files is.
         other = self.root / "other"
         other.mkdir()
         git("init", "-q", "-b", "main", cwd=other)
-        self.assertEqual(fleet.orch_decide({"cwd": str(other)}, [self.project], fleet.HookRun()),
+        self.assertEqual(fleet.orch_decide({"cwd": str(other)}, self.cands(), fleet.HookRun()),
                          (fleet.ORDINARY, None))
         fleet.write_json(project_json, {"name": "app"})
-        self.assertEqual(fleet.orch_decide({"cwd": str(other)}, [self.project], fleet.HookRun()),
+        self.assertEqual(fleet.orch_decide({"cwd": str(other)}, self.cands(), fleet.HookRun()),
                          (fleet.NOTE, "the project file of app could not be read"))
         project_json.write_text(good)
         # One candidate read per SessionStart, before the input is read; none for SessionEnd.
@@ -4996,7 +5111,7 @@ class OrchTests(FleetTestCase):
         for raw in (b"{", b"[]", b"\xff{}", json.dumps({"source": "compact", "cwd": str(self.repo)}).encode()[:-1]):
             cp, _, _ = self.hook_child("session-start", None, [git_dir], raw=raw)
             self.assertEqual((cp.returncode, cp.stderr), (0, ""), raw)
-            self.assertIn(f"orchestrator of project app, but this hook {NOTE} (the hook input could not be read)",
+            self.assertIn(f"orch default of project app, but this hook {NOTE} (the hook input could not be read)",
                           json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"], raw)
             cp, _, _ = self.hook_child("session-start", None, [git_dir], raw=raw, HERDR_PANE_ID="w5:p5")
             self.assertEqual((cp.returncode, cp.stdout, cp.stderr), (0, "", ""), raw)
@@ -5011,7 +5126,7 @@ class OrchTests(FleetTestCase):
         self.assertEqual((cp.returncode, cp.stdout, cp.stderr), (0, "", ""))
         plain = self.root / "plain"
         plain.mkdir()
-        fixed = ("Fleet orchestrator: this pane (w1:p1) is registered as the orchestrator of app, but this hook could "
+        fixed = ("Fleet orchestrator: this pane (w1:p1) is registered as orch app/default, but this hook could "
                  "not confirm that this session works in that project (git found no repository here), so it gives no "
                  "re-brief. If you orchestrate it, run the fleet helper's `digest` command first, then read the "
                  "project's PROJECT.md.")
@@ -5022,7 +5137,7 @@ class OrchTests(FleetTestCase):
                 cp, _, _ = self.hook_child("session-start", payload, [git_dir], PATIENT_RAISE_IN=injection)
                 self.assertEqual((cp.returncode, cp.stderr), (0, ""), (source, injection))
                 context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
-                self.assertIn(f"orchestrator of project app, but this hook {NOTE} ({cause})", context)
+                self.assertIn(f"orch default of project app, but this hook {NOTE} ({cause})", context)
             # The note builder fails: the fixed note.
             cp, _, _ = self.hook_child("session-start", {"source": source, "cwd": str(plain)}, [git_dir],
                                        PATIENT_RAISE_IN="orch_unconfirmed_note")
@@ -5032,7 +5147,7 @@ class OrchTests(FleetTestCase):
             cp, _, _ = self.hook_child("session-start", payload, [git_dir], PATIENT_RAISE_IN="orch_rebrief:FakeClockLimit")
             self.assertEqual((cp.returncode, cp.stdout), (1, ""), source)
             self.assertIn("\nFakeClockLimit: patient_fleet: injected in orch_rebrief", cp.stderr, source)
-        self.assertEqual(fleet.orch_fixed_note([self.project], "w1:p1", fleet.HOOK_NO_REPOSITORY), fixed)
+        self.assertEqual(fleet.orch_fixed_note(self.cands(), "w1:p1", fleet.HOOK_NO_REPOSITORY), fixed)
 
     def test_write_json_syncs_before_it_replaces(self):
         path = self.root / "data.json"
