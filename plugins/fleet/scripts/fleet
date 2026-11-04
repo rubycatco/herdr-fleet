@@ -3662,8 +3662,8 @@ def helper_command(env) -> str:
 
 def orch_match(data: dict, env) -> tuple[Path, str] | None:
     """(project home, pane) when the session runs in the registered orch pane of the project that holds its
-    directory. Reads files only, and runs git once with HOOK_GIT_TIMEOUT, and only when an orch.json names
-    this pane."""
+    directory. Reads files, and runs git (two calls, each with HOOK_GIT_TIMEOUT) only when an orch.json
+    names this pane."""
     pane = text_or_none(env.get("HERDR_PANE_ID"))
     if not pane:
         return None
