@@ -3017,8 +3017,8 @@ class OrchTests(FleetTestCase):
             self.assertEqual(self.main("orch", "show", "--orch", "nope")[0], 1)
         self.assertIn("no orch 'nope' in project app; its orchs: billing, default", err.getvalue())
         # list: every orch, its pane's state and its cached board.
-        fleet.save_board(self.project / "orchs" / "default", [{"lane": "a", "phase": "idle"},
-                                                              {"lane": "b", "phase": "removed"}], fleet.precise_now())
+        fleet.save_board(self.project, [{"lane": "a", "phase": "idle"}, {"lane": "b", "phase": "removed"}],
+                         fleet.precise_now(), fleet.orch_files(self.project, "default")["board"])
         rows = json.loads(self.main("orch", "list", "--json")[1])["orchs"]
         self.assertEqual([(r["name"], r["pane"], r["state"], r["lanes"]) for r in rows],
                          [("billing", "w2:p1", "unknown", None), ("default", "w1:p1", "alive", 1)])
@@ -3511,6 +3511,184 @@ class OrchTests(FleetTestCase):
         out = self.board([], "digest", pane="w1:p1")[1]
         self.assertIn("lane-a: ready 1 -> gone", out)
         self.assertEqual(fleet.read_json(self.project / "digest.json")["lanes"], {})
+
+    def two_orchs(self):
+        """Orch default (w1:p1) and orch billing (w2:p1), both alive, with lanes a (default's), b (billing's) and c
+        (unowned)."""
+        self.main("orch", "claim", pane="w1:p1")
+        self.main("orch", "claim", "--name", "billing", pane="w2:p1")
+        self.alive.update({"w1:p1", "w2:p1"})
+        lanes = {n: self.add_lane(n, STATUS_md="## Next step\nGo.\n") for n in "abc"}
+        fleet.write_json(lanes["a"] / ".fleet" / "lane.json", {"orch": "default", "branch": "feat/a"})
+        fleet.write_json(lanes["b"] / ".fleet" / "lane.json", {"orch": "billing", "branch": "feat/b"})
+        return lanes
+
+    def views(self, lanes, *argv, pane=None, **extra):
+        """`board` or `digest` through the real collect_lanes, with herdr's lanes stubbed (`lanes`, open workspaces)
+        and their facts too: (exit code, output, the lanes whose facts were read)."""
+        stubs = [{"workspace": f"w{i}", "label": None, "path": str(p), "panes": []} for i, p in enumerate(lanes, 5)]
+        seen = []
+
+        def facts(stub, *args, **kwargs):
+            seen.append(stub["path"])
+            return {**self.facts(stub["path"]), "main_root": stub.get("main_root")}
+        with mock.patch.object(fleet, "enumerate_lanes", return_value=(stubs, [])), \
+                mock.patch.object(fleet, "lane_facts", side_effect=facts), \
+                mock.patch.object(fleet, "finish_lane", side_effect=lambda f: f), \
+                mock.patch.object(fleet.shutil, "which", return_value="/usr/bin/herdr"):
+            code, out = self.main(*argv, pane=pane, **extra)
+        return code, out, seen
+
+    def test_each_orch_sees_its_own_lanes_and_the_unowned_ones(self):
+        lanes = self.two_orchs()
+        a, b, c = (str(lanes[n]) for n in "abc")
+        orchs = self.project / "orchs"
+        code, out, seen = self.views(lanes.values(), "board", "--json", pane="w1:p1")
+        data = json.loads(out)
+        self.assertEqual((code, data["orch"], data["all"], data["saved"]), (0, "default", False, True))
+        self.assertEqual(seen, [a, c])  # filtered before the facts: gh is asked for these only
+        self.assertEqual([(r["lane"], r["orch"]) for r in data["lanes"]], [("feat/a", "default"), ("feat/c", None)])
+        self.assertEqual(data["board"], str(orchs / "default" / "board.json"))
+        self.assertEqual([r["lane"] for r in fleet.read_json(orchs / "default" / "board.json")["lanes"]],
+                         ["feat/a", "feat/c"])
+        self.assertFalse((orchs / "billing" / "board.json").exists())
+        text = self.views(lanes.values(), "board", pane="w1:p1")[1]
+        self.assertIn("project app, orch default: 2 lanes", text)
+        self.assertRegex(text, r"(?m)^feat/a .*next: Go\.$")  # another note wins over `unowned`
+        self.assertNotIn("ORCH", text)
+        (lanes["c"] / ".fleet" / "STATUS.md").write_text("# Status\n")
+        self.assertRegex(self.views(lanes.values(), "board", pane="w1:p1")[1], r"(?m)^feat/c .*unowned: adopt it$")
+        _, out, seen = self.views(lanes.values(), "board", "--json", pane="w2:p1")
+        self.assertEqual(([r["lane"] for r in json.loads(out)["lanes"]], seen), (["feat/b", "feat/c"], [b, c]))
+        # --all, and a caller that is no orch: every lane with its orch, an ORCH column, nothing saved.
+        saved = {n: (orchs / n / "board.json").read_bytes() for n in ("default", "billing")}
+        for argv, pane in ((("board", "--all"), "w1:p1"), (("board",), "w9:p9"), (("board",), None)):
+            code, text, seen = self.views(lanes.values(), *argv, pane=pane)
+            self.assertEqual((code, seen), (0, [a, b, c]), argv)
+            self.assertIn("project app (every orch's lanes): 3 lanes", text)
+            self.assertRegex(text, r"(?m)^LANE\s+ORCH\s+PHASE")
+            self.assertRegex(text, r"(?m)^feat/b\s+billing\s+")
+            self.assertRegex(text, r"(?m)^feat/c\s+-\s+.*unowned: adopt it$")
+            self.assertLessEqual(max(len(l) for l in text.splitlines()), 160)
+        data = json.loads(self.views(lanes.values(), "board", "--all", "--json", pane="w1:p1")[1])
+        self.assertEqual((data["all"], data["saved"], data["board"]), (True, False, None))
+        self.assertEqual({n: (orchs / n / "board.json").read_bytes() for n in saved}, saved)
+        self.assertFalse((self.project / "board.json").exists())  # a board never moves a file to the root
+        # The ORCH column clips a long name; LANE is clipped to 24.
+        lines = fleet.board_lines([{"lane": "x" * 40, "orch": "y" * 30, "phase": "idle"}], owners=True, column=True)
+        self.assertEqual(lines[1].split()[:2], ["x" * 23 + "…", "y" * 11 + "…"])
+
+    def test_two_orchs_have_their_own_digests(self):
+        lanes = self.two_orchs()
+        a, b, c = (str(lanes[n]) for n in "abc")
+        orchs = self.project / "orchs"
+        for name, path in (("a", a), ("b", b), ("c", c)):
+            fleet.record("send", path, pane=f"w{name}:p1", cwd=path, branch=f"feat/{name}", text=f"to {name}")
+        fleet.record("send", str(self.repo), by=False, pane="w7:p1", cwd=str(self.repo), branch="main", text="main")
+        fleet.record("follow_up_added", None, home=self.project, by=False, pane="w7:p1", id="F1", text="shared")
+        fleet.record("cleanup", str(self.repo), lane=str(self.root / "gone"), branch="feat/gone", removed=True,
+                     orch="billing")
+        fleet.record("cleanup", str(self.repo), lane=str(self.root / "mine"), branch="feat/mine", removed=True,
+                     orch="default")
+        data = json.loads(self.views(lanes.values(), "digest", "--peek", "--json", pane="w1:p1")[1])
+        self.assertEqual(data["orch"], "default")
+        texts = [e.get("text") or e["event"] for e in data["events"]]
+        # The other orch's claim and the follow-up are project events; a send in main is no lane's.
+        self.assertEqual(texts, ["orch_claim", "to a", "to c", "main", "shared", "cleanup"])
+        self.assertEqual(data["events"][0]["orch"], "billing")
+        self.assertEqual(data["events"][-1]["lane"], str(self.root / "mine"))
+        # The consuming digest of each orch: its own cursor, board and phase events.
+        data = json.loads(self.views(lanes.values(), "digest", "--json", pane="w1:p1")[1])
+        self.assertEqual(sorted((c["lane"], c["new"]) for c in data["changes"]), [("feat/a", "no agent"), ("feat/c", "no agent")])
+        self.assertEqual(sorted(fleet.read_json(orchs / "default" / "digest.json")["lanes"]), [a, c])
+        self.assertFalse((orchs / "billing" / "digest.json").exists())
+        self.assertEqual({e["orch"] for e in self.events("phase")}, {"default"})
+        data = json.loads(self.views(lanes.values(), "digest", "--json", pane="w2:p1")[1])
+        self.assertEqual(data["orch"], "billing")
+        self.assertEqual(sorted(c["lane"] for c in data["changes"]), ["feat/b", "feat/c"])  # c: on both (D9)
+        self.assertEqual([e.get("text") or e["event"] for e in data["events"]],
+                         ["orch_claim", "to b", "to c", "main", "shared", "cleanup"])
+        self.assertEqual(data["events"][0]["orch"], "default")
+        self.assertEqual(data["events"][-1]["lane"], str(self.root / "gone"))
+        self.assertEqual(sorted(fleet.read_json(orchs / "billing" / "digest.json")["lanes"]), [b, c])
+        self.assertEqual(sorted(e["orch"] for e in self.events("phase")), ["billing", "billing", "default", "default"])
+        self.assertFalse((self.project / "digest.json").exists())  # a digest never moves a file
+        # The default's cursor did not move with billing's: its next digest has nothing new.
+        out = self.views(lanes.values(), "digest", pane="w1:p1")[1]
+        self.assertIn("project app, orch default: digest since", out)
+        self.assertIn("No phase changes.", out)
+        self.assertIn("No new events.", out)
+        # A removed lane is on its own orch's board only.
+        fleet.write_json(orchs / "billing" / "digest.json", {**fleet.read_json(orchs / "billing" / "digest.json"),
+                                                             "cursor": "2020-01-01T00:00:00+00:00"})
+        recs = json.loads(self.views(lanes.values(), "board", "--json", pane="w2:p1")[1])["lanes"]
+        self.assertEqual([(r["lane"], r["phase"], r["orch"]) for r in recs if r["phase"] == "removed"],
+                         [("feat/gone", "removed", "billing")])
+
+    def test_who_may_consume_a_digest_with_two_orchs(self):
+        lanes = self.two_orchs()
+        orchs = self.project / "orchs"
+        # A caller that is no orch only reads, and is told to name one.
+        data = json.loads(self.views(lanes.values(), "digest", "--json", pane="w9:p9")[1])
+        self.assertEqual((data["read_only"], data["why"], data["orch"]), (True, "name the orch: --orch NAME", None))
+        self.assertEqual({r["orch"] for r in data["lanes"]}, {"default", "billing", None})  # every lane
+        # --orch from another pane only reads while that orch's pane is alive.
+        data = json.loads(self.views(lanes.values(), "digest", "--orch", "default", "--json", pane="w9:p9")[1])
+        self.assertEqual((data["read_only"], data["why"]), (True, "pane w1:p1 is orch default of this project"))
+        self.assertFalse((orchs / "default" / "digest.json").exists())
+        self.alive.discard("w1:p1")
+        data = json.loads(self.views(lanes.values(), "digest", "--orch", "default", "--json", pane="w9:p9")[1])
+        self.assertFalse(data["read_only"])
+        self.assertTrue((orchs / "default" / "digest.json").exists())
+        self.assertFalse((orchs / "billing" / "digest.json").exists())
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(self.views(lanes.values(), "digest", "--orch", "nope", pane="w9:p9")[0], 1)
+        # A consuming digest from the orch's pane records its session (the hook's session match), once.
+        before = fleet.read_orchs(self.project)
+        self.views(lanes.values(), "digest", pane="w2:p1", CLAUDE_CODE_SESSION_ID="sess-new")
+        after = fleet.read_orchs(self.project)
+        self.assertEqual((after["billing"]["session"], after["default"]), ("sess-new", before["default"]))
+        stamp = (self.project / "orch.json").stat().st_mtime_ns
+        self.views(lanes.values(), "digest", pane="w2:p1", CLAUDE_CODE_SESSION_ID="sess-new")
+        self.assertEqual((self.project / "orch.json").stat().st_mtime_ns, stamp)  # no change, no write
+        self.views(lanes.values(), "digest", "--peek", pane="w2:p1", CLAUDE_CODE_SESSION_ID="sess-peek")
+        self.assertEqual(fleet.read_orchs(self.project)["billing"]["session"], "sess-new")  # --peek writes nothing
+        # One legacy orch: a consuming digest refreshes its session in the legacy shape.
+        (self.project / "orch.json").unlink()
+        self.main("orch", "claim", pane="w1:p1")
+        self.views([], "digest", pane="w1:p1", CLAUDE_CODE_SESSION_ID="sess-legacy")
+        rec = json.loads((self.project / "orch.json").read_text())
+        self.assertEqual((rec["session"], (self.project / "orch.json").read_bytes()),
+                         ("sess-legacy", self.legacy_bytes(rec)))
+
+    def test_log_by_orch(self):
+        lanes = self.two_orchs()
+        a, b = str(lanes["a"]), str(lanes["b"])
+        fleet.record("worktree", a, lane=a, branch="feat/a", orch="default")
+        fleet.record("worktree", b, lane=b, branch="feat/b", orch="billing")
+        fleet.record("send", a, pane="w5:p1", cwd=a, branch="feat/a", text="to a")
+        fleet.record("send", b, pane="w6:p1", cwd=b, branch="feat/b", text="to b")
+        fleet.record("follow_up_taken", None, home=self.project, id="F2", branch="feat/a", text="x")
+        rows = json.loads(self.main("log", "--orch", "default", "--json")[1])
+        self.assertEqual([(e["event"], e.get("text")) for e in rows],
+                         [("orch_claim", None), ("worktree", None), ("send", "to a"), ("follow_up_taken", "x")])
+        self.assertEqual([e["event"] for e in json.loads(self.main("log", "--orch", "billing", "--json")[1])],
+                         ["orch_claim", "worktree", "send"])
+
+    def test_rebrief_count_follows_the_view(self):
+        """The re-brief of an orch of a project with two orchs reads its own files and counts the events of its view,
+        from the cached boards only."""
+        lanes = self.two_orchs()
+        (lanes["c"] / ".fleet" / "STATUS.md").write_text("# Status\n")
+        for pane in ("w1:p1", "w2:p1"):
+            self.views(lanes.values(), "digest", pane=pane)
+        for name in "abc":
+            path = str(lanes[name])
+            fleet.record("send", path, by=False, pane="w8:p1", cwd=path, branch=f"feat/{name}", text=name)
+        with mock.patch.object(fleet, "collect_lanes", side_effect=AssertionError("no scan")):
+            text = fleet.orch_rebrief(self.project, "w1:p1", {"source": "clear"}, {})
+        self.assertIn("2 events since the last digest.", text)  # a and c, not b
+        self.assertRegex(text, r"feat/c .*unowned: adopt it")
 
     def test_digest_only_reads_for_another_pane_than_a_live_orch(self):
         a = self.add_lane("a")

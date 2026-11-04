@@ -1801,6 +1801,19 @@ def find_transcript(agent: str | None, session: str, homes: dict[str, list[str]]
     return None
 
 
+OWNING_EVENTS = ("worktree", "adopt", "cleanup")  # events whose `orch` names the owner of their lane
+
+
+def orch_events(events: list[dict], name: str) -> list[dict]:
+    """The events that name orch `name`, and the events of its lanes: the lanes and branches of its worktree, adopt
+    and cleanup events. Reads the log only."""
+    paths = {e["lane"] for e in events if e.get("orch") == name and e.get("event") in OWNING_EVENTS and e.get("lane")}
+    branches = {e["branch"] for e in events
+                if e.get("orch") == name and e.get("event") in OWNING_EVENTS and e.get("branch")}
+    return [e for e in events if e.get("orch") == name or (
+        e.get("orch") is None and (e.get("branch") in branches or any(lane_matches(e, p) for p in paths)))]
+
+
 def log_dirs(args: argparse.Namespace) -> list[Path]:
     known = ", ".join(p.name for p in project_dirs()) or "none yet"
     if args.all:
@@ -1826,6 +1839,8 @@ def cmd_log(args: argparse.Namespace) -> int:
         events = [e for e in events if e.get("event") in kinds]
     if args.lane:
         events = lane_events(events, args.lane)
+    if args.orch:
+        events = orch_events(events, args.orch)
     if args.pane:
         events = [e for e in events if pane_matches(e, args.pane)]
     if args.sessions:
@@ -3354,7 +3369,11 @@ def risk_note(risk) -> str:
 
 
 def board_record(f: dict, events: list[dict], home: Path | None = None,
-                 follow_ups: dict[str, list[dict]] | None = None) -> dict:
+                 follow_ups: dict[str, list[dict]] | None = None, roots: dict[str, str | None] | None = None,
+                 viewer: str | None = None) -> dict:
+    """The board's record of a lane. `orch` is its owner (lane.json), `checkout` its main checkout. `clone`, the
+    lane's main checkout, when that is not the main checkout of its orch's recorded checkout (the owner's, else the
+    viewer's for an unowned lane; `roots`, orch_roots): the lane sits in another clone of the project."""
     d = Path(f["path"]) / FLEET_DIR
     roles = load_panes(d)
     panes = [{"pane": p.get("pane"), "role": (roles.get(p.get("pane") or "") or {}).get("role"),
@@ -3367,7 +3386,11 @@ def board_record(f: dict, events: list[dict], home: Path | None = None,
            "phase": phase, "last_event": newest_lane_event(events, f["path"], f.get("branch")),
            "blocked": first_note(status_md, "Blocked"), "next": first_note(status_md, r"Next steps?"),
            "risk": board_risk(f["path"], phase, home, bool(f.get("git"))),
-           "follow_ups": [x["id"] for x in (follow_ups or {}).get(f.get("branch") or "", []) if x["id"]]}
+           "follow_ups": [x["id"] for x in (follow_ups or {}).get(f.get("branch") or "", []) if x["id"]],
+           "orch": lane_owner(f["path"]), "checkout": f.get("main_root")}
+    root = (roots or {}).get(out["orch"] or viewer)
+    if root and f.get("main_root") and os.path.realpath(f["main_root"]) != os.path.realpath(root):
+        out["clone"] = f["main_root"]
     if phase.startswith("plan ready"):
         warning = plan_gate_note(f["path"])
         if warning:
@@ -3409,8 +3432,10 @@ def open_research(home: Path) -> list[dict]:
     return out
 
 
-def removed_records(events: list[dict], since: float | None, on_board: set[str], names: dict[str, str]) -> list[dict]:
-    """The lanes that a cleanup event removed at or after `since` (none without it), and that are gone now.
+def removed_records(events: list[dict], since: float | None, on_board: set[str], names: dict[str, str],
+                    view: dict | None = None) -> list[dict]:
+    """The lanes that a cleanup event removed at or after `since` (none without it), and that are gone now. A view
+    that filters keeps those of its orch and the unowned ones (the cleanup event names the lane's orch).
 
     A lane that is on the board again was made anew at the same path after its cleanup.
     """
@@ -3423,15 +3448,36 @@ def removed_records(events: list[dict], since: float | None, on_board: set[str],
             continue
         if os.path.realpath(path) in on_board:
             continue
+        if view and view.get("filtered") and e.get("orch") not in (None, view.get("name")):
+            continue
         found[path] = {"lane": names.get(path) or e.get("branch") or os.path.basename(path), "path": path,
                        "branch": e.get("branch"), "workspace": e.get("workspace"), "panes": [], "pr": None,
                        "phase": "removed", "last_event": {"ts": e.get("ts"), "event": "cleanup"},
-                       "blocked": None, "next": None, "risk": None, "follow_ups": []}
+                       "blocked": None, "next": None, "risk": None, "follow_ups": [], "orch": e.get("orch")}
     return list(found.values())
 
 
-def lane_selector(home: Path):
-    """A `collect_lanes` filter for the lanes of the project at `home`, with the project cached per main checkout."""
+def lane_owner(path: str) -> str | None:
+    """The orch that owns the lane at `path`, by name, from its .fleet/lane.json; None: unowned (no file, or no name)."""
+    return text_or_none(read_json(Path(path) / FLEET_DIR / LANE_FILE).get("orch"))
+
+
+def write_lane_owner(cwd: str, home: Path | None, name: str | None, pane: str | None) -> str:
+    """Record the orch that owns the lane at `cwd` (by name, never by pane: panes change at every handoff) in its
+    .fleet/lane.json, atomically. Returns the file."""
+    fleet_dir = Path(prep_dir(cwd)["fleet_dir"])
+    path = fleet_dir / LANE_FILE
+    write_json(path, {"orch": name, "project": home.name if home else None,
+                      "branch": git_branch(cwd) or None, "since": now_iso(), "by": pane})
+    return str(path)
+
+
+def lane_selector(home: Path, view: dict | None = None):
+    """A `collect_lanes` filter for the lanes of the project at `home`, with the project cached per main checkout.
+    With a `view` that filters (orch_view), it keeps only the view's orch's own lanes and the unowned ones, by each
+    lane's .fleet/lane.json (one small file), so that gh is asked for those alone. `select.lanes` maps the real path
+    of each lane of the project that it saw, on the view or not, to its owner (None: unowned); `select.branches`
+    maps the branches that lane.json files name to their owners."""
     cache: dict[str, bool] = {}
     want = os.path.realpath(home)
 
@@ -3444,19 +3490,61 @@ def lane_selector(home: Path):
             ident = repo_identity(root)
             found = find_project(ident["keys"]) if ident else None
             cache[key] = found is not None and os.path.realpath(found) == want
-        return cache[key]
+        if not cache[key]:
+            return False
+        rec = read_json(Path(stub["path"]) / FLEET_DIR / LANE_FILE)
+        owner = text_or_none(rec.get("orch"))
+        select.lanes[os.path.realpath(stub["path"])] = owner
+        if text_or_none(rec.get("branch")):
+            select.branches[rec["branch"]] = owner
+        return not (view and view.get("filtered")) or owner in (None, view.get("name"))
+    select.lanes, select.branches = {}, {}
     return select
 
 
-def make_board(home: Path, since: float | None, names: dict[str, str]) -> list[dict]:
-    """A fresh board of the project's lanes, with the lanes removed since `since`. Runs herdr, git and gh."""
+def orch_view(home: Path, name: str | None = None, all_lanes: bool = False) -> dict:
+    """What `board` and `digest` show the caller: its orch (current_orch; `name` is --orch), that orch's files, and
+    whether the board is filtered to that orch's own and unowned lanes (a project with several orchs and a resolved
+    orch, without --all) or shows every lane with its orch (--all, or several orchs and none resolved)."""
+    orchs, is2 = orch_registry(home)
+    name, rec = current_orch(home, name, orchs)
+    several = len(orchs) > 1
+    return {"name": name, "record": rec, "orchs": orchs, "is2": is2, "several": several,
+            "filtered": several and name is not None and not all_lanes,
+            "all": all_lanes or (several and name is None), "files": orch_files(home, name, is2)}
+
+
+def orch_roots(home: Path, orchs: dict[str, dict]) -> dict[str, str | None]:
+    """The main checkout of each orch's recorded checkout, by name; None when it is not a checkout of this project
+    (an orch pane can sit in another project's checkout) or git cannot tell."""
+    roots: dict[str, str | None] = {}
+    for name, rec in orchs.items():
+        checkout = text_or_none(rec.get("checkout"))
+        ident = repo_identity(checkout) if checkout and os.path.isdir(checkout) else None
+        found = find_project(ident["keys"]) if ident else None
+        roots[name] = ident["main_root"] if found and os.path.realpath(found) == os.path.realpath(home) else None
+    return roots
+
+
+def make_board(home: Path, since: float | None, names: dict[str, str], view: dict | None = None) -> list[dict]:
+    """A fresh board of the project's lanes (of the view's lanes, for a view that filters), with the lanes removed
+    since `since`. Runs herdr, git and gh. It puts the lanes that it saw, with their owners, in view["lanes"] and
+    view["branches"] (lane_selector), for the digest's event filter."""
     if not shutil.which("herdr"):
         raise FleetError("herdr not found in PATH")
-    lanes, _, _ = collect_lanes(select=lane_selector(home))
+    select = lane_selector(home, view)
+    lanes, _, _ = collect_lanes(select=select)
     events = read_events([home])
     held, _ = lane_follow_ups(home)  # PROJECT.md, read once per board
-    records = [board_record(f, events, home, held) for f in lanes]
-    records += removed_records(events, since, {os.path.realpath(r["path"]) for r in records}, names)
+    roots = orch_roots(home, view["orchs"]) if view else {}
+    viewer = view.get("name") if view else None
+    records = [board_record(f, events, home, held, roots, viewer) for f in lanes]
+    records += removed_records(events, since, {os.path.realpath(r["path"]) for r in records}, names, view)
+    if view is not None:
+        view["lanes"], view["branches"] = dict(select.lanes), dict(select.branches)
+        for r in records:
+            if r.get("branch"):
+                view["branches"].setdefault(r["branch"], r.get("orch"))
     return sorted(records, key=lambda r: (r["phase"] == "removed", r["lane"], r["path"]))
 
 
@@ -3464,10 +3552,11 @@ def precise_now() -> str:
     return datetime.now().astimezone().isoformat(timespec="microseconds")
 
 
-def save_board(home: Path, records: list[dict], made: str) -> bool:
-    """Write board.json unless it already holds a board made later. `made` is when the board collection began.
-    The caller holds the project lock."""
-    path = home / BOARD_FILE
+def save_board(home: Path, records: list[dict], made: str, path: Path | None = None) -> bool:
+    """Write board.json (`path`: an orch's own, orch_files; default the root one) unless it already holds a board made
+    later. `made` is when the board collection began. The caller holds the project lock."""
+    path = path or home / BOARD_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
     if event_time({"ts": read_json(path).get("made")}) > event_time({"ts": made}):
         return False
     write_json(path, {"made": made, "project": home.name, "lanes": records})
@@ -3517,12 +3606,14 @@ def as_dict(value) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def board_lines(records: list) -> list[str]:
-    """The board as a compact text table: one line per lane. A damaged record in board.json shows as blanks."""
+def board_lines(records: list, owners: bool = False, column: bool = False) -> list[str]:
+    """The board as a compact text table: one line per lane. A damaged record in board.json shows as blanks. `owners`
+    (a project with several orchs): an unowned lane gets the note `unowned: adopt it`, last of the notes. `column`
+    (every lane, --all): an ORCH column, and LANE clipped to 24."""
     records = [r for r in records if isinstance(r, dict)] if isinstance(records, list) else []
     if not records:
         return ["no lanes"]
-    table = [["LANE", "PHASE", "PR", "PANES", "LAST", "NOTE"]]
+    table = [["LANE"] + (["ORCH"] if column else []) + ["PHASE", "PR", "PANES", "LAST", "NOTE"]]
     for r in records:
         pr = as_dict(r.get("pr"))
         panes = r.get("panes") if isinstance(r.get("panes"), list) else []
@@ -3532,10 +3623,14 @@ def board_lines(records: list) -> list[str]:
         blocked, nxt, warning = as_text(r.get("blocked")), as_text(r.get("next")), as_text(r.get("warning"))
         risky = risk_note(r.get("risk"))
         held = [x for x in r.get("follow_ups") or [] if isinstance(x, str)] if isinstance(r.get("follow_ups"), list) else []
+        clone = as_text(r.get("clone"))
+        unowned = owners and "orch" in r and r.get("orch") is None and r.get("phase") != "removed"
         note = (warning if warning else risky if risky else f"blocked: {blocked}" if blocked
-                else f"next: {nxt}" if nxt else f"follow-ups: {', '.join(held)}" if held else "")
+                else f"next: {nxt}" if nxt else f"follow-ups: {', '.join(held)}" if held
+                else f"in another clone: {short_path(clone)}" if clone else "unowned: adopt it" if unowned else "")
         number = pr.get("number")
-        table.append([clip(as_text(r.get("lane")) or "?", 28), as_text(r.get("phase")) or "?",
+        table.append([clip(as_text(r.get("lane")) or "?", 24 if column else 28)]
+                     + ([clip(as_text(r.get("orch")) or "-", 12)] if column else []) + [as_text(r.get("phase")) or "?",
                       f"#{number} {as_text(pr.get('state')).lower()}".strip() if isinstance(number, int) else "-",
                       panes or "-", f"{clock(last)} {as_text(last.get('event'))}".strip() if last else "-",
                       clip(note, 60)])
@@ -3959,9 +4054,10 @@ def cmd_orch(args: argparse.Namespace) -> int:
     return 0
 
 
-def digest_base(home: Path) -> tuple[float | None, dict[str, dict], dict[str, int]]:
-    """The digest's cursor (a timestamp, or None), the lanes it saw then by path, and how far it read each log."""
-    data = read_json(home / DIGEST_FILE)
+def digest_base(path: Path) -> tuple[float | None, dict[str, dict], dict[str, int]]:
+    """The digest's cursor (a timestamp, or None), the lanes it saw then by path, and how far it read each log, from
+    the digest.json at `path` (an orch's own, orch_files)."""
+    data = read_json(path)
     cursor = event_time({"ts": data.get("cursor")}) or None
     lanes = as_dict(data.get("lanes"))
     read = {k: v for k, v in as_dict(data.get("read")).items()
@@ -4000,13 +4096,47 @@ def read_new_events(home: Path, read: dict[str, int],
     return events, offsets, False
 
 
-def digest_events(events: list[dict], orch_pane: str | None, lane_paths: list[str]) -> list[dict]:
+PROJECT_EVENTS = ("orch_claim", "orch_release", "orch_rename") + FOLLOW_UP_EVENTS  # every orch sees them
+
+
+def under_lane(path, lanes: dict[str, str | None]) -> tuple[bool, str | None]:
+    """(whether `path` is at or inside one of `lanes`, real path -> owner; that lane's owner)."""
+    if not isinstance(path, str) or not path:
+        return False, None
+    real = os.path.realpath(path)
+    for root, owner in lanes.items():
+        if real == root or real.startswith(root.rstrip(os.sep) + os.sep):
+            return True, owner
+    return False, None
+
+
+def view_shows(e: dict, view: dict | None) -> bool:
+    """Whether an event belongs on the view of an orch (`view`: {name, lanes, branches}, None: every event). A
+    project-level event (PROJECT_EVENTS) goes to every orch. An event of a lane (its `lane` or `cwd` inside a lane
+    of the project, else its `branch` a lane's) shows when that lane is the orch's own or unowned; any other event
+    shows unless it names another orch."""
+    if not view or e.get("event") in PROJECT_EVENTS:
+        return True
+    mine = (None, view.get("name"))
+    for path in (e.get("lane"), e.get("cwd")):
+        hit, owner = under_lane(path, view.get("lanes") or {})
+        if hit:
+            return owner in mine
+    branches = view.get("branches") or {}
+    if e.get("branch") in branches:
+        return branches[e["branch"]] in mine
+    return e.get("orch") in mine
+
+
+def digest_events(events: list[dict], orch_pane: str | None, lane_paths: list[str],
+                  view: dict | None = None) -> list[dict]:
     """Of the unseen events, those for the orch: not its own, no `phase` and no session events, except a
-    compaction in a lane pane (that lane can need a reset)."""
+    compaction in a lane pane (that lane can need a reset); with a `view` (view_shows), only the events of its
+    lanes and of the project."""
     out = []
     for e in events:
         kind = e.get("event")
-        if kind == "phase":
+        if kind == "phase" or not view_shows(e, view):
             continue
         if orch_pane and orch_pane in (e.get("pane"), (e.get("by") or {}).get("pane")):
             continue
@@ -4041,20 +4171,31 @@ def event_line(e: dict) -> str:
     return clip(f"{clock(e)}  {e.get('event')}  {e.get('pane') or '-'}  {where}  {describe_event(e)}", 180)
 
 
+def board_head(home: Path, view: dict, records: list) -> str:
+    who = (" (every orch's lanes)" if view["all"] and view["several"] else " (every lane)" if view["all"]
+           else f", orch {view['name']}" if view["several"] else "")
+    return f"project {home.name}{who}: {plural(len(records), 'lane')}"
+
+
 def cmd_board(args: argparse.Namespace) -> int:
     home = project_home(args)
+    view = orch_view(home, args.orch, args.all)
+    files = view["files"]
     made = precise_now()
-    cursor, base, _ = digest_base(home)
-    records = make_board(home, cursor, {p: b.get("lane") for p, b in base.items() if b.get("lane")})
-    with project_lock(home):
-        saved = save_board(home, records, made)
+    cursor, base, _ = digest_base(files["digest"])
+    records = make_board(home, cursor, {p: b.get("lane") for p, b in base.items() if b.get("lane")}, view)
+    saved = False
+    if not view["all"]:
+        with project_lock(home):
+            saved = save_board(home, records, made, files["board"])
     research = open_research(home)
     if args.json:
-        print(json.dumps({"project": home.name, "board": str(home / BOARD_FILE), "saved": saved, "lanes": records,
-                          "research": research}, indent=2, ensure_ascii=False))
+        print(json.dumps({"project": home.name, "orch": view["name"], "all": view["all"],
+                          "board": str(files["board"]) if not view["all"] else None, "saved": saved,
+                          "lanes": records, "research": research}, indent=2, ensure_ascii=False))
         return 0
-    print(f"project {home.name}: {plural(len(records), 'lane')}" + ("" if saved else " (board.json holds a newer board)"))
-    print("\n".join(board_lines(records)))
+    print(board_head(home, view, records) + ("" if saved or view["all"] else " (board.json holds a newer board)"))
+    print("\n".join(board_lines(records, owners=view["several"], column=view["all"])))
     if research:
         print(f"\nOpen research ({len(research)}, no RESEARCH DONE line yet):")
         for r in research:
@@ -4064,42 +4205,54 @@ def cmd_board(args: argparse.Namespace) -> int:
 
 def cmd_digest(args: argparse.Namespace) -> int:
     """A digest that consumes holds the project lock from its permission check through its commit, so the
-    check still holds when it commits, and two digests run one after the other."""
+    check still holds when it commits, and two digests run one after the other. It reads and moves the cursor of
+    the caller's orch (current_orch), and shows that orch's view."""
     home = project_home(args)
     me = os.environ.get("HERDR_PANE_ID") or None
     with ExitStack() as lock:
         read_only = "--peek" if args.peek else None
         if not read_only:
             lock.enter_context(project_lock(home))
-        orch_pane = read_json(home / ORCH_FILE).get("pane") or None
-        if not read_only and orch_pane and orch_pane != me:
+        view = orch_view(home, args.orch)
+        name, rec, files = view["name"], view["record"], view["files"]
+        orch_pane = (rec or {}).get("pane") or None
+        if not read_only and name is None and view["several"]:
+            read_only = "name the orch: --orch NAME"
+            lock.close()
+        elif not read_only and orch_pane and orch_pane != me:
             state = pane_state(orch_pane)
             if state != "dead":
-                read_only = f"pane {orch_pane} is the orch of this project" + (
-                    "; herdr cannot tell whether it is alive" if state == "unknown" else "")
+                read_only = (f"pane {orch_pane} is " + (f"orch {name}" if view["several"] else "the orch")
+                             + " of this project" + ("; herdr cannot tell whether it is alive" if state == "unknown"
+                                                     else ""))
                 lock.close()
         made = precise_now()
-        cursor, base, read = digest_base(home)
-        records = make_board(home, cursor, {p: b.get("lane") for p, b in base.items() if b.get("lane")})
+        cursor, base, read = digest_base(files["digest"])
+        records = make_board(home, cursor, {p: b.get("lane") for p, b in base.items() if b.get("lane")}, view)
         changes = phase_changes(records, base)
         events, offsets, _ = read_new_events(home, read)
-        shown = digest_events(events, orch_pane, [r["path"] for r in records])
+        shown = digest_events(events, orch_pane, [r["path"] for r in records],
+                              view if view["filtered"] else None)
         omitted = max(0, len(shown) - DIGEST_EVENTS_MAX)
         shown = shown[-DIGEST_EVENTS_MAX:]
         if not read_only:
             for c in changes:
                 record("phase", None, home=home, lane=c["path"], name=c["lane"], branch=c.get("branch"),
-                       old=c["old"], new=c["new"])
-            save_board(home, records, made)
-            write_json(home / DIGEST_FILE, {"cursor": now_iso(), "read": offsets, "lanes": {
+                       old=c["old"], new=c["new"], orch=name)
+            save_board(home, records, made, files["board"])
+            write_json(files["digest"], {"cursor": now_iso(), "read": offsets, "lanes": {
                 r["path"]: {"lane": r["lane"], "branch": r.get("branch"), "phase": r["phase"]} for r in records}})
+            session = text_or_none(os.environ.get("CLAUDE_CODE_SESSION_ID"))
+            if rec and me and rec.get("pane") == me and session and rec.get("session") != session:
+                write_orchs(home, {**view["orchs"], name: {**rec, "session": session}})  # F9: the hook's match
     since = datetime.fromtimestamp(cursor).astimezone().isoformat(timespec="seconds") if cursor else None
     if args.json:
-        print(json.dumps({"project": home.name, "since": since, "read_only": bool(read_only), "why": read_only,
-                          "changes": changes, "events": shown, "omitted": omitted, "lanes": records},
-                         indent=2, ensure_ascii=False))
+        print(json.dumps({"project": home.name, "orch": name, "since": since, "read_only": bool(read_only),
+                          "why": read_only, "changes": changes, "events": shown, "omitted": omitted,
+                          "lanes": records}, indent=2, ensure_ascii=False))
         return 0
-    head = f"project {home.name}: digest since " + (clock({"ts": since}) if since else "the start (no digest yet)")
+    head = (f"project {home.name}" + (f", orch {name}" if view["several"] and name else "") + ": digest since "
+            + (clock({"ts": since}) if since else "the start (no digest yet)"))
     print(head + (f"; read only ({read_only}), nothing moved" if read_only else ""))
     print("\nPhases" if changes else "\nNo phase changes.")
     for c in changes:
@@ -4224,6 +4377,30 @@ def orch_unconfirmed_note(homes: list[Path], pane: str, cause: str, env) -> str:
             f"orchestrate it, run `{digest}` first, then read {files} and load the fleet:fleet skill.")
 
 
+def cached_board(path: Path) -> list[dict]:
+    """The lane records of a saved board.json; a damaged file holds none."""
+    board = read_json(path)
+    return [r for r in board.get("lanes") if isinstance(r, dict)] if isinstance(board.get("lanes"), list) else []
+
+
+def cached_view(home: Path, name: str | None, orchs: dict[str, dict], is2: bool) -> dict | None:
+    """The view of orch `name` for the re-brief's event count, from files only: the lanes and branches of every
+    orch's cached board, with the owner that each record names. None (every event) for a project with one orch."""
+    if len(orchs) < 2 or not name:
+        return None
+    lanes: dict[str, str | None] = {}
+    branches: dict[str, str | None] = {}
+    for n in sorted(orchs, key=lambda n: n != name):  # the orch's own board first
+        for r in cached_board(orch_files(home, n, is2)["board"]):
+            if "orch" not in r or not isinstance(r.get("path"), str):
+                continue  # a record of 0.8.x names no owner
+            owner = text_or_none(r.get("orch"))
+            lanes.setdefault(os.path.realpath(r["path"]), owner)
+            if text_or_none(r.get("branch")):
+                branches.setdefault(r["branch"], owner)
+    return {"name": name, "lanes": lanes, "branches": branches}
+
+
 def orch_rebrief(home: Path, pane: str, data: dict, env) -> str:
     """The re-brief for the registered orch pane, from the project home. Reads files only, and at most
     REBRIEF_READ_BUDGET bytes of unread log: never the history that a digest consumed."""
@@ -4242,21 +4419,24 @@ def orch_rebrief(home: Path, pane: str, data: dict, env) -> str:
         body += lines[:15] or ["- none"]
         if len(lines) > 15:
             body.append(f"- ... {len(lines) - 15} more in PROJECT.md")
-    board = read_json(home / BOARD_FILE)
-    records = [r for r in board.get("lanes") or [] if isinstance(r, dict)] if isinstance(board.get("lanes"), list) else []
+    orchs, is2 = orch_registry(home)
+    name = next((n for n, r in orchs.items() if r.get("pane") == pane), None)
+    files = orch_files(home, name, is2)
+    records = cached_board(files["board"])
+    board = read_json(files["board"])
     if board.get("made"):
         body.append(f"Board from {age_text(time.time() - event_time({'ts': board['made']}))} ago "
                     "(cached; `board` refreshes it):")
-        body += ["  " + line for line in board_lines(records)[:16]]
+        body += ["  " + line for line in board_lines(records, owners=len(orchs) > 1)[:16]]
     else:
         body.append("No board yet.")
-    cursor, _, read = digest_base(home)
+    cursor, _, read = digest_base(files["digest"])
     if cursor is None:
         tail = ["No digest yet."]
     else:
         events, _, cut = read_new_events(home, read, REBRIEF_READ_BUDGET)
         paths = [r["path"] for r in records if isinstance(r.get("path"), str)]
-        count = len(digest_events(events, pane, paths))
+        count = len(digest_events(events, pane, paths, cached_view(home, name, orchs, is2)))
         tail = [("More than " if cut else "") + f"{plural(count, 'event')} since the last digest."]
     tail.append(f"Run `{helper_command(env)} digest` first, then load the fleet:fleet skill.")
     room = REBRIEF_LINES_MAX - len(head) - len(tail)
@@ -5490,6 +5670,7 @@ def build_parser() -> argparse.ArgumentParser:
     lg.add_argument("--all", action="store_true", help="every project, and the events outside a project")
     lg.add_argument("--lane", help="a branch, workspace id or label, or a path at or above the lane's checkout")
     lg.add_argument("--pane", help="events of this pane, or run from it")
+    lg.add_argument("--orch", help="events that name this orch, and the events of its lanes")
     lg.add_argument("--event", help="event kinds, comma-separated: " + ",".join(LOG_EVENTS))
     lg.add_argument("--since", help="30m, 12h, 7d, 2w, or a date such as 2026-11-01")
     lg.add_argument("--limit", type=int, default=50, help="the newest N rows (default 50; 0 for all)")
@@ -5519,17 +5700,24 @@ def build_parser() -> argparse.ArgumentParser:
     o.set_defaults(func=cmd_orch)
 
     b = sub.add_parser("board", help="one row per lane of this project: phase, pull request, panes, newest event",
-                       description="Reads herdr, git and gh like sweep, and saves the board to board.json in the "
-                                   "project home. It never moves the digest.")
+                       description="Reads herdr, git and gh like sweep, and saves the board to the orch's "
+                                   "board.json in the project home. It never moves the digest. In a project with "
+                                   "several orchs, an orch's board holds its own lanes and the unowned ones; --all "
+                                   "(and a caller that is no orch) shows every lane with an ORCH column.")
     b.add_argument("--project", help="a project name (default: the project of this directory)")
+    b.add_argument("--orch", help="the orch whose board this is (default: the caller's orch)")
+    b.add_argument("--all", action="store_true", help="every lane of the project, with its orch; saves nothing")
     b.add_argument("--json", action="store_true")
     b.set_defaults(func=cmd_board)
 
     dg = sub.add_parser("digest", help="phase changes and events since the last digest, then move the cursor",
-                        description="Only reads with --peek, or when a live orch is registered and the caller is "
-                                    "another pane.")
+                        description="Only reads with --peek, when the orch's pane is alive and the caller is "
+                                    "another pane, or when the project has several orchs and none is resolved (pass "
+                                    "--orch NAME). Each orch has its own cursor; a consuming digest from the orch's "
+                                    "pane also records its session for the SessionStart hook.")
     dg.add_argument("--peek", action="store_true", help="read only: record nothing, move nothing")
     dg.add_argument("--project", help="a project name (default: the project of this directory)")
+    dg.add_argument("--orch", help="the orch whose digest this is (default: the caller's orch)")
     dg.add_argument("--json", action="store_true")
     dg.set_defaults(func=cmd_digest)
 
