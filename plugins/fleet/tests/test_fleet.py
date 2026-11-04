@@ -3586,10 +3586,11 @@ class OrchTests(FleetTestCase):
             fleet.record("send", path, pane=f"w{name}:p1", cwd=path, branch=f"feat/{name}", text=f"to {name}")
         fleet.record("send", str(self.repo), by=False, pane="w7:p1", cwd=str(self.repo), branch="main", text="main")
         fleet.record("follow_up_added", None, home=self.project, by=False, pane="w7:p1", id="F1", text="shared")
-        fleet.record("cleanup", str(self.repo), lane=str(self.root / "gone"), branch="feat/gone", removed=True,
-                     orch="billing")
-        fleet.record("cleanup", str(self.repo), lane=str(self.root / "mine"), branch="feat/mine", removed=True,
-                     orch="default")
+        with open(self.log_file(), "a") as fh:  # removed long ago: the result never depends on the wall clock
+            for lane, orch in (("gone", "billing"), ("mine", "default")):
+                fh.write(json.dumps({"ts": "2021-01-01T00:00:00+00:00", "event": "cleanup", "project": "app",
+                                     "lane": str(self.root / lane), "branch": f"feat/{lane}", "removed": True,
+                                     "orch": orch}) + "\n")
         data = json.loads(self.views(lanes.values(), "digest", "--peek", "--json", pane="w1:p1")[1])
         self.assertEqual(data["orch"], "default")
         texts = [e.get("text") or e["event"] for e in data["events"]]
