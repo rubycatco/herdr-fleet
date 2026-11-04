@@ -4188,6 +4188,14 @@ class OrchTests(FleetTestCase):
             json.loads((deep / "orch.json").read_text())
         self.assertEqual(fleet.read_json(deep / "orch.json"), {})
         self.assertEqual(fleet.orch_candidates({"HERDR_PANE_ID": "w1:p1"}), ("w1:p1", [self.project]))
+        real_read = fleet.read_json
+
+        def read_fails_for_deep(path):  # each file is read alone, also when a read itself raises
+            if Path(path).parent == deep:
+                raise RecursionError("maximum recursion depth exceeded")
+            return real_read(path)
+        with mock.patch.object(fleet, "read_json", side_effect=read_fails_for_deep):
+            self.assertEqual(fleet.orch_candidates({"HERDR_PANE_ID": "w1:p1"}), ("w1:p1", [self.project]))
         project_json = self.project / "project.json"
         good = project_json.read_text()
         for source in ("startup", "resume", "clear", "compact"):
