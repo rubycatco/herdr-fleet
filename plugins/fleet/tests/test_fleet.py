@@ -3122,5 +3122,310 @@ class OrchTests(unittest.TestCase):
         self.assertIn("you orchestrate project app (pane w1:p1)", context)
 
 
+class FollowUpTests(unittest.TestCase):
+    """fleet follow-up, the cleanup close and the board's IDs, in a temporary FLEET_HOME. herdr and gh never run."""
+
+    HAND = ("# Project: app\n\nThe memory.\n\n## Rules\n- Never push to main.\n\n## Follow-ups\n\n"
+            "- Hand-written one\n  with a continuation line\n* Star bullet (lane: feat/x)   \nSome prose, no item\n"
+            "- [F5] Has an ID\n\n## Notes\n- a note\n\n## Follow-ups\n- In the second section")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.home = self.root / "home"
+        self.patch = mock.patch.dict(os.environ, {"FLEET_HOME": str(self.home)})
+        self.patch.start()
+        self.repo = self.root / "app"
+        self.repo.mkdir()
+        git("init", "-q", "-b", "main", cwd=self.repo)
+        git("remote", "add", "origin", "git@github.com:acme/app.git", cwd=self.repo)
+        git("-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init",
+            cwd=self.repo)
+        self.project = fleet.project_for(str(self.repo))
+        self.md = self.project / "PROJECT.md"
+
+    def tearDown(self):
+        self.patch.stop()
+        self.tmp.cleanup()
+
+    def main(self, *argv, cwd=None):
+        buf = io.StringIO()
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("HERDR_") and k not in ("CLAUDE_CODE_SESSION_ID", "CLAUDECODE")}
+        with mock.patch.dict(os.environ, env, clear=True), chdir(cwd or self.repo), redirect_stdout(buf):
+            code = fleet.main(list(argv))
+        return code, buf.getvalue()
+
+    def fu(self, *argv, code=0, cwd=None):
+        got, out = self.main("follow-up", *argv, cwd=cwd)
+        self.assertEqual(got, code, out)
+        return json.loads(out) if out.startswith("{") else out
+
+    def write(self, text, mode=0o600):
+        self.md.write_bytes(text.encode())
+        os.chmod(self.md, mode)
+
+    def text(self):
+        return self.md.read_bytes().decode()
+
+    def events(self, kind=None):
+        return [e for e in fleet.read_events([self.project]) if kind is None or e["event"] == kind]
+
+    # format -----------------------------------------------------------
+
+    def test_template_placeholder_goes_and_comes_back(self):
+        self.write(fleet.PROJECT_TEMPLATE.format(name="app"))
+        before = self.text()
+        res = self.fu("add", "Add a CHANGELOG entry.")
+        self.assertEqual((res["id"], res["changed"], res["text"]), ("F1", "added", "Add a CHANGELOG entry."))
+        self.assertEqual(self.text(), before.replace("## Follow-ups\n- none\n", "## Follow-ups\n- [F1] Add a CHANGELOG entry.\n"))
+        self.assertEqual(self.fu("add", "Second", "--source", "feat/a REVIEW-1.md")["id"], "F2")
+        self.assertIn("- [F1] Add a CHANGELOG entry.\n- [F2] Second (from feat/a REVIEW-1.md)\n\n## Notes", self.text())
+        self.fu("done", "F1")
+        self.fu("done", "f2")
+        self.assertEqual(self.text(), before)  # the last done brings `- none` back where the item was
+        self.assertEqual(oct(self.md.stat().st_mode & 0o777), oct(0o600))
+        self.assertEqual(sorted(p.name for p in self.project.iterdir() if p.name.endswith(".tmp")), [])
+
+    def test_hand_written_lines_get_ids_and_every_other_byte_stays(self):
+        self.write(self.HAND, mode=0o640)
+        before = self.HAND.split("\n")
+        res = self.fu("list", "--json")
+        self.assertEqual(res["changed"], "ids")
+        self.assertEqual(res["assigned"], ["F6", "F7", "F8"])
+        self.assertEqual((res["sections"], res["other_lines"]), (2, 1))
+        self.assertEqual([(x["id"], x["text"], x["lane"]) for x in res["follow_ups"]],
+                         [("F6", "Hand-written one", None), ("F7", "Star bullet", "feat/x"),
+                          ("F5", "Has an ID", None), ("F8", "In the second section", None)])
+        self.assertEqual(res["follow_ups"][0]["detail"], ["with a continuation line"])
+        after = self.text().split("\n")
+        changed = [i for i, (a, b) in enumerate(zip(before, after)) if a != b]
+        self.assertEqual(len(after), len(before))
+        self.assertEqual([after[i] for i in changed], ["- [F6] Hand-written one", "* [F7] Star bullet (lane: feat/x)   ",
+                                                        "- [F8] In the second section"])
+        self.assertFalse(self.text().endswith("\n"))  # no final newline before, none after
+        self.assertEqual(oct(self.md.stat().st_mode & 0o777), oct(0o640))
+        # A second list changes nothing and records nothing.
+        n = len(self.events())
+        self.assertEqual(self.fu("list", "--json")["changed"], "nothing")
+        self.assertEqual(len(self.events()), n)
+        self.assertEqual([e["id"] for e in self.events("follow_up_added")], ["F6", "F7", "F8"])
+        # add goes after the last item of the first section; take, release and done change only their lines.
+        base = self.text().split("\n")
+        self.assertEqual(self.fu("add", "New one")["id"], "F9")
+        want = base[:base.index("- [F5] Has an ID") + 1] + ["- [F9] New one"] + base[base.index("- [F5] Has an ID") + 1:]
+        self.assertEqual(self.text().split("\n"), want)
+        self.fu("take", "6", "--lane", "feat/a")
+        self.assertIn("- [F6] Hand-written one (lane: feat/a)\n  with a continuation line\n", self.text())
+        res = self.fu("done", "F6", "--reason", "fixed in feat/a")
+        self.assertEqual((res["changed"], res["lane"]), ("done", "feat/a"))
+        self.fu("release", "F7")
+        want = [("* [F7] Star bullet   " if l.startswith("* [F7]") else l) for l in want
+                if not l.startswith("- [F6]") and l != "  with a continuation line"]
+        self.assertEqual(self.text().split("\n"), want)
+        done = self.events("follow_up_done")[-1]
+        self.assertEqual((done["id"], done["text"], done["branch"], done["reason"], done["detail"]),
+                         ("F6", "Hand-written one", "feat/a", "fixed in feat/a", "with a continuation line"))
+        text = self.main("follow-up", "list")[1]
+        self.assertIn("F7  Star bullet\n", text)
+        self.assertIn("2 ## Follow-ups sections", text)
+        self.assertIn("1 line under ## Follow-ups is no list item", text)
+
+    def test_ids_are_never_used_twice(self):
+        self.write(fleet.PROJECT_TEMPLATE.format(name="app"))
+        self.assertEqual([self.fu("add", t)["id"] for t in ("a", "b")], ["F1", "F2"])
+        self.fu("done", "F2")
+        self.assertEqual(self.fu("add", "c")["id"], "F3")  # F2 is gone from the file, not from the log
+        self.write(self.text().replace("- [F3] c\n", "- [F3] c\n- by hand\n"))
+        self.assertEqual(self.fu("list", "--json")["assigned"], ["F4"])
+        self.write(self.text().replace("- [F4] by hand\n", ""))  # the orchestrator deletes it by hand
+        self.assertEqual(self.fu("add", "d")["id"], "F5")
+        # An ID in any section and any list item counts, also one the parser does not see as a follow-up.
+        self.write(self.text() + "\n## Notes\n- [F40] an old note\n")
+        self.assertEqual(self.fu("add", "e")["id"], "F41")
+
+    def test_no_section_crlf_and_empty_file(self):
+        self.write("# Project: app\n\n## Rules\n- none\n")
+        self.fu("add", "x")
+        self.assertEqual(self.text(), "# Project: app\n\n## Rules\n- none\n\n## Follow-ups\n- [F1] x\n")
+        self.write("# Project: app")
+        self.fu("add", "y")
+        self.assertEqual(self.text(), "# Project: app\n\n## Follow-ups\n- [F2] y\n")
+        self.write("")
+        self.fu("add", "z")
+        self.assertEqual(self.text(), "## Follow-ups\n- [F3] z\n")
+        self.write("# P\r\n\r\n## Follow-ups\r\n- none\r\n\r\n## Notes\r\n- n\r\n")
+        self.fu("add", "w")
+        self.fu("take", "F4", "--lane", "feat/w")
+        self.assertEqual(self.text(), "# P\r\n\r\n## Follow-ups\r\n- [F4] w (lane: feat/w)\r\n\r\n## Notes\r\n- n\r\n")
+        self.fu("done", "F4")
+        self.assertEqual(self.text(), "# P\r\n\r\n## Follow-ups\r\n- none\r\n\r\n## Notes\r\n- n\r\n")
+
+    # actions and refusals ---------------------------------------------
+
+    def test_take_release_and_refusals(self):
+        self.write(fleet.PROJECT_TEMPLATE.format(name="app"))
+        self.fu("add", "Fix the flaky test.")
+        res = self.fu("take", "F1", "--lane", "feat/a")
+        self.assertEqual((res["changed"], res["lane"]), ("taken", "feat/a"))
+        n = len(self.events())
+        self.assertEqual(self.fu("take", "F1", "--lane", "feat/a")["changed"], "nothing")  # the same lane
+        res = self.fu("take", "F1", "--lane", "feat/b", code=2)
+        self.assertEqual((res["changed"], res["held_by"]), ("nothing", "feat/a"))
+        self.assertEqual(len(self.events()), n)
+        self.assertEqual(self.fu("release", "F1")["changed"], "released")
+        self.assertEqual(self.fu("release", "F1")["changed"], "nothing")
+        self.assertEqual(self.fu("take", "F1", "--lane", "feat/b")["lane"], "feat/b")
+        before = self.text()
+        for argv in (("done", "F9"), ("take", "x7", "--lane", "feat/a"), ("take", "F1", "--lane", "a b"),
+                     ("add", "   "), ("add", "Ends like a mark (lane: feat/z)")):
+            self.assertEqual(self.fu(*argv, code=2)["changed"], "nothing", argv)
+        self.write(before.replace("(lane: feat/b)\n", "(lane: feat/b)\n- [F1] a copy\n"))
+        self.assertIn("on 2 lines", self.fu("done", "F1", code=2)["refused"])
+        self.write(before)
+        self.assertEqual(self.text(), before)
+        # Missing PROJECT.md: list is empty, a write refuses.
+        self.md.unlink()
+        res = self.fu("list", "--json")
+        self.assertEqual((res["ok"], res["follow_ups"], res["note"]), (True, [], fleet.NO_PROJECT_MD))
+        self.assertEqual(self.fu("add", "x", code=2)["refused"], fleet.NO_PROJECT_MD)
+        self.assertFalse(self.md.exists())
+        # Outside a project: a refusal; --project NAME finds it from anywhere; a wrong name is an error.
+        outside = self.root / "outside"
+        outside.mkdir()
+        self.assertEqual(self.fu("list", cwd=outside, code=2)["changed"], "nothing")
+        self.write(before)
+        self.assertEqual(self.fu("list", "--json", "--project", "app", cwd=outside)["follow_ups"][0]["id"], "F1")
+        self.assertEqual(self.main("follow-up", "list", "--project", "nope", cwd=outside)[0], 1)
+        # A file that is not UTF-8 is never written.
+        self.md.write_bytes(b"## Follow-ups\n- caf\xe9\n")
+        self.assertEqual(self.main("follow-up", "add", "x")[0], 1)
+        self.assertEqual(self.md.read_bytes(), b"## Follow-ups\n- caf\xe9\n")
+
+    def test_events_in_the_log(self):
+        self.write(fleet.PROJECT_TEMPLATE.format(name="app"))
+        self.fu("add", "Write docs.", "--source", "feat/a REVIEW-2.md")
+        self.fu("take", "F1", "--lane", "feat/b")
+        self.fu("release", "F1")
+        self.fu("take", "F1", "--lane", "feat/b")
+        self.fu("done", "F1", "--reason", "merged")
+        kinds = [e["event"] for e in self.events() if e["event"].startswith("follow_up_")]
+        self.assertEqual(kinds, ["follow_up_added", "follow_up_taken", "follow_up_released", "follow_up_taken",
+                                 "follow_up_done"])
+        self.assertTrue(set(fleet.FOLLOW_UP_EVENTS) <= set(fleet.LOG_EVENTS))
+        out = self.main("log", "--lane", "feat/b")[1]
+        self.assertIn('F1 taken by feat/b: "Write docs. (from feat/a REVIEW-2.md)"', out)
+        self.assertIn('F1 released from feat/b', out)
+        self.assertIn('F1 done in feat/b: merged', out)
+        self.assertNotIn("follow_up_added", out)
+        out = self.main("log", "--event", "follow_up_added")[1]
+        self.assertIn('F1 "Write docs. (from feat/a REVIEW-2.md)"', out)
+
+    # cleanup ----------------------------------------------------------
+
+    def lane(self, name="lane-a", commit=False):
+        path = self.root / name
+        git("worktree", "add", "-q", "-b", name, str(path), cwd=self.repo)
+        if commit:
+            git("-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "x",
+                cwd=path)
+        stub = {"workspace": None, "label": None, "path": str(path), "panes": []}
+        stub.update(fleet.repo_paths(str(path)))
+        return fleet.finish_lane(fleet.lane_facts(stub, None, str(self.root), lambda p, b: (None, None),
+                                                  lambda p, pr: None))
+
+    def held(self):
+        self.write("# Project: app\n\n## Follow-ups\n- [F3] Do a (lane: lane-a)\n- [F4] Do b (lane: lane-b)\n"
+                   "- hand-written (lane: lane-a)\n\n## Notes\n- none\n")
+
+    def test_cleanup_closes_the_follow_ups_of_a_merged_lane(self):
+        self.held()
+        f = self.lane()
+        self.assertEqual(f["verdict"], "ready")
+        plan = fleet.cleanup_plan(f)["follow_ups"]
+        self.assertEqual(plan, {"close": [{"id": "F3", "text": "Do a"}, {"id": None, "text": "hand-written"}]})
+        out = fleet.clean_lane(f, 5)
+        self.assertEqual((out["ok"], out["removed"], out["branch"]), (True, True, "deleted lane-a"))
+        self.assertEqual((out["follow_ups_closed"], out["follow_up_error"]), (["F3", "F5"], None))
+        self.assertEqual(self.text(), "# Project: app\n\n## Follow-ups\n- [F4] Do b (lane: lane-b)\n\n## Notes\n- none\n")
+        event = self.events("cleanup")[-1]
+        self.assertEqual(event["follow_ups_closed"], ["F3", "F5"])
+        self.assertIn("follow-ups closed F3, F5", fleet.describe_event(event))
+        done = self.events("follow_up_done")
+        self.assertEqual([(e["id"], e["branch"]) for e in done], [("F3", "lane-a"), ("F5", "lane-a")])
+        self.assertIn("lane lane-a merged and removed", done[0]["reason"])
+
+    def test_cleanup_unmerged_releases(self):
+        self.held()
+        f = self.lane(commit=True)
+        self.assertEqual((f["verdict"], f["blockers"]), ("keep", []))
+        self.assertEqual(list(fleet.cleanup_plan(f)["follow_ups"]), ["release"])
+        out = fleet.clean_lane(f, 5)
+        self.assertEqual((out["ok"], out["follow_ups_released"], out["follow_ups_closed"]), (True, ["F3", "F5"], []))
+        self.assertIn("- [F3] Do a\n- [F4] Do b (lane: lane-b)\n- [F5] hand-written\n", self.text())
+        self.assertEqual(self.events("cleanup")[-1]["follow_ups_released"], ["F3", "F5"])
+
+    def test_cleanup_reports_a_follow_up_failure_and_succeeds(self):
+        self.md.write_bytes(b"## Follow-ups\n- [F1] caf\xe9 (lane: lane-a)\n")
+        out = fleet.clean_lane(self.lane(), 5)
+        self.assertEqual((out["ok"], out["removed"], out.get("error")), (True, True, None))
+        self.assertIn("not UTF-8", out["follow_up_error"])
+        self.assertEqual(self.md.read_bytes(), b"## Follow-ups\n- [F1] caf\xe9 (lane: lane-a)\n")
+        self.assertIn("follow-ups: ", fleet.describe_event(self.events("cleanup")[-1]))
+        # A lock that another command holds: the cleanup still succeeds.
+        self.held()
+        f = self.lane("lane-b")
+        with mock.patch.object(fleet, "LOCK_WAIT", 0.2), fleet.project_lock(self.project):
+            out = fleet.clean_lane(f, 5)
+        self.assertEqual((out["ok"], out["removed"]), (True, True))
+        self.assertIn("is busy", out["follow_up_error"])
+        self.assertIn("(lane: lane-b)", self.text())
+        # No PROJECT.md.
+        self.md.unlink()
+        out = fleet.clean_lane(self.lane("lane-c"), 5)
+        self.assertEqual((out["ok"], out["follow_up_error"]), (True, "no PROJECT.md"))
+
+    def test_cleanup_dry_run_lists_and_changes_nothing(self):
+        self.held()
+        before = self.text()
+        f = self.lane()
+        with mock.patch.object(fleet, "require_herdr"), \
+                mock.patch.object(fleet, "collect_lanes", return_value=([f], [], [])):
+            code, out = self.main("cleanup", f["target"], "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["plan"][0]["follow_ups"]["close"][0], {"id": "F3", "text": "Do a"})
+        self.assertEqual(self.text(), before)
+        self.assertTrue(Path(f["path"]).is_dir())
+        self.assertEqual(self.events("follow_up_done"), [])
+
+    # board and re-brief -----------------------------------------------
+
+    def test_board_shows_the_ids(self):
+        self.held()
+        a, b = self.root / "a", self.root / "b"
+        for path, status in ((a, "## Plan\n- x\n"), (b, "## Next step\nWrite the tests.\n")):
+            (path / ".fleet").mkdir(parents=True)
+            (path / ".fleet" / "STATUS.md").write_text(status)
+        lanes = [{"path": str(p), "label": None, "workspace": "w2", "branch": br, "panes": [], "pr": None,
+                  "exists": True, "git": False, "linked": True} for p, br in ((a, "lane-a"), (b, "lane-b"))]
+        with mock.patch.object(fleet, "collect_lanes", return_value=(lanes, [], [])), \
+                mock.patch.object(fleet.shutil, "which", return_value="/usr/bin/herdr"):
+            recs = {r["branch"]: r for r in json.loads(self.main("board", "--json")[1])["lanes"]}
+            text = self.main("board")[1]
+        self.assertEqual((recs["lane-a"]["follow_ups"], recs["lane-b"]["follow_ups"]), (["F3"], ["F4"]))
+        self.assertRegex(text, r"(?m)^lane-a .*follow-ups: F3$")
+        self.assertRegex(text, r"(?m)^lane-b .*next: Write the tests\.$")  # another note wins
+        self.assertLessEqual(max(len(l) for l in text.splitlines()), 160)
+        self.assertEqual(fleet.removed_records([{"event": "cleanup", "removed": True, "lane": "/tmp/gone",
+                                                 "ts": fleet.now_iso()}], 0, set(), {})[0]["follow_ups"], [])
+
+    def test_rebrief_shows_the_ids(self):
+        self.held()
+        fleet.write_json(self.project / "orch.json", {"pane": "w1:p1"})
+        text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)}, env={"HERDR_PANE_ID": "w1:p1"})
+        self.assertIn("- [F3] Do a (lane: lane-a)", text)
+        self.assertLessEqual(len(text.splitlines()), fleet.REBRIEF_LINES_MAX)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -25,6 +25,8 @@ Commands:
   fleet orch [show|claim|release]         the project's orchestrator pane, in its project home
   fleet board [--json]                    one row per lane of this project, with its phase
   fleet digest [--peek] [--json]          phase changes and events since the last digest
+  fleet follow-up list|add|take|release|done
+                                          the project's follow-ups in PROJECT.md, with IDs and lane marks
   fleet approve-plan [DIR] --by orch|user approve the lane's .fleet/PLAN.md (refuses on changes or a risk;
                                           high-risk paths under ## Files need the user)
   fleet risk [DIR] [--json]               the lane's changed paths that match a high-risk pattern (reads only)
@@ -53,7 +55,7 @@ from contextlib import ExitStack, contextmanager
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 FLEET_DIR = ".fleet"
 LANE_FILES = ("BRIEF.md", "STATUS.md", "HANDOFF.md", "PLAN.md")
@@ -1123,12 +1125,14 @@ PROJECTS_DIR = "projects"
 EVENTS_DIR = "events"
 PROJECT_FILE = "project.json"
 LOG_EVENTS = ("worktree", "spawn", "spawn_result", "send", "reset", "retire", "cleanup", "handoff",
-              "session_start", "session_end", "orch_claim", "orch_release", "phase", "plan_approved", "risk_approved")
+              "session_start", "session_end", "orch_claim", "orch_release", "phase", "plan_approved", "risk_approved",
+              "follow_up_added", "follow_up_taken", "follow_up_released", "follow_up_done")
 HOOK_GIT_TIMEOUT = 1  # seconds for each git call in a hook; SessionEnd has 5 s in all, SessionStart 10 s
 # Types of the event fields that are not text. `fleet log` drops a field of another type, so one damaged
 # line cannot break it. Add each new field that is not text here.
 EVENT_FIELD_TYPES = {"ok": bool, "closed": bool, "removed": bool, "replace": bool, "force": bool, "by": dict,
-                     "exited": list, "reasons": list, "round": int, "files": int, "high_risk": list, "matches": list}
+                     "exited": list, "reasons": list, "round": int, "files": int, "high_risk": list, "matches": list,
+                     "follow_ups_closed": list, "follow_ups_released": list}
 DICT_LIST_FIELDS = ("exited", "high_risk", "matches")  # lists of objects with text fields; other lists hold text
 
 
@@ -1485,7 +1489,20 @@ def describe_event(e: dict) -> str:
     elif kind == "cleanup":
         text = (f"{short_path(e.get('lane') or '')} " + ("removed" if e.get("removed") else "kept")
                 + f"; branch: {e.get('branch_result') or '-'}"
-                + (f"; archive {short_path(e['archive'])}" if e.get("archive") else ""))
+                + (f"; archive {short_path(e['archive'])}" if e.get("archive") else "")
+                + (f"; follow-ups closed {', '.join(e['follow_ups_closed'])}" if e.get("follow_ups_closed") else "")
+                + (f"; follow-ups released {', '.join(e['follow_ups_released'])}" if e.get("follow_ups_released") else "")
+                + (f"; follow-ups: {e['follow_up_error']}" if e.get("follow_up_error") else ""))
+    elif kind == "follow_up_added":
+        text = (f'{e.get("id") or "?"} "{e.get("text") or ""}"'
+                + (" (ID given to a hand-written line)" if e.get("assigned") else ""))
+    elif kind == "follow_up_taken":
+        text = f'{e.get("id") or "?"} taken by {e.get("branch") or "?"}: "{e.get("text") or ""}"'
+    elif kind == "follow_up_released":
+        text = f'{e.get("id") or "?"} released from {e.get("branch") or "?"}: "{e.get("text") or ""}"'
+    elif kind == "follow_up_done":
+        text = (f'{e.get("id") or "?"} done' + (f" in {e['branch']}" if e.get("branch") else "")
+                + (f": {e['reason']}" if e.get("reason") else "") + f'  "{e.get("text") or ""}"')
     elif kind == "handoff":
         text = f"handoff file {short_path(e.get('path') or '')}"
     elif kind == "orch_claim":
@@ -2147,7 +2164,21 @@ def cleanup_plan(f: dict) -> dict:
             "archive": (Path(f["path"]) / FLEET_DIR).is_dir(),
             "remove": "herdr worktree remove" if f.get("workspace") else "git worktree remove",
             "branch": (f"delete {f['branch']}" if f["delete_branch"] else
-                       f"keep {f['branch']}: {f['branch_note']}" if f.get("branch") else "none: detached HEAD")}
+                       f"keep {f['branch']}: {f['branch_note']}" if f.get("branch") else "none: detached HEAD"),
+            "follow_ups": planned_follow_ups(f)}
+
+
+def planned_follow_ups(f: dict) -> dict:
+    """What cleanup would do with the follow-ups that the lane's branch holds: {close|release: [{id, text}]}, or
+    {error}. Reads only (no lock): a line without an ID shows with id None and gets one at the cleanup."""
+    branch = f.get("branch")
+    if not branch:
+        return {}
+    held, error = lane_follow_ups(project_for(f.get("main_root"), create=False))
+    if error:
+        return {"error": error}
+    items = held.get(branch) or []
+    return {("close" if f.get("verdict") == "ready" else "release"): items} if items else {}
 
 
 def finish_branch(f: dict) -> str:
@@ -2204,6 +2235,7 @@ def clean_lane(f: dict, timeout: float) -> dict:
             except OSError:
                 pass
         out["branch"] = finish_branch(f)
+        out.update(close_lane_follow_ups(f))  # after the removal and the branch step; it never fails the cleanup
         out["ok"] = True
     except FleetError as e:
         out["error"] = str(e)
@@ -2211,7 +2243,8 @@ def clean_lane(f: dict, timeout: float) -> dict:
         record("cleanup", f.get("main_root"), lane=f["path"], workspace=f.get("workspace"), branch=f.get("branch"),
                verdict=f.get("verdict"), reasons=f.get("reasons"), exited=sessions, archive=out.get("archive"),
                removed=bool(out.get("removed")), branch_result=out.get("branch"), ok=out["ok"],
-               error=out.get("error"))
+               error=out.get("error"), follow_ups_closed=out.get("follow_ups_closed"),
+               follow_ups_released=out.get("follow_ups_released"), follow_up_error=out.get("follow_up_error"))
     return out
 
 
@@ -2341,6 +2374,431 @@ def read_text(path: Path) -> str:
         return Path(path).read_text(errors="replace")
     except OSError:
         return ""
+
+
+# --------------------------------------------------------------------------
+# follow-ups
+#
+# The orchestrator's open work: list items under `## Follow-ups` in PROJECT.md, `- [F7] <text>`, which end with
+# ` (lane: <branch>)` once a lane took them. Only `fleet follow-up` writes IDs and lane marks; the orchestrator may
+# still edit the section by hand, and a line without an ID gets the next one at the next write. A write changes
+# only the lines that it must and keeps every other byte, runs under the project lock, and replaces the file
+# atomically. The event log keeps each follow-up's history: the next ID is 1 + the highest in PROJECT.md and in the
+# project's follow_up_* events, so an ID that `done` removed is never used again.
+
+FOLLOW_UPS_SECTION = r"Follow-?ups?"
+FOLLOW_UP_EVENTS = ("follow_up_added", "follow_up_taken", "follow_up_released", "follow_up_done")
+# A list item at the start of a line: the bullet, an optional [Fn] ID, the text, an optional lane mark, and the
+# trailing blanks (with a CR in a CRLF file), which a rewrite keeps.
+FOLLOW_UP_ITEM = re.compile(r"^([-*+][ \t]+)(?:\[[Ff](\d{1,9})\](?:[ \t]+|(?=[ \t\r]*$)))?(.*?)"
+                            r"(?:[ \t]+\(lane:[ \t]*([^()\s][^()]*?)[ \t]*\))?([ \t\r]*)$")
+FOLLOW_UP_ID_ANYWHERE = re.compile(r"^[ \t]*[-*+][ \t]+\[[Ff](\d{1,9})\]", re.M)  # every ID in the file counts
+FOLLOW_UP_ID_ARG = re.compile(r"[Ff]?(\d{1,9})")
+CONTINUATION = re.compile(r"^[ \t]+\S")
+BRANCH_MARK = re.compile(r"[^()\s]+")
+NO_PROJECT_MD = "no PROJECT.md: `fleet orch claim` creates it"
+
+
+def parse_follow_ups(text: str) -> dict:
+    """The follow-ups of a PROJECT.md text, by line index (`text.split("\\n")`, so that no byte is lost).
+
+    `sections`: the (first, end) line ranges of every `## Follow-ups` section, `end` exclusive. `items`: in file
+    order, each with its ID (or None), text, lane mark, the index of its line and of its indented continuation
+    lines. `placeholders`: the `- none`-style lines of the first section. `other_lines`: the lines under a
+    Follow-ups heading that are no list item. `max_id`: the highest [Fn] number of any list item in the file.
+    """
+    lines = text.split("\n")
+    sections: list[tuple[int, int]] = []
+    start = None
+    for i, line in enumerate(lines):
+        m = HEADING.match(line)
+        if m and len(m.group(1)) <= 2:
+            if start is not None:
+                sections.append((start, i))
+                start = None
+            if len(m.group(1)) == 2 and re.fullmatch(FOLLOW_UPS_SECTION, m.group(2), re.I):
+                start = i + 1
+    if start is not None:
+        sections.append((start, len(lines)))
+    items: list[dict] = []
+    placeholders: list[int] = []
+    other = 0
+    for s, (first, end) in enumerate(sections):
+        item = None
+        for i in range(first, end):
+            line = lines[i]
+            if item is not None and CONTINUATION.match(line):
+                item["lines"].append(i)
+                continue
+            item = None
+            if not line.strip():
+                continue
+            if EMPTY_NOTE.match(line.strip()):
+                if s == 0:
+                    placeholders.append(i)
+                continue
+            m = FOLLOW_UP_ITEM.match(line)
+            if not m:
+                other += 1
+                continue
+            item = {"id": f"F{int(m.group(2))}" if m.group(2) else None,
+                    "number": int(m.group(2)) if m.group(2) else None, "text": m.group(3), "lane": m.group(4),
+                    "line": i, "lines": [i], "section": s, "match": m}
+            items.append(item)
+    numbers = [int(m.group(1)) for m in FOLLOW_UP_ID_ANYWHERE.finditer(text)]
+    return {"lines": lines, "sections": sections, "items": items, "placeholders": placeholders,
+            "other_lines": other, "max_id": max(numbers, default=0),
+            "eol": "\r" if lines and lines[0].endswith("\r") else ""}
+
+
+def follow_up_view(doc: dict, item: dict) -> dict:
+    """An item as the commands print it: ID, text, lane, and its continuation lines when it has any."""
+    out = {"id": item["id"], "text": item["text"], "lane": item["lane"]}
+    detail = [doc["lines"][i].strip() for i in item["lines"][1:]]
+    if detail:
+        out["detail"] = detail
+    return out
+
+
+def next_follow_up_number(home: Path, doc: dict) -> int:
+    """1 + the highest follow-up number in PROJECT.md and in the project's follow_up_* events."""
+    numbers = [doc["max_id"]]
+    for e in read_events([home]):
+        m = FOLLOW_UP_ID_ARG.fullmatch(e.get("id") or "") if str(e.get("event")).startswith("follow_up_") else None
+        if m:
+            numbers.append(int(m.group(1)))
+    return max(numbers) + 1
+
+
+def read_project_md(home: Path) -> str | None:
+    """PROJECT.md as text, or None when it does not exist. A file that is not UTF-8 is not read: a write could not
+    keep its bytes."""
+    path = home / PROJECT_MD
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise FleetError(f"cannot read {path}: {e.strerror or e}")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise FleetError(f"{path} is not UTF-8; fix it by hand")
+
+
+def write_project_md(home: Path, text: str) -> None:
+    """Replace PROJECT.md atomically (a temporary file in its folder, then a rename), keeping its mode. A symlinked
+    PROJECT.md stays a symlink: the file that it points to is replaced."""
+    path = Path(os.path.realpath(home / PROJECT_MD))
+    try:
+        mode = path.stat().st_mode & 0o7777
+    except FileNotFoundError:
+        mode = 0o600
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(text.encode("utf-8"))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def join_lines(lines: list[str]) -> str:
+    return "\n".join(lines)
+
+
+def assign_follow_up_ids(text: str, number: int) -> tuple[str, list[dict]]:
+    """Give each item without an ID the next number, in order of the lines. Only `[Fn] ` is inserted."""
+    doc = parse_follow_ups(text)
+    lines = list(doc["lines"])
+    assigned = []
+    for item in doc["items"]:
+        if item["id"]:
+            continue
+        line, m = lines[item["line"]], item["match"]
+        lines[item["line"]] = line[:m.end(1)] + f"[F{number}] " + line[m.end(1):]
+        assigned.append({"id": f"F{number}", "text": item["text"]})
+        number += 1
+    return (join_lines(lines) if assigned else text), assigned
+
+
+def add_follow_up_line(text: str, entry: str) -> str:
+    """Add the item line `entry` to the first Follow-ups section: after its last item, else in place of its
+    `- none` placeholder, else after its last line of text or its heading. Other placeholders of the section go.
+    Without a Follow-ups section, one is appended at the end of the file."""
+    doc = parse_follow_ups(text)
+    eol = doc["eol"]
+    if not doc["sections"]:
+        nl = eol + "\n"
+        if not text:
+            return f"## Follow-ups{nl}{entry}{eol}\n"
+        return text + ("" if text.endswith("\n") else nl) + f"{nl}## Follow-ups{nl}{entry}{eol}\n"
+    first, end = doc["sections"][0]
+    items = [it for it in doc["items"] if it["section"] == 0]
+    placeholders = set(doc["placeholders"])
+    replace_at = after = None
+    if items:
+        after = items[-1]["lines"][-1]
+    elif placeholders:
+        replace_at = min(placeholders)
+    else:
+        after = next((i for i in range(end - 1, first - 1, -1) if doc["lines"][i].strip()), first - 1)
+    out = []
+    for i, line in enumerate(doc["lines"]):
+        if i in placeholders:
+            if i == replace_at:
+                out.append(entry + eol)
+            continue
+        out.append(line)
+        if i == after:
+            out.append(entry + eol)
+    return join_lines(out)
+
+
+def remove_follow_up(text: str, item: dict) -> str:
+    """Remove the item and its continuation lines. When it was the last item of the first section and that has no
+    placeholder, `- none` takes its place."""
+    doc = parse_follow_ups(text)
+    gone = set(item["lines"])
+    restore = (item["section"] == 0 and not doc["placeholders"]
+               and not [it for it in doc["items"] if it["section"] == 0 and it["line"] != item["line"]])
+    out = []
+    for i, line in enumerate(doc["lines"]):
+        if i in gone:
+            if restore and i == item["line"]:
+                out.append("- none" + doc["eol"])
+            continue
+        out.append(line)
+    return join_lines(out)
+
+
+def set_follow_up_lane(text: str, item: dict, branch: str | None) -> str:
+    """Add, replace or (with None) remove the item's ` (lane: <branch>)` mark; the rest of the line stays."""
+    lines = text.split("\n")
+    line, m = lines[item["line"]], item["match"]
+    lines[item["line"]] = line[:m.end(3)] + (f" (lane: {branch})" if branch else "") + line[m.start(5):]
+    return join_lines(lines)
+
+
+def parse_follow_up_id(value: str) -> int | None:
+    m = FOLLOW_UP_ID_ARG.fullmatch((value or "").strip())
+    return int(m.group(1)) if m else None
+
+
+def follow_up_apply(home: Path, action: str, number: int | None = None, body: str | None = None,
+                    branch: str | None = None, reason: str | None = None, source: str | None = None,
+                    wait: float | None = None) -> dict:
+    """Run one follow-up action on PROJECT.md under the project lock, write the file once, then record the events.
+
+    `action`: list (only give IDs), add, take, release, done, or for cleanup lane-done and lane-release (every item
+    whose lane mark is `branch`). Any write first gives the items without an ID their IDs. Returns the result
+    (`ok` False with `refused` for a refusal, which writes nothing). Raises FleetError when the lock or the file
+    cannot be had, and OSError when the write fails.
+    """
+    with project_lock(home, wait):
+        text = read_project_md(home)
+        if text is None:
+            return {"ok": False, "refused": NO_PROJECT_MD}
+        number_next = next_follow_up_number(home, parse_follow_ups(text))
+        new, assigned = assign_follow_up_ids(text, number_next)
+        number_next += len(assigned)
+        events = [("follow_up_added", {"id": a["id"], "text": a["text"], "assigned": "list"}) for a in assigned]
+        result: dict = {"ok": True}
+        if action == "add":
+            entry = f"- [F{number_next}] {body}"
+            new = add_follow_up_line(new, entry)
+            result.update(id=f"F{number_next}", text=body, lane=None, changed="added")
+            events.append(("follow_up_added", {"id": f"F{number_next}", "text": body, "source": source}))
+        elif action in ("take", "release", "done"):
+            doc = parse_follow_ups(new)
+            found = [it for it in doc["items"] if it["number"] == number]
+            if not found:
+                return {"ok": False, "refused": f"no follow-up F{number} in {home / PROJECT_MD}", "id": f"F{number}"}
+            if len(found) > 1:
+                return {"ok": False, "id": f"F{number}",
+                        "refused": f"F{number} is on {len(found)} lines of {home / PROJECT_MD}; fix it by hand"}
+            item = found[0]
+            view = follow_up_view(doc, item)
+            result.update(id=item["id"], text=item["text"], lane=item["lane"])
+            if action == "take":
+                if item["lane"] and item["lane"] != branch:
+                    return {"ok": False, "id": item["id"], "text": item["text"], "held_by": item["lane"],
+                            "refused": f"{item['id']} is held by lane {item['lane']}; `fleet follow-up release "
+                                       f"{item['id']}` frees it"}
+                if item["lane"] != branch:
+                    new = set_follow_up_lane(new, item, branch)
+                    result.update(lane=branch, changed="taken")
+                    events.append(("follow_up_taken", {"id": item["id"], "text": item["text"], "branch": branch}))
+            elif action == "release":
+                if item["lane"]:
+                    new = set_follow_up_lane(new, item, None)
+                    result.update(lane=None, changed="released")
+                    events.append(("follow_up_released", {"id": item["id"], "text": item["text"],
+                                                          "branch": item["lane"]}))
+            else:
+                new = remove_follow_up(new, item)
+                result.update(changed="done")
+                events.append(("follow_up_done", {"id": item["id"], "text": item["text"], "branch": item["lane"],
+                                                  "detail": "\n".join(view.get("detail") or []) or None,
+                                                  "reason": reason}))
+        elif action in ("lane-done", "lane-release"):
+            ids = []
+            while True:
+                doc = parse_follow_ups(new)
+                item = next((it for it in doc["items"] if it["lane"] == branch), None)
+                if item is None:
+                    break
+                ids.append(item["id"])
+                if action == "lane-done":
+                    detail = follow_up_view(doc, item).get("detail")
+                    new = remove_follow_up(new, item)
+                    events.append(("follow_up_done", {"id": item["id"], "text": item["text"], "branch": branch,
+                                                      "detail": "\n".join(detail) if detail else None,
+                                                      "reason": reason}))
+                else:
+                    new = set_follow_up_lane(new, item, None)
+                    events.append(("follow_up_released", {"id": item["id"], "text": item["text"],
+                                                          "branch": branch}))
+            result["ids"] = ids
+        if new != text:
+            write_project_md(home, new)
+        for kind, fields in events:
+            record(kind, None, home=home, **fields)
+    result.setdefault("changed", "ids" if assigned else "nothing")
+    if assigned:
+        result["assigned"] = [a["id"] for a in assigned]
+    doc = parse_follow_ups(new)
+    result["follow_ups"] = [follow_up_view(doc, it) for it in doc["items"]]
+    result["sections"] = len(doc["sections"])
+    result["other_lines"] = doc["other_lines"]
+    return result
+
+
+def lane_follow_ups(home: Path | None) -> tuple[dict[str, list[dict]], str | None]:
+    """{branch: [{id, text}]} of the taken follow-ups, read without the lock, and why they cannot be read."""
+    if home is None:
+        return {}, "no project"
+    try:
+        text = read_project_md(home)
+    except FleetError as e:
+        return {}, str(e)
+    if text is None:
+        return {}, "no PROJECT.md"
+    out: dict[str, list[dict]] = {}
+    for it in parse_follow_ups(text)["items"]:
+        if it["lane"]:
+            out.setdefault(it["lane"], []).append({"id": it["id"], "text": it["text"]})
+    return out, None
+
+
+def close_lane_follow_ups(f: dict) -> dict:
+    """After cleanup removed a lane: close the follow-ups that its branch holds (a merged lane), or release them
+    (a lane removed with --unmerged). Never raises: a failure is reported in `follow_up_error`."""
+    out: dict = {"follow_ups_closed": [], "follow_ups_released": [], "follow_up_error": None}
+    branch = f.get("branch")
+    if not branch:
+        return out
+    merged = f.get("verdict") == "ready"
+    try:
+        home = project_for(f.get("main_root"), create=False)
+        if home is None:
+            out["follow_up_error"] = "no project"
+            return out
+        res = follow_up_apply(home, "lane-done" if merged else "lane-release", branch=branch,
+                              reason=f"closed by fleet cleanup: lane {branch} merged and removed")
+        if not res["ok"]:
+            out["follow_up_error"] = "no PROJECT.md" if res["refused"] == NO_PROJECT_MD else res["refused"]
+        else:
+            out["follow_ups_closed" if merged else "follow_ups_released"] = res["ids"]
+    except (FleetError, OSError, ValueError) as e:
+        out["follow_up_error"] = str(e) or type(e).__name__
+    return out
+
+
+def follow_up_text(value: str | None) -> str:
+    return " ".join((value or "").split())
+
+
+def cmd_follow_up(args: argparse.Namespace) -> int:
+    if getattr(args, "project", None):
+        home = project_home(args, create=False)  # a wrong name is an error, as in board and orch
+    else:
+        try:
+            home = project_home(args, create=False)
+        except FleetError as e:
+            return refuse(refused=str(e))
+    base = {"project": home.name, "project_md": str(home / PROJECT_MD)}
+    action = args.action
+    if action == "list":
+        try:
+            text = read_project_md(home)
+        except FleetError as e:
+            return refuse(**base, refused=str(e))
+        if text is None:
+            res = {"ok": True, "changed": "nothing", "follow_ups": [], "sections": 0, "other_lines": 0,
+                   "note": NO_PROJECT_MD}
+        elif any(not it["id"] for it in parse_follow_ups(text)["items"]):
+            res = follow_up_apply(home, "list")  # gives the lines without an ID their IDs, under the lock
+        else:
+            doc = parse_follow_ups(text)
+            res = {"ok": True, "changed": "nothing", "follow_ups": [follow_up_view(doc, it) for it in doc["items"]],
+                   "sections": len(doc["sections"]), "other_lines": doc["other_lines"]}
+        if not res["ok"]:
+            return refuse(**base, refused=res["refused"])
+        res = {"ok": True, **base, **{k: v for k, v in res.items() if k != "ok"}}
+        if args.json:
+            print(json.dumps(res, indent=2, ensure_ascii=False))
+            return 0
+        for it in res["follow_ups"]:
+            print(f"{it['id']}  {it['text']}" + (f"  (lane: {it['lane']})" if it["lane"] else ""))
+            for more in it.get("detail") or []:
+                print(f"      {more}")
+        if not res["follow_ups"]:
+            print("no follow-ups" + (f" ({res['note']})" if res.get("note") else ""))
+        if res.get("assigned"):
+            print(f"gave IDs to {plural(len(res['assigned']), 'line')} without one: {', '.join(res['assigned'])}")
+        if res["sections"] > 1:
+            print(f"note: PROJECT.md has {res['sections']} ## Follow-ups sections; add writes to the first")
+        if res["other_lines"]:
+            print(f"note: {plural(res['other_lines'], 'line')} under ## Follow-ups {'is' if res['other_lines'] == 1 else 'are'} "
+                  "no list item and no follow-up")
+        return 0
+    fields: dict = {}
+    if action == "add":
+        body = follow_up_text(args.text)
+        if not body:
+            return refuse(**base, refused="the follow-up text is empty")
+        source = follow_up_text(args.source) or None
+        if source:
+            body += f" (from {source})"
+        m = FOLLOW_UP_ITEM.match(f"- [F1] {body}")
+        if not m or m.group(3) != body:
+            return refuse(**base, refused="the text cannot end with a lane mark `(lane: ...)`: only take writes it")
+        fields = {"body": body, "source": source}
+    else:
+        number = parse_follow_up_id(args.id)
+        if number is None:
+            return refuse(**base, refused=f"not a follow-up ID: {args.id!r} (F7, f7 or 7)")
+        fields = {"number": number}
+        if action == "take":
+            if not BRANCH_MARK.fullmatch(args.lane or ""):
+                return refuse(**base, refused=f"not a branch for a lane mark: {args.lane!r}")
+            fields["branch"] = args.lane
+        elif action == "done":
+            fields["reason"] = follow_up_text(args.reason) or None
+    res = follow_up_apply(home, action, **fields)
+    if not res["ok"]:
+        return refuse(**base, **{k: v for k, v in res.items() if k != "ok"})
+    res = {"ok": True, **base, **{k: v for k, v in res.items() if k != "ok"}}
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+    return 0
 
 
 def review_rounds(d: Path) -> tuple[dict[int, Path], dict[int, list[Path]]]:
@@ -2499,7 +2957,8 @@ def risk_note(risk) -> str:
     return f"risky diff needs the user ({len(items)}): {first}"
 
 
-def board_record(f: dict, events: list[dict], home: Path | None = None) -> dict:
+def board_record(f: dict, events: list[dict], home: Path | None = None,
+                 follow_ups: dict[str, list[dict]] | None = None) -> dict:
     d = Path(f["path"]) / FLEET_DIR
     roles = load_panes(d)
     panes = [{"pane": p.get("pane"), "role": (roles.get(p.get("pane") or "") or {}).get("role"),
@@ -2511,7 +2970,8 @@ def board_record(f: dict, events: list[dict], home: Path | None = None) -> dict:
            "panes": panes, "pr": {"number": pr.get("number"), "state": pr.get("state")} if pr else None,
            "phase": phase, "last_event": newest_lane_event(events, f["path"], f.get("branch")),
            "blocked": first_note(status_md, "Blocked"), "next": first_note(status_md, r"Next steps?"),
-           "risk": board_risk(f["path"], phase, home, bool(f.get("git")))}
+           "risk": board_risk(f["path"], phase, home, bool(f.get("git"))),
+           "follow_ups": [x["id"] for x in (follow_ups or {}).get(f.get("branch") or "", []) if x["id"]]}
     if phase.startswith("plan ready"):
         warning = plan_gate_note(f["path"])
         if warning:
@@ -2564,7 +3024,7 @@ def removed_records(events: list[dict], since: float | None, on_board: set[str],
         found[path] = {"lane": names.get(path) or e.get("branch") or os.path.basename(path), "path": path,
                        "branch": e.get("branch"), "workspace": e.get("workspace"), "panes": [], "pr": None,
                        "phase": "removed", "last_event": {"ts": e.get("ts"), "event": "cleanup"},
-                       "blocked": None, "next": None, "risk": None}
+                       "blocked": None, "next": None, "risk": None, "follow_ups": []}
     return list(found.values())
 
 
@@ -2592,7 +3052,8 @@ def make_board(home: Path, since: float | None, names: dict[str, str]) -> list[d
         raise FleetError("herdr not found in PATH")
     lanes, _, _ = collect_lanes(select=lane_selector(home))
     events = read_events([home])
-    records = [board_record(f, events, home) for f in lanes]
+    held, _ = lane_follow_ups(home)  # PROJECT.md, read once per board
+    records = [board_record(f, events, home, held) for f in lanes]
     records += removed_records(events, since, {os.path.realpath(r["path"]) for r in records}, names)
     return sorted(records, key=lambda r: (r["phase"] == "removed", r["lane"], r["path"]))
 
@@ -2668,8 +3129,9 @@ def board_lines(records: list) -> list[str]:
         last = as_dict(r.get("last_event"))
         blocked, nxt, warning = as_text(r.get("blocked")), as_text(r.get("next")), as_text(r.get("warning"))
         risky = risk_note(r.get("risk"))
+        held = [x for x in r.get("follow_ups") or [] if isinstance(x, str)] if isinstance(r.get("follow_ups"), list) else []
         note = (warning if warning else risky if risky else f"blocked: {blocked}" if blocked
-                else f"next: {nxt}" if nxt else "")
+                else f"next: {nxt}" if nxt else f"follow-ups: {', '.join(held)}" if held else "")
         number = pr.get("number")
         table.append([clip(as_text(r.get("lane")) or "?", 28), as_text(r.get("phase")) or "?",
                       f"#{number} {as_text(pr.get('state')).lower()}".strip() if isinstance(number, int) else "-",
@@ -4255,6 +4717,33 @@ def build_parser() -> argparse.ArgumentParser:
     dg.add_argument("--project", help="a project name (default: the project of this directory)")
     dg.add_argument("--json", action="store_true")
     dg.set_defaults(func=cmd_digest)
+
+    fu = sub.add_parser("follow-up", help="the project's follow-ups in PROJECT.md: list, add, take, release, done",
+                        description="Follow-ups are the list items under ## Follow-ups in the project's PROJECT.md: "
+                                    "'- [F7] <text>', and ' (lane: <branch>)' once a lane took one. An ID is never "
+                                    "used twice. Every write runs under the project lock, first gives the lines "
+                                    "without an ID their IDs, keeps every other byte of the file, and records an "
+                                    "event (follow_up_added, _taken, _released, _done). A refusal exits 2 and "
+                                    "changes nothing. `fleet cleanup` closes the follow-ups of a merged lane that "
+                                    "it removes, and releases those of a lane removed with --unmerged.")
+    fus = fu.add_subparsers(dest="action", required=True)
+    fu_project = argparse.ArgumentParser(add_help=False)
+    fu_project.add_argument("--project", help="a project name (default: the project of this directory)")
+    ful = fus.add_parser("list", parents=[fu_project], help="ID, text and lane of each follow-up (gives the lines "
+                                                            "without an ID their IDs)")
+    ful.add_argument("--json", action="store_true")
+    fua = fus.add_parser("add", parents=[fu_project], help="add '- [Fn] TEXT' and print its ID")
+    fua.add_argument("text")
+    fua.add_argument("--source", help="where it comes from, e.g. 'feat/a REVIEW-1.md': adds ' (from SOURCE)'")
+    fut = fus.add_parser("take", parents=[fu_project], help="mark the follow-up as taken by a lane")
+    fut.add_argument("id", help="F7, f7 or 7")
+    fut.add_argument("--lane", required=True, metavar="BRANCH", help="the lane's branch")
+    fur = fus.add_parser("release", parents=[fu_project], help="remove the follow-up's lane mark")
+    fur.add_argument("id", help="F7, f7 or 7")
+    fud = fus.add_parser("done", parents=[fu_project], help="remove the follow-up; its event keeps the text")
+    fud.add_argument("id", help="F7, f7 or 7")
+    fud.add_argument("--reason", help="why it is done")
+    fu.set_defaults(func=cmd_follow_up)
 
     ap = sub.add_parser("approve-plan", help="approve the newest round of the lane's .fleet/PLAN.md (the plan gate)",
                         description="Appends 'PLAN APPROVED: <n> by <who> <date>' and records plan_approved. It "
