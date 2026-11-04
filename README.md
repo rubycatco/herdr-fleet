@@ -103,7 +103,7 @@ After installing, run `/reload-plugins` in open sessions, and `/fleet:onboard` o
 | `/fleet:context` | Chooses between continuing, `/compact`, `/clear` with a re-brief, or a handoff, and does it. |
 | `/fleet:handoff` | Moves this session or a lane to a new pane: through a handoff file, or by resuming the same conversation on another account. |
 | `/fleet:accounts` | remuda accounts, usage and the account of each pane. |
-| `/fleet:cleanup` | Lists every lane with a verdict (ready, waiting, keep), asks which ones to remove, then exits their agents, archives `.fleet/`, removes the worktrees, deletes merged local branches, closes the follow-ups whose work merged, and runs the project's own cleanup. Only you start it. |
+| `/fleet:cleanup` | Lists every lane with a verdict (ready, waiting, keep), asks which ones to remove, then exits their agents, archives `.fleet/`, removes the worktrees, deletes merged local branches, closes the follow-ups whose work merged, and runs the project's own cleanup. A lane is kept while it has changed or untracked files (whatever the settings for untracked files, the file system monitor or the untracked cache say) or existing paths outside `.fleet/` marked assume-unchanged or skip-worktree (absent paths of a sparse checkout do not count), and cleanup checks again after the agents exit, right before the removal. Ignored files do not keep a lane and go with the worktree (only `.fleet/` is archived), and a mode-only change is not seen when `core.fileMode` is false. Only you start it. |
 
 ## Conventions
 

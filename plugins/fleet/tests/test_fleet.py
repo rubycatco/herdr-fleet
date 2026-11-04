@@ -106,6 +106,19 @@ def git(*args, cwd):
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
 
 
+def install_stale_monitor(root, repo, lane, run_git):
+    """A protocol-v2 file system monitor that answers with a token and no paths, so it misses every change, and a
+    warmed untracked cache: plain `git status` in `lane` then reports no change made after this call."""
+    monitor = Path(root) / "monitor"
+    monitor.write_text("#!/bin/sh\nprintf 'token\\000'\n")
+    monitor.chmod(0o755)
+    for key, value in (("core.fsmonitor", str(monitor)), ("core.fsmonitorHookVersion", "2"),
+                       ("core.untrackedCache", "true")):
+        run_git(repo, "config", key, value)
+    for _ in range(3):
+        run_git(lane, "status", "--porcelain", "-z", "--untracked-files=normal")
+
+
 class AccountTests(unittest.TestCase):
     def setUp(self):
         self.accounts = fleet.parse_remuda_list(REMUDA_LIST)
@@ -672,9 +685,15 @@ class SweepTests(unittest.TestCase):
         config = '[ui]\ndirectory = "x"\n\n[worktrees]\ndirectory = "~/wt"  # checkouts\n'
         self.assertEqual(fleet.worktrees_dir_from_config(config), "~/wt")
         self.assertIsNone(fleet.worktrees_dir_from_config("[ui]\ntheme = 'dark'\n"))
-        self.assertEqual(fleet.count_dirty(" M a.rb\n?? .fleet/\n?? new.txt\n"), 2)
-        self.assertEqual(fleet.count_dirty(""), 0)
+        self.assertEqual(fleet.count_dirty([["a.rb"], [".fleet/"], ["new.txt"]]), 2)
+        self.assertEqual(fleet.count_dirty([]), 0)
         self.assertIsNone(fleet.count_dirty(None))
+        self.assertEqual(fleet.count_dirty([["app2.py", ".fleet/draft.py"]]), 1)  # a rename out of .fleet/
+        self.assertEqual(fleet.count_dirty([[".fleet/b.md", ".fleet/a.md"]]), 0)  # a rename inside it
+        self.assertEqual(fleet.count_dirty([["d/"]]), 1)  # one untracked directory
+        self.assertEqual(fleet.count_dirty([["a -> b.py"]]), 1)  # -z never splits a name at an arrow
+        self.assertEqual(fleet.count_dirty([[".fleet"]]), 1)  # a file or symlink named .fleet is no lane record
+        self.assertEqual(fleet.count_dirty([[".fleet"], [".fleet/a.md"]]), 1)
         shell = {"foreground_process_group_id": 5, "shell_pid": 5, "foreground_processes": [{"name": "zsh"}]}
         self.assertIsNone(fleet.busy_from_process_info(shell))
         job = {"foreground_process_group_id": 9, "shell_pid": 5, "foreground_processes": [{"name": "node"}]}
@@ -748,7 +767,132 @@ class LaneGitTests(unittest.TestCase):
         self.git(self.repo, "merge", "-q", "--no-ff", "-m", "merge lane-a", "lane-a")
         f = self.facts()
         self.assertEqual((f["verdict"], f["reasons"], f["delete_branch"]), ("ready", ["in main"], True))
+        self.assertEqual(f["dirty"], 0)  # only .fleet/ files are left
         self.assertFalse(fleet.repo_paths(str(self.repo))["linked"])
+
+    def test_git_settings_cannot_hide_untracked_files_from_sweep(self):
+        # The lane is merged (no commit of its own); its only change is one untracked file.
+        self.git(self.lane_path, "config", "status.showUntrackedFiles", "no")
+        (self.lane_path / "new.txt").write_text("work")
+        self.assertEqual(self.git(self.lane_path, "status", "--porcelain"), "")  # the setting took
+        f = self.facts()
+        self.assertEqual((f["verdict"], f["reasons"], f["dirty"]), ("keep", ["1 uncommitted change"], 1))
+        # The same setting in the global config.
+        self.git(self.lane_path, "config", "--unset", "status.showUntrackedFiles")
+        global_config = Path(self.tmp.name) / "gitconfig"
+        global_config.write_text("[status]\n\tshowUntrackedFiles = no\n")
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(global_config)}):
+            plain = subprocess.run(["git", "status", "--porcelain"], cwd=self.lane_path, capture_output=True,
+                                   text=True)
+            self.assertEqual(plain.stdout, "")
+            f = self.facts()
+        self.assertEqual((f["verdict"], f["reasons"], f["dirty"]), ("keep", ["1 uncommitted change"], 1))
+
+    def test_an_untracked_directory_is_one_change(self):
+        (self.lane_path / "d").mkdir()
+        (self.lane_path / "d" / "a.txt").write_text("a")
+        (self.lane_path / "d" / "b.txt").write_text("b")
+        self.assertEqual(self.facts()["dirty"], 1)
+        self.git(self.lane_path, "add", "d")
+        f = self.facts()
+        self.assertEqual((f["dirty"], f["reasons"]), (2, ["2 uncommitted changes"]))
+
+    def test_a_rename_out_of_fleet_counts_for_sweep(self):
+        # A base that tracks a file in .fleet/; a new lane moves it to a code path, staged, without a commit.
+        (self.repo / ".fleet").mkdir()
+        (self.repo / ".fleet" / "draft.py").write_text("print('x')\n")
+        self.git(self.repo, "add", "-f", ".fleet/draft.py")
+        self.git(self.repo, "commit", "-q", "-m", "draft")
+        self.lane_path = Path(self.tmp.name) / "lane-r"
+        self.git(self.repo, "worktree", "add", "-q", "-b", "lane-r", str(self.lane_path))
+        self.git(self.lane_path, "mv", ".fleet/draft.py", "app2.py")
+        f = self.facts()
+        self.assertEqual((f["verdict"], f["reasons"], f["dirty"]), ("keep", ["1 uncommitted change"], 1))
+        # A move inside .fleet/ is no change.
+        self.git(self.lane_path, "mv", "app2.py", ".fleet/draft.py")
+        self.git(self.lane_path, "mv", ".fleet/draft.py", ".fleet/kept.py")
+        self.assertIn("R  .fleet/draft.py -> .fleet/kept.py", self.git(self.lane_path, "status", "--porcelain"))
+        f = self.facts()
+        self.assertEqual((f["verdict"], f["dirty"]), ("ready", 0))
+
+    def new_lane(self, name, files):
+        """A merged lane made after main commits `files` (name -> contents)."""
+        for rel, text in files.items():
+            (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / rel).write_text(text)
+            self.git(self.repo, "add", rel)
+        self.git(self.repo, "commit", "-q", "-m", "files")
+        self.lane_path = Path(self.tmp.name) / name
+        self.git(self.repo, "worktree", "add", "-q", "-b", name, str(self.lane_path))
+
+    def test_a_file_named_fleet_is_a_change(self):
+        # Only the .fleet/ directory holds lane records; a file or symlink of that name is work like any other.
+        self.git(self.lane_path, "config", "status.showUntrackedFiles", "no")
+        (self.lane_path / ".fleet").write_text("not a lane record")
+        self.assertEqual(self.git(self.lane_path, "status", "--porcelain"), "")  # the setting took
+        f = self.facts()
+        self.assertEqual((f["verdict"], f["reasons"], f["dirty"]), ("keep", ["1 uncommitted change"], 1))
+        (self.lane_path / "target.txt").write_text("x")
+        (self.lane_path / ".fleet").unlink()
+        (self.lane_path / ".fleet").symlink_to("target.txt")
+        self.assertEqual(self.facts()["reasons"], ["2 uncommitted changes"])
+
+    def test_a_stale_file_system_monitor_cannot_hide_work(self):
+        for name, change in (("lane-t", lambda lane: (lane / "tracked.txt").write_text("changed")),
+                             ("lane-u", lambda lane: (lane / "new.txt").write_text("new"))):
+            with self.subTest(name):
+                if name == "lane-t":
+                    self.new_lane(name, {"tracked.txt": "a"})
+                else:
+                    self.lane_path = Path(self.tmp.name) / name
+                    self.git(self.repo, "worktree", "add", "-q", "-b", name, str(self.lane_path))
+                install_stale_monitor(self.tmp.name, self.repo, self.lane_path, self.git)
+                change(self.lane_path)
+                self.assertEqual(self.git(self.lane_path, "status", "--porcelain"), "")  # the monitor missed it
+                f = self.facts()
+                self.assertEqual((f["verdict"], f["reasons"], f["dirty"]), ("keep", ["1 uncommitted change"], 1))
+
+    def test_assume_unchanged_and_skip_worktree_keep_the_lane(self):
+        self.new_lane("lane-f", {"tracked.txt": "a", ".fleet/draft.md": "d"})
+        self.assertEqual((self.facts()["verdict"], self.facts()["flagged"]), ("ready", 0))
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            with self.subTest(flag):
+                self.git(self.lane_path, "update-index", flag, "tracked.txt", ".fleet/draft.md")
+                (self.lane_path / "tracked.txt").write_text("edited")
+                self.assertEqual(self.git(self.lane_path, "status", "--porcelain"), "")  # git no longer looks
+                f = self.facts()
+                # The flagged path counts once its flag hides it; the one in .fleet/ does not.
+                self.assertEqual((f["verdict"], f["reasons"], f["dirty"], f["flagged"]),
+                                 ("keep", ["1 path marked assume-unchanged or skip-worktree"], 0, 1))
+                self.git(self.lane_path, "update-index", flag.replace("--", "--no-", 1), "tracked.txt",
+                         ".fleet/draft.md")
+                self.git(self.lane_path, "checkout", "--", "tracked.txt")
+
+    def test_a_sparse_checkout_stays_ready(self):
+        self.new_lane("lane-s", {"keep/a.txt": "a", "other/b.txt": "b"})
+        self.git(self.lane_path, "sparse-checkout", "set", "keep")
+        self.assertFalse((self.lane_path / "other").exists())
+        self.assertIn("S other/b.txt", self.git(self.lane_path, "ls-files", "-v"))
+        f = self.facts()
+        self.assertEqual((f["verdict"], f["reasons"], f["dirty"], f["flagged"]), ("ready", ["in main"], 0, 0))
+        # An excluded path that comes back in the worktree keeps the lane: git clears its skip-worktree bit when it
+        # reads the index, and status then counts it as a change.
+        (self.lane_path / "other").mkdir()
+        (self.lane_path / "other" / "b.txt").write_text("edited")
+        f = self.facts()
+        self.assertEqual((f["verdict"], f["reasons"]), ("keep", ["1 uncommitted change"]))
+
+    def test_a_failing_ls_files_keeps_the_lane(self):
+        with mock.patch.object(fleet, "flagged_count", return_value=None):
+            f = self.facts()
+        self.assertIsNone(f["flagged"])
+        self.assertEqual((f["verdict"], f["reasons"]), ("keep", ["git ls-files failed"]))
+
+    def test_a_failing_status_keeps_the_lane(self):
+        with mock.patch.object(fleet, "status_entries", return_value=None):
+            f = self.facts()
+        self.assertIsNone(f["dirty"])
+        self.assertEqual((f["verdict"], f["reasons"]), ("keep", ["git status failed"]))
 
     def test_merged_pull_request_whose_head_is_not_in_the_clone(self):
         origin = Path(self.tmp.name) / "origin.git"
@@ -803,6 +947,219 @@ class LaneGitTests(unittest.TestCase):
         self.git(self.lane_path, "commit", "-q", "--allow-empty", "-m", "only here")
         self.assertEqual(self.facts()["reasons"], ["detached HEAD with 1 commit on no branch"])
 
+
+
+class CleanupTests(unittest.TestCase):
+    """clean_lane and cmd_cleanup on real git worktrees: a lane in a temporary Herdr worktrees directory. Herdr, gh
+    and the agents' exit are stubs."""
+
+    PANE = {"pane_id": "w1:p1", "agent": "claude", "agent_status": "idle"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.repo, self.wt, self.home = self.root / "repo", self.root / "wt", self.root / "home"
+        self.lane_path = self.wt / "repo" / "lane-a"
+        self.env = {**os.environ, "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.com",
+                    "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.com"}
+        for patch in (mock.patch.dict(os.environ, {"FLEET_HOME": str(self.home)}),
+                      mock.patch.object(fleet, "herdr_worktrees_dir", return_value=self.wt),
+                      mock.patch.object(fleet, "herdr", side_effect=self.fake_herdr),
+                      mock.patch.object(fleet, "require_herdr"),
+                      mock.patch.object(fleet, "pr_for_branch", return_value=(None, None))):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.repo.mkdir()
+        self.git(self.repo, "init", "-q", "-b", "main")
+        (self.repo / "tracked.txt").write_text("a")
+        self.git(self.repo, "add", "tracked.txt")
+        self.git(self.repo, "commit", "-q", "-m", "init")
+        # The lane is merged: it has no commit of its own. Its .fleet/ is excluded, as `fleet worktree` leaves it.
+        self.git(self.repo, "worktree", "add", "-q", "-b", "lane-a", str(self.lane_path))
+        (Path(fleet.prep_dir(str(self.lane_path))["fleet_dir"]) / "STATUS.md").write_text("log")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @staticmethod
+    def fake_herdr(*args, **kwargs):
+        return {"workspaces": []} if args[:2] == ("workspace", "list") else {"panes": []}
+
+    def git(self, cwd, *args):
+        return subprocess.run(["git", *args], cwd=cwd, env=self.env, check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def facts(self, panes=()):
+        stub = {"workspace": None, "label": None, "path": str(self.lane_path), "panes": list(panes)}
+        stub.update(fleet.repo_paths(stub["path"]))
+        return fleet.finish_lane(fleet.lane_facts(stub, None, str(self.root)))
+
+    def cleanup(self, *args):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = fleet.main(["cleanup", str(self.lane_path), *args])
+        return code, json.loads(buf.getvalue())
+
+    def clean(self, write=None):
+        """clean_lane on the lane with one idle agent, whose exit writes the file `write` into the lane."""
+        f = self.facts([self.PANE])
+        self.assertEqual(f["verdict"], "ready")
+
+        def exit_agent(pane, agent, timeout):
+            if write:
+                (self.lane_path / write).parent.mkdir(parents=True, exist_ok=True)
+                (self.lane_path / write).write_text("written while the agent exits")
+            return True
+        info = {"agent": "claude", "agent_status": "idle", "agent_session": {"value": "s-1"}}
+        with mock.patch.object(fleet, "pane_info", return_value=info), \
+                mock.patch.object(fleet, "exit_agent", side_effect=exit_agent):
+            return fleet.clean_lane(f, 5)
+
+    def cleanup_events(self):
+        return [e for e in fleet.read_events([fleet.project_for(str(self.repo))]) if e["event"] == "cleanup"]
+
+    def assert_lane_stays(self):
+        self.assertTrue(self.lane_path.is_dir())
+        self.assertIn(str(self.lane_path), self.git(self.repo, "worktree", "list"))
+        self.assertEqual(self.git(self.repo, "rev-parse", "--verify", "--quiet", "--symbolic-full-name", "lane-a"),
+                         "refs/heads/lane-a")
+
+    def test_cleanup_refuses_a_lane_with_a_hidden_untracked_file(self):
+        self.git(self.lane_path, "config", "status.showUntrackedFiles", "no")
+        (self.lane_path / "new.txt").write_text("work")
+        self.assertEqual(self.git(self.lane_path, "status", "--porcelain"), "")  # the setting took
+        global_config = self.root / "gitconfig"
+        global_config.write_text("[status]\n\tshowUntrackedFiles = no\n")
+        for where in ("repository", "global"):
+            if where == "global":
+                self.git(self.lane_path, "config", "--unset", "status.showUntrackedFiles")
+            with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(global_config)} if where == "global" else {}):
+                for extra in ([], ["--dry-run"]):
+                    code, out = self.cleanup(*extra)
+                    self.assertEqual(code, 2, (where, extra))
+                    self.assertEqual((out["ok"], out["changed"]), (False, "nothing"))
+                    [refused] = out["refused"]
+                    self.assertEqual((refused["verdict"], refused["reasons"]), ("keep", ["1 uncommitted change"]))
+                    self.assertTrue((self.lane_path / "new.txt").is_file())
+                    self.assert_lane_stays()
+        self.assertEqual(self.cleanup_events(), [])
+        self.assertEqual(list(self.home.rglob("lanes")), [])  # no archive either
+
+    def assert_refused(self, reasons):
+        code, out = self.cleanup()
+        self.assertEqual((code, out["ok"], out["changed"]), (2, False, "nothing"), out)
+        [refused] = out["refused"]
+        self.assertEqual((refused["verdict"], refused["reasons"]), ("keep", reasons))
+        self.assert_lane_stays()
+        self.assertEqual(self.cleanup_events(), [])
+
+    def test_cleanup_refuses_a_file_named_fleet(self):
+        self.git(self.lane_path, "config", "status.showUntrackedFiles", "no")
+        shutil.rmtree(self.lane_path / ".fleet")
+        (self.lane_path / ".fleet").write_text("not a lane record")
+        self.assert_refused(["1 uncommitted change"])
+        self.assertEqual((self.lane_path / ".fleet").read_text(), "not a lane record")
+
+    def test_cleanup_refuses_work_that_a_stale_monitor_hides(self):
+        install_stale_monitor(self.root, self.repo, self.lane_path, self.git)
+        for name in ("tracked.txt", "new.txt"):
+            with self.subTest(name):
+                (self.lane_path / name).write_text("work")
+                self.assertEqual(self.git(self.lane_path, "status", "--porcelain"), "")  # the monitor missed it
+                self.assert_refused(["1 uncommitted change"])
+                self.assertEqual((self.lane_path / name).read_text(), "work")
+                (self.lane_path / "tracked.txt").write_text("a")  # git checkout would trust the monitor too
+                (self.lane_path / "new.txt").unlink(missing_ok=True)
+
+    def test_cleanup_refuses_flagged_paths(self):
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            with self.subTest(flag):
+                self.git(self.lane_path, "update-index", flag, "tracked.txt")
+                (self.lane_path / "tracked.txt").write_text("edited")
+                self.assert_refused(["1 path marked assume-unchanged or skip-worktree"])
+                self.assertEqual((self.lane_path / "tracked.txt").read_text(), "edited")
+                self.git(self.lane_path, "update-index", flag.replace("--", "--no-", 1), "tracked.txt")
+                self.git(self.lane_path, "checkout", "--", "tracked.txt")
+
+    def test_cleanup_recount_reads_the_flags(self):
+        # The agent marks a file assume-unchanged and edits it while it exits.
+        f = self.facts([self.PANE])
+        self.assertEqual(f["verdict"], "ready")
+
+        def exit_agent(pane, agent, timeout):
+            self.git(self.lane_path, "update-index", "--assume-unchanged", "tracked.txt")
+            (self.lane_path / "tracked.txt").write_text("edited while the agent exits")
+            return True
+        info = {"agent": "claude", "agent_status": "idle", "agent_session": {"value": "s-1"}}
+        with mock.patch.object(fleet, "pane_info", return_value=info), \
+                mock.patch.object(fleet, "exit_agent", side_effect=exit_agent):
+            out = fleet.clean_lane(f, 5)
+        self.assertEqual((out["ok"], out.get("removed")), (False, None))
+        self.assertEqual(out["error"], "1 path marked assume-unchanged or skip-worktree; the worktree stays")
+        self.assertEqual((self.lane_path / "tracked.txt").read_text(), "edited while the agent exits")
+        self.assert_lane_stays()
+        self.git(self.lane_path, "update-index", "--no-assume-unchanged", "tracked.txt")
+        self.git(self.lane_path, "checkout", "--", "tracked.txt")
+        f = self.facts([self.PANE])
+        self.assertEqual(f["verdict"], "ready")
+        with mock.patch.object(fleet, "pane_info", return_value=info), \
+                mock.patch.object(fleet, "exit_agent", return_value=True), \
+                mock.patch.object(fleet, "flagged_count", return_value=None):
+            out = fleet.clean_lane(f, 5)
+        self.assertEqual(out["error"], "git ls-files failed; the worktree stays")
+        self.assert_lane_stays()
+
+    def test_cleanup_keeps_a_lane_that_changes_while_its_agent_exits(self):
+        # Once hidden by the git settings: then neither removal command would refuse, and only the count again
+        # stands between the file and its deletion. Then once in plain sight.
+        for name, hide in (("hidden.txt", True), ("late.txt", False)):
+            if hide:
+                self.git(self.lane_path, "config", "status.showUntrackedFiles", "no")
+            else:
+                self.git(self.lane_path, "config", "--unset", "status.showUntrackedFiles")
+            out = self.clean(write=name)
+            self.assertEqual((out["ok"], out.get("removed"), out["exited"]), (False, None, ["w1:p1"]))
+            self.assertEqual(out["error"], "1 uncommitted change appeared after the check; the worktree stays")
+            self.assertTrue((self.lane_path / name).is_file())
+            self.assert_lane_stays()
+            event = self.cleanup_events()[-1]
+            self.assertEqual((event["removed"], event["ok"], event["error"]), (False, False, out["error"]))
+            self.assertEqual(event["archive"], out["archive"])  # the archive comes first, and the event names it
+            (self.lane_path / name).unlink()
+        # A file that appears in .fleet/ is no change: the removal goes ahead.
+        out = self.clean(write=".fleet/notes.md")
+        self.assertEqual((out["ok"], out["removed"]), (True, True), out)
+        self.assertFalse(self.lane_path.exists())
+
+    def test_cleanup_removes_a_clean_merged_lane(self):
+        out = self.clean()
+        self.assertEqual((out["ok"], out["removed"], out["branch"], out["exited"]),
+                         (True, True, "deleted lane-a", ["w1:p1"]), out)
+        self.assertNotIn("error", out)
+        self.assertFalse(self.lane_path.exists())
+        self.assertFalse((self.wt / "repo").exists())  # Herdr's repository folder held only this lane
+        self.assertEqual((Path(out["archive"]) / "STATUS.md").read_text(), "log")
+        self.assertEqual(self.git(self.repo, "branch", "--list", "--format=%(refname)", "lane-a"), "")
+        event = self.cleanup_events()[-1]
+        self.assertEqual((event["removed"], event["ok"], event["branch_result"]), (True, True, "deleted lane-a"))
+
+    def test_cleanup_end_to_end_removes_a_clean_merged_lane(self):
+        code, out = self.cleanup()
+        self.assertEqual(code, 0, out)
+        [lane] = out["lanes"]
+        self.assertEqual((lane["ok"], lane["removed"], lane["branch"]), (True, True, "deleted lane-a"))
+        self.assertFalse(self.lane_path.exists())
+
+    def test_cleanup_with_a_failing_status_keeps_the_worktree(self):
+        f = self.facts([self.PANE])
+        info = {"agent": "claude", "agent_status": "idle", "agent_session": {"value": "s-1"}}
+        with mock.patch.object(fleet, "pane_info", return_value=info), \
+                mock.patch.object(fleet, "exit_agent", return_value=True), \
+                mock.patch.object(fleet, "status_entries", return_value=None):
+            out = fleet.clean_lane(f, 5)
+        self.assertEqual((out["ok"], out.get("removed")), (False, None))
+        self.assertEqual(out["error"], "git status failed; the worktree stays")
+        self.assert_lane_stays()
 
 class ProjectLogTests(unittest.TestCase):
     """Project homes, the event log, the session hooks and `fleet log`, in a temporary FLEET_HOME."""
@@ -1483,7 +1840,6 @@ class ApprovePlanTests(unittest.TestCase):
         git("mv", ".fleet/draft.py", "app2.py", cwd=lane)
         self.assertIn(" -> ", subprocess.run(["git", "status", "--porcelain"], cwd=lane, capture_output=True,
                                              text=True).stdout)
-        self.assertEqual(fleet.count_dirty("R  .fleet/draft.py -> app2.py\n"), 0)  # sweep's reading, unchanged
         self.assertEqual(fleet.status_paths(str(lane)), ["app2.py", ".fleet/draft.py"])
         out = self.refused("--by", "user", reason="1 changed path outside .fleet/", cwd=lane, plan=plan)
         self.assertEqual(out["paths"], ["app2.py"])
