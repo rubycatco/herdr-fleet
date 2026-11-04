@@ -1228,6 +1228,338 @@ class CleanupTests(FleetTestCase):
         self.assertEqual(out["error"], "git status failed; the worktree stays")
         self.assert_lane_stays()
 
+class LaneOwnerTests(FleetTestCase):
+    """Lane ownership (.fleet/lane.json) on real git worktrees: worktree and spawn record the orch, adopt sets and
+    moves it, and cleanup and adopt refuse a lane of another orch without --other-orch. Herdr is a stub."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.repo, self.wt, self.home = self.root / "repo", self.root / "wt", self.root / "home"
+        self.workspaces = []  # (workspace id, path) of the worktrees that the herdr stub "opened"
+        for patch in (mock.patch.dict(os.environ, {"FLEET_HOME": str(self.home), "GIT_AUTHOR_NAME": "T",
+                                                   "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "T",
+                                                   "GIT_COMMITTER_EMAIL": "t@example.com"}),
+                      mock.patch.object(fleet, "herdr_worktrees_dir", return_value=self.wt),
+                      mock.patch.object(fleet, "herdr", side_effect=self.fake_herdr),
+                      mock.patch.object(fleet, "require_herdr"),
+                      mock.patch.object(fleet, "pr_for_branch", return_value=(None, None)),
+                      mock.patch.object(fleet, "pane_state", return_value="alive")):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.repo.mkdir()
+        git("init", "-q", "-b", "main", cwd=self.repo)
+        git("commit", "-q", "--allow-empty", "-m", "init", cwd=self.repo)
+        self.project = fleet.project_for(str(self.repo))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def fake_herdr(self, *args, **kwargs):
+        if args[:2] == ("worktree", "create"):
+            branch = args[args.index("--branch") + 1]
+            path = self.wt / "repo" / branch.replace("/", "-")
+            git("worktree", "add", "-q", "-b", branch, str(path), cwd=self.repo)
+            ws = f"w{len(self.workspaces) + 5}"
+            self.workspaces.append((ws, str(path)))
+            return {"worktree": {"path": str(path)}, "workspace": {"workspace_id": ws},
+                    "root_pane": {"pane_id": f"{ws}:p1", "cwd": str(path)}}
+        if args[:2] == ("worktree", "remove"):
+            ws = args[args.index("--workspace") + 1]
+            path = dict(self.workspaces)[ws]
+            git("worktree", "remove", path, cwd=self.repo)
+            return {}
+        if args[:2] == ("workspace", "list"):
+            return {"workspaces": [{"workspace_id": ws, "worktree": {"checkout_path": p, "is_linked_worktree": True}}
+                                   for ws, p in self.workspaces if os.path.isdir(p)]}
+        return {"panes": []}
+
+    def main(self, *argv, pane="w1:p1"):
+        buf = io.StringIO()
+        env = {"HERDR_PANE_ID": pane} if pane else {}
+        with mock.patch.dict(os.environ, env), chdir(self.repo), redirect_stdout(buf):
+            if not pane:
+                os.environ.pop("HERDR_PANE_ID", None)
+            code = fleet.main(list(argv))
+        out = buf.getvalue()
+        return code, (json.loads(out) if out.strip().startswith("{") else out)
+
+    def claim(self, pane, name=None):
+        self.assertEqual(self.main("orch", "claim", *(["--name", name] if name else []), pane=pane)[0], 0)
+
+    def owner(self, path):
+        return fleet.read_json(Path(path) / ".fleet" / "lane.json")
+
+    def events(self, kind):
+        return [e for e in fleet.read_events([self.project]) if e["event"] == kind]
+
+    def worktree(self, branch, *argv, pane="w1:p1"):
+        code, out = self.main("worktree", branch, *argv, pane=pane)
+        self.assertEqual(code, 0, out)
+        return Path(out["cwd"])
+
+    def test_worktree_records_the_callers_orch(self):
+        self.claim("w1:p1")
+        self.claim("w2:p1", "billing")
+        a = self.worktree("feat/a")
+        rec = self.owner(a)
+        self.assertEqual((rec["orch"], rec["project"], rec["branch"], rec["by"]), ("default", "repo", "feat/a", "w1:p1"))
+        self.assertIn("since", rec)
+        self.assertEqual(self.owner(self.worktree("feat/b", pane="w2:p1"))["orch"], "billing")
+        self.assertEqual(self.owner(self.worktree("feat/c", pane="w9:p9"))["orch"], None)  # no orch: null
+        self.assertEqual(self.owner(self.worktree("feat/d", "--orch", "billing", pane="w9:p9"))["orch"], "billing")
+        self.assertEqual([(e["branch"], e.get("orch")) for e in self.events("worktree")],
+                         [("feat/a", "default"), ("feat/b", "billing"), ("feat/c", None), ("feat/d", "billing")])
+        # An unknown --orch refuses before herdr creates anything.
+        with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+            self.assertEqual(self.main("worktree", "feat/e", "--orch", "nope")[0], 1)
+        self.assertIn("no orch 'nope'", err.getvalue())
+        self.assertEqual(len(self.workspaces), 4)
+        # A project with one orch: every caller's lane is that orch's.
+        (self.project / "orch.json").unlink()
+        self.claim("w1:p1")
+        self.assertEqual(self.owner(self.worktree("feat/f", pane="w9:p9"))["orch"], "default")
+        # cleanup archives lane.json with the lane's other files.
+        out = fleet.archive_lane_files(str(a), "repo", "feat/a")
+        self.assertEqual(fleet.read_json(Path(out) / "lane.json")["orch"], "default")
+
+    def spawn(self, cwd, *argv, pane="w1:p1"):
+        def create(args, cwd=None, info=None):
+            return {"pane_id": "w1:p9", "workspace_id": "w1", "cwd": cwd, "placement": "split"}
+
+        def run(cmd, *a, **k):
+            if cmd[0] == "herdr":
+                return subprocess.CompletedProcess(cmd, 0, "{}", "")
+            return _guarded_run(cmd, *a, **k)
+        buf = io.StringIO()
+        with mock.patch.object(fleet, "run", run), mock.patch.object(fleet, "create_pane", side_effect=create), \
+                mock.patch.object(fleet, "herdr_ok", return_value=True), \
+                mock.patch.object(fleet, "pane_info", return_value={"cwd": str(cwd)}), \
+                mock.patch.dict(os.environ, {"HERDR_PANE_ID": pane, "FLEET_NO_REMUDA": "1"}), redirect_stdout(buf):
+            code = fleet.main(["spawn", "--no-wait", "--cwd", str(cwd), *argv])
+        return code, json.loads(buf.getvalue())
+
+    def test_spawn_adopts_an_unowned_lane_only(self):
+        self.claim("w1:p1")
+        self.claim("w2:p1", "billing")
+        lane = self.root / "hand-made"
+        git("worktree", "add", "-q", "-b", "feat/h", str(lane), cwd=self.repo)
+        for role in ("critic", "researcher"):  # any role: the first orch that starts an agent owns the lane
+            code, out = self.spawn(lane, "--role", role, pane="w2:p1")
+            self.assertEqual((code, out.get("adopted")), (0, "billing" if role == "critic" else None), out)
+        self.assertEqual((self.owner(lane)["orch"], self.owner(lane)["by"]), ("billing", "w2:p1"))
+        self.assertEqual([(e.get("orch"), e.get("adopted")) for e in self.events("spawn")],
+                         [("billing", "billing"), ("billing", None)])
+        # A spawn by another orch never takes an owned lane.
+        self.assertEqual(self.spawn(lane, "--role", "critic", pane="w1:p1")[0], 0)
+        self.assertEqual(self.owner(lane)["orch"], "billing")
+        # A lane.json that names no orch is unowned; a main checkout gets no lane.json.
+        fleet.write_json(lane / ".fleet" / "lane.json", {"orch": None})
+        self.spawn(lane, "--role", "helper", pane="w1:p1")
+        self.assertEqual(self.owner(lane)["orch"], "default")
+        self.spawn(self.repo, "--role", "researcher", pane="w1:p1")
+        self.assertFalse((self.repo / ".fleet" / "lane.json").exists())
+        # A caller that is no orch, in a project with two, adopts nothing; an unknown --orch refuses at once.
+        other = self.root / "other-lane"
+        git("worktree", "add", "-q", "-b", "feat/o", str(other), cwd=self.repo)
+        self.spawn(other, "--role", "helper", pane="w9:p9")
+        self.assertFalse((other / ".fleet" / "lane.json").exists())
+        with mock.patch.object(sys, "stderr", io.StringIO()), mock.patch.object(fleet, "create_pane") as create:
+            self.assertEqual(fleet.main(["spawn", "--no-wait", "--cwd", str(other), "--orch", "nope"]), 1)
+        create.assert_not_called()
+
+    def test_adopt_sets_and_moves_the_owner(self):
+        self.claim("w1:p1")
+        self.claim("w2:p1", "billing")
+        hand = self.root / "hand-made"  # a worktree made by hand: no .fleet/ yet
+        git("worktree", "add", "-q", "-b", "feat/h", str(hand), cwd=self.repo)
+        code, out = self.main("adopt", str(hand), pane="w1:p1")
+        self.assertEqual((code, out["lanes"][0]["orch"], out["lanes"][0]["old"]), (0, "default", None), out)
+        self.assertEqual(self.owner(hand)["orch"], "default")
+        self.assertIn(".fleet/", (self.repo / ".git" / "info" / "exclude").read_text())
+        # Another orch is refused without the flag, with the owner and the flag named; nothing changes.
+        code, out = self.main("adopt", str(hand), pane="w2:p1")
+        self.assertEqual((code, out["ok"], out["changed"]), (2, False, "nothing"))
+        self.assertEqual(out["refused"][0]["reasons"],
+                         [f"lane {hand} belongs to orch default; pass --other-orch to adopt it"])
+        self.assertEqual(self.owner(hand)["orch"], "default")
+        code, out = self.main("adopt", str(hand), "--other-orch", pane="w2:p1")
+        self.assertEqual((code, out["lanes"][0]["old"], self.owner(hand)["orch"]), (0, "default", "billing"))
+        self.assertEqual([(e.get("old"), e["orch"]) for e in self.events("adopt")], [(None, "default"),
+                                                                                       ("default", "billing")])
+        self.assertIn(f"{hand}: orch default -> billing", self.main("log")[1])
+        # The same owner again: no write, no event.
+        self.assertFalse(self.main("adopt", str(hand), pane="w2:p1")[1]["lanes"][0]["changed"])
+        self.assertEqual(len(self.events("adopt")), 2)
+        # Refusals: an unknown orch, a caller with no orch, a path that is no worktree; each refuses the whole call.
+        lane = self.worktree("feat/x", pane="w9:p9")  # unowned
+        for argv, pane, text in (((str(lane), "--orch", "nope"), "w1:p1", "no orch 'nope'"),
+                                 ((str(lane),), "w9:p9", "no orch to adopt it for"),
+                                 ((str(lane), str(self.root)), "w1:p1", "not a lane and not the top")):
+            code, out = self.main("adopt", *argv, pane=pane)
+            self.assertEqual((code, out["changed"]), (2, "nothing"), argv)
+            self.assertIn(text, " ".join(r for x in out["refused"] for r in x["reasons"]))
+            self.assertIsNone(self.owner(lane)["orch"])
+        # By workspace id, as sweep prints it.
+        ws = dict((p, w) for w, p in self.workspaces)[str(lane)]
+        self.assertEqual(self.main("adopt", ws, "--orch", "billing", pane="w9:p9")[0], 0)
+        self.assertEqual(self.owner(lane)["orch"], "billing")
+
+    def cleanup(self, *argv, pane="w1:p1"):
+        return self.main("cleanup", *argv, "--unmerged", pane=pane)
+
+    def test_cleanup_refuses_a_lane_of_another_orch(self):
+        self.claim("w1:p1")
+        self.claim("w2:p1", "billing")
+        mine, theirs = self.worktree("feat/mine"), self.worktree("feat/theirs", pane="w2:p1")
+        unowned = self.worktree("feat/unowned", pane="w9:p9")
+        # Refused: the owner and the flag are named, exit 2, nothing changes, also for the other targets.
+        for argv in ((str(theirs),), (str(mine), str(theirs)), (str(theirs), "--dry-run")):
+            code, out = self.cleanup(*argv)
+            self.assertEqual((code, out["ok"], out["changed"]), (2, False, "nothing"), argv)
+            [r] = [r for r in out["refused"] if r.get("owner")]
+            self.assertEqual((r["owner"], r["orch"], r["reasons"]),
+                             ("billing", "default", [f"lane {theirs} belongs to orch billing; pass --other-orch to "
+                                                     "remove it"]))
+        self.assertTrue(mine.is_dir() and theirs.is_dir())
+        self.assertEqual(self.events("cleanup"), [])
+        # A caller with no orch: every owned lane is another orch's; an unowned lane passes.
+        code, out = self.cleanup(str(mine), pane="w9:p9")
+        self.assertEqual((code, out["refused"][0]["owner"], out["refused"][0]["orch"]), (2, "default", None))
+        code, out = self.cleanup(str(unowned), pane="w9:p9")
+        self.assertEqual((code, out["ok"]), (0, True), out)
+        self.assertFalse(unowned.exists())
+        # The caller's own lane passes; the event names the owner.
+        self.assertEqual(self.cleanup(str(mine))[0], 0)
+        self.assertEqual([(e["branch"], e.get("orch")) for e in self.events("cleanup")],
+                         [("feat/unowned", None), ("feat/mine", "default")])
+        # --other-orch lets the lane through; --orch acts as another orch.
+        code, out = self.cleanup(str(theirs), "--other-orch")
+        self.assertEqual((code, self.events("cleanup")[-1]["orch"]), (0, "billing"), out)
+        self.assertFalse(theirs.exists())
+        other = self.worktree("feat/other", pane="w2:p1")
+        self.assertEqual(self.cleanup(str(other), "--orch", "billing", pane="w9:p9")[0], 0)
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(self.cleanup(str(self.worktree("feat/z")), "--orch", "nope")[0], 1)
+
+    def test_board_notes_a_lane_in_another_clone(self):
+        """A lane whose main checkout is not the main checkout of its orch's recorded checkout sits in another clone
+        of the project; no note when the orch's checkout is another project's."""
+        clone = self.root / "clone"
+        git("clone", "-q", str(self.repo), str(clone), cwd=self.root)
+        git("remote", "remove", "origin", cwd=clone)
+        fleet.write_json(self.project / "project.json", {"name": "repo", "keys": [f"local:{self.repo}",
+                                                                                   f"local:{clone}"]})
+        self.claim("w1:p1")
+        lane = self.root / "clone-lane"
+        git("worktree", "add", "-q", "-b", "feat/c", str(lane), cwd=clone)
+        stub = {"path": str(lane), "panes": [], "pr": None, "branch": "feat/c", "main_root": str(clone),
+                "exists": True, "git": True, "linked": True}
+        roots = fleet.orch_roots(self.project, fleet.read_orchs(self.project))
+        self.assertEqual(roots, {"default": str(self.repo)})
+        record = fleet.board_record(stub, [], self.project, roots=roots, viewer="default")
+        self.assertEqual((record["clone"], record["checkout"], record["orch"]), (str(clone), str(clone), None))
+        self.assertIn("in another clone: " + fleet.short_path(str(clone))[:20], fleet.board_lines([record])[1])
+        same = fleet.board_record({**stub, "main_root": str(self.repo)}, [], self.project, roots=roots,
+                                  viewer="default")
+        self.assertNotIn("clone", same)
+        # The orch's checkout is in another project: no note.
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        git("init", "-q", "-b", "main", cwd=elsewhere)
+        orchs = fleet.read_orchs(self.project)
+        orchs["default"]["checkout"] = str(elsewhere)
+        self.assertEqual(fleet.orch_roots(self.project, orchs), {"default": None})
+        self.assertNotIn("clone", fleet.board_record(stub, [], self.project, roots={"default": None},
+                                                     viewer="default"))
+
+    def test_copied_clones(self):
+        """A clone copied with its folder lists the first clone's worktrees as its own. Each worktree belongs to the
+        clone that its own .git file names: listed once, `locked` from that clone's listing, and cleanup removes it
+        from that clone; a worktree that the copy made itself belongs to the copy."""
+        lane = self.root / "lane-a"
+        git("worktree", "add", "-q", "-b", "lane-a", str(lane), cwd=self.repo)
+        fleet.prep_dir(str(lane))
+        plain = self.root / "plain"
+        git("worktree", "add", "-q", "-b", "plain", str(plain), cwd=self.repo)
+        copy = self.root / "copy"
+        shutil.copytree(self.repo, copy, symlinks=True)
+        git("worktree", "lock", str(plain), cwd=copy)  # the copy's stale entry says locked; the first clone's not
+        own = self.root / "copy-lane"
+        git("worktree", "add", "-q", "-b", "copy-lane", str(own), cwd=copy)
+        fleet.prep_dir(str(own))
+        for listed in ((str(self.repo), str(copy)), (str(copy), str(self.repo)), (str(copy),)):
+            with mock.patch.object(fleet, "enumerate_lanes", return_value=([], list(listed))):
+                stubs, others = fleet.lane_stubs()
+            by_path = {s["path"]: s for s in stubs}
+            self.assertEqual(sorted(by_path), sorted([str(lane), str(own)]), listed)
+            self.assertEqual((by_path[str(lane)]["main_root"], by_path[str(own)]["main_root"]),
+                             (str(self.repo), str(copy)), listed)
+            self.assertEqual([(o["repo"], o["path"]) for o in others], [("repo", str(plain))], listed)
+        with mock.patch.object(fleet, "enumerate_lanes", return_value=([], [str(copy)])):
+            stubs, others = fleet.lane_stubs()
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                fleet.print_sweep([], others)
+        self.assertIn("  repo: 1 other", buf.getvalue())
+        self.assertNotIn("copy:", buf.getvalue())
+        git("worktree", "lock", str(lane), cwd=self.repo)
+        git("worktree", "unlock", str(plain), cwd=copy)
+        git("worktree", "lock", str(plain), cwd=copy)
+        with mock.patch.object(fleet, "enumerate_lanes", return_value=([], [str(copy)])):
+            stubs, _ = fleet.lane_stubs()
+        self.assertTrue({s["path"]: s for s in stubs}[str(lane)]["locked"])  # from the first clone
+        git("worktree", "unlock", str(lane), cwd=self.repo)
+        git("worktree", "lock", str(lane), cwd=copy)  # only the copy's stale entry
+        with mock.patch.object(fleet, "enumerate_lanes", return_value=([], [str(copy)])):
+            lanes, _, _ = fleet.collect_lanes(targets=[str(lane)])
+        self.assertEqual((lanes[0]["main_root"], lanes[0].get("locked")), (str(self.repo), False))
+        git("worktree", "unlock", str(lane), cwd=copy)  # git never calls a locked entry prunable
+        # cleanup removes the first clone's lane from the first clone; the copy's entry only turns prunable.
+        before = sorted(p.name for p in (copy / ".git" / "worktrees").iterdir())
+        with mock.patch.object(fleet, "enumerate_lanes", return_value=([], [str(copy)])):
+            code, out = self.main("cleanup", str(lane), "--unmerged", pane="w9:p9")
+        self.assertEqual((code, out["lanes"][0]["removed"]), (0, True), out)
+        self.assertFalse(lane.exists())
+        self.assertNotIn(str(lane), git_out("worktree", "list", cwd=self.repo))
+        self.assertEqual(sorted(p.name for p in (copy / ".git" / "worktrees").iterdir()), before)
+        self.assertIn("prunable", git_out("worktree", "list", "--porcelain", cwd=copy))
+        self.assertTrue(own.is_dir())
+
+    def test_sweep_shows_the_owner_and_herdr_refusal_falls_back_to_git(self):
+        self.claim("w1:p1")
+        self.claim("w2:p1", "billing")
+        mine, unowned = self.worktree("feat/mine"), self.worktree("feat/free", pane="w9:p9")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(fleet.main(["sweep"]), 0)
+        text = buf.getvalue()
+        self.assertRegex(text, r"feat/mine\s+orch default\s")
+        self.assertRegex(text, r"feat/free\s+unowned\s")
+        self.assertIn("A lane of another orch needs --other-orch.", text)
+        lanes = {l["path"]: l for l in self.main("sweep", "--json")[1]["lanes"]}
+        self.assertEqual((lanes[str(mine)]["orch"], lanes[str(unowned)]["orch"]), ("default", None))
+        # herdr refuses to remove the worktree (a workspace opened from a copied clone): git removes it from the
+        # lane's own main checkout, and the result says to close the workspace.
+        real = self.fake_herdr
+
+        def refusing(*args, **kwargs):
+            if args[:2] == ("worktree", "remove"):
+                raise fleet.FleetError("herdr: validation failed")
+            return real(*args, **kwargs)
+        with mock.patch.object(fleet, "herdr", side_effect=refusing):
+            code, out = self.cleanup(str(mine))
+        [lane] = out["lanes"]
+        self.assertEqual((code, lane["removed"]), (0, True), out)
+        self.assertIn("herdr worktree remove failed (herdr: validation failed); git removed the worktree", lane["note"])
+        self.assertFalse(mine.exists())
+        self.assertIn("herdr workspace close", self.events("cleanup")[-1]["note"])
+
+
+def git_out(*args, cwd):
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
+
+
 class ProjectLogTests(FleetTestCase):
     """Project homes, the event log, the session hooks and `fleet log`, in a temporary FLEET_HOME."""
 

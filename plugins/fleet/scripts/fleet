@@ -456,9 +456,21 @@ def choose_option(pane: str, target: re.Pattern, max_steps: int = 6) -> bool:
 # worktree / spawn
 
 
-def create_worktree(branch: str, base: str | None, repo: str | None, label: str | None) -> dict:
-    """herdr worktree create: a linked worktree in its own workspace, with a shell pane."""
+def caller_orch(path: str | None, name: str | None = None, create: bool = False) -> tuple[Path | None, str | None]:
+    """(the project home of the checkout `path`, the caller's orch there: current_orch, with `name` from --orch).
+    (None, None) outside a project; a `name` that the project does not have raises."""
+    home = project_for(path, create=create) if path else None
+    if name and not home:
+        raise FleetError(f"--orch {name}: {path} is in no fleet project")
+    return home, (current_orch(home, name)[0] if home else None)
+
+
+def create_worktree(branch: str, base: str | None, repo: str | None, label: str | None,
+                    orch: str | None = None) -> dict:
+    """herdr worktree create: a linked worktree in its own workspace, with a shell pane, and .fleet/lane.json naming
+    the caller's orch in the repository's project (`orch`: --orch; null for a caller that is no orch)."""
     repo = repo or git_toplevel(os.getcwd()) or os.getcwd()
+    home, owner = caller_orch(repo, orch, create=True)  # before anything is created: an unknown --orch refuses
     cmd = ["worktree", "create", "--cwd", repo, "--branch", branch, "--no-focus"]
     if base:
         cmd += ["--base", base]
@@ -469,14 +481,17 @@ def create_worktree(branch: str, base: str | None, repo: str | None, label: str 
     out = {"pane_id": find_pane_id(result), "tab_id": (result.get("tab") or {}).get("tab_id"),
            "workspace_id": (result.get("workspace") or {}).get("workspace_id"),
            "cwd": path, "branch": branch, "placement": f"worktree {branch}"}
+    if path:
+        out["lane_json"] = write_lane_owner(path, home, owner, os.environ.get("HERDR_PANE_ID"))
+        out["orch"] = owner
     record("worktree", path, lane=path, branch=branch, base=base, label=label, workspace=out["workspace_id"],
-           pane=out["pane_id"])
+           pane=out["pane_id"], orch=owner)
     return out
 
 
 def cmd_worktree(args: argparse.Namespace) -> int:
     require_herdr()
-    target = create_worktree(args.branch, args.base, args.repo, args.name)
+    target = create_worktree(args.branch, args.base, args.repo, args.name, args.orch)
     prep = prep_dir(target["cwd"])
     print(json.dumps({"ok": True, **target, **prep}, indent=2, ensure_ascii=False))
     return 0
@@ -542,7 +557,7 @@ def create_pane(args: argparse.Namespace, cwd: str | None = None, info: dict | N
         return {"pane_id": args.pane, "tab_id": info.get("tab_id"), "workspace_id": info.get("workspace_id"),
                 "cwd": cwd or info.get("cwd"), "placement": "existing pane"}
     if args.worktree:
-        return create_worktree(args.worktree, args.base, args.repo, args.name)
+        return create_worktree(args.worktree, args.base, args.repo, args.name, getattr(args, "orch", None))
     cwd = cwd or os.path.abspath(os.path.expanduser(args.cwd or os.getcwd()))
     if args.tab:
         cmd = ["tab", "create", "--cwd", cwd, "--no-focus"]
@@ -644,6 +659,19 @@ def wait_for_start(pane: str, agent: str, prompt: str | None, accept_trust: bool
     return {"ok": False, "status": pane_info(pane).get("agent_status"), "reason": f"agent not ready after {timeout:g}s", "notes": notes}
 
 
+def adopt_on_spawn(cwd: str, name: str | None) -> dict:
+    """At the first spawn into an unowned lane (the top of a linked worktree whose lane.json is missing or names no
+    orch), the caller's orch adopts it, whatever the role. A lane of another orch is never taken, and a main checkout
+    gets no lane.json. Returns {"adopted": name} when it wrote, else {}."""
+    if lane_owner(cwd) or not repo_paths(cwd).get("linked"):
+        return {}
+    home, owner = caller_orch(cwd, name)
+    if not owner:
+        return {}
+    write_lane_owner(cwd, home, owner, os.environ.get("HERDR_PANE_ID"))
+    return {"adopted": owner}
+
+
 def cmd_spawn(args: argparse.Namespace) -> int:
     prompt = args.prompt
     if prompt and (len(prompt) > PROMPT_MAX or "\n" in prompt):
@@ -679,6 +707,8 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     require_herdr()
     info = pane_info(args.pane) if args.pane else None  # one snapshot of an existing pane
     cwd = target_cwd(args, info)
+    if args.orch and cwd:
+        caller_orch(cwd, args.orch)  # an unknown --orch refuses before anything is created
     if args.role in GATED_ROLES:
         if args.pane and not cwd:
             return refuse(reason=f"herdr reports no directory for pane {args.pane}, so the plan gate cannot be "
@@ -696,12 +726,16 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         if task:
             entry["task"] = task
         target["registry"] = register_pane(target["cwd"], pane, entry)
+    if target.get("cwd") and not args.worktree:
+        target.update(adopt_on_spawn(target["cwd"], args.orch))
     run(["herdr", "pane", "run", pane, launch["command"]])
     # Record the launch now: the wait can take minutes, and the caller can stop the command during it.
     cwd = target.get("cwd")
     where = {"pane": pane, "workspace": target.get("workspace_id"), "cwd": cwd,
              "branch": (git_branch(cwd) or None) if cwd else None, "agent": agent, "role": args.role}
-    record("spawn", cwd, **where, placement=target.get("placement"), account=launch["account"], model=args.model,
+    owner = lane_owner(cwd) if cwd else None
+    record("spawn", cwd, **where, orch=owner, adopted=target.get("adopted"), placement=target.get("placement"),
+           account=launch["account"], model=args.model,
            effort=args.effort, permission_mode=args.permission_mode, label=args.name, prompt=prompt,
            resume=args.resume, task=task)
     if args.no_wait:
@@ -1158,6 +1192,7 @@ HOOK_WAIT_STEP = 0.05  # seconds of each wait in ensure_project and record
 EVENT_FIELD_TYPES = {"ok": bool, "closed": bool, "removed": bool, "replace": bool, "force": bool, "by": dict,
                      "exited": list, "reasons": list, "round": int, "files": int, "high_risk": list, "matches": list,
                      "follow_ups_closed": list, "follow_ups_released": list, "switched": bool, "lanes": list}
+# `orch` (text) names the orch that an event concerns: the claim's, or the owner of the event's lane.
 DICT_LIST_FIELDS = ("exited", "high_risk", "matches")  # lists of objects with text fields; other lists hold text
 
 
@@ -2142,6 +2177,7 @@ def lane_facts(stub: dict, caller_pane: str | None, caller_cwd: str, pr_lookup=N
     """What sweep and cleanup decide on, for one lane. Reads only."""
     f = dict(stub)
     path = f["path"]
+    f["orch"] = lane_owner(path)
     f["panes"] = [{"pane": p.get("pane_id"), "agent": p.get("agent"), "status": p.get("agent_status")}
                   for p in stub.get("panes") or []]
     f["self"] = inside(caller_cwd, path) or any(p["pane"] == caller_pane for p in f["panes"])
@@ -2306,10 +2342,17 @@ def match_target(target: str, stubs: list[dict]) -> dict | None:
     return next((s for s in stubs if os.path.realpath(s["path"]) == path), None)
 
 
-def lane_stubs() -> tuple[list[dict], list[dict]]:
+def lane_stubs(others: bool = True) -> tuple[list[dict], list[dict]]:
     """(lane stubs, other worktrees): herdr's worktree workspaces and the checkouts in its worktrees directory, then
     each linked worktree with a .fleet/ folder that the `git worktree list` of a clone shows. Each stub has its
-    repo_paths and `locked`. Runs herdr and git, never gh."""
+    repo_paths and `locked`. Runs herdr and git, never gh.
+
+    A clone made by copying another clone's folder lists the first clone's worktrees as its own, from stale copies
+    of their entries, while each such worktree's own .git file names the first clone. So a worktree belongs to the
+    main checkout that its own .git names (repo_paths), never to the clone whose listing showed it; it is listed once,
+    and its `locked` comes from the listing of its own main checkout. A listed folder that is gone (prunable) has no
+    .git to ask: it stays with the listing that shows it. `others=False` skips the other worktrees (their
+    attribution costs a git call each), for callers that only need the lanes."""
     stubs, checkouts = enumerate_lanes()
     for s in stubs:
         s.update(repo_paths(s["path"]))
@@ -2317,33 +2360,50 @@ def lane_stubs() -> tuple[list[dict], list[dict]]:
     for root in [s["main_root"] for s in stubs if s.get("main_root")] + checkouts:
         repos.setdefault(os.path.realpath(root), root)
     known = {os.path.realpath(s["path"]): s for s in stubs}
-    others: list[dict] = []
+    listings: dict[str, dict[str, dict]] = {}
+
+    def listing(root: str) -> dict[str, dict]:
+        """The linked worktrees that `git worktree list` in `root` shows, by real path, in order (read once)."""
+        key = os.path.realpath(root)
+        if key not in listings:
+            cp = run_git(root, "worktree", "list", "--porcelain")
+            entries = parse_worktree_porcelain(cp.stdout if cp is not None and cp.returncode == 0 else "")
+            listings[key] = {os.path.realpath(e["path"]): e for e in entries[1:]}
+        return listings[key]
+    found: list[dict] = []
+    seen: set[str] = set()
     for _, root in sorted(repos.items()):
-        listing = run_git(root, "worktree", "list", "--porcelain")
-        entries = parse_worktree_porcelain(listing.stdout if listing is not None and listing.returncode == 0 else "")
-        for e in entries[1:]:
-            real = os.path.realpath(e["path"])
-            if real in known:
-                known[real]["locked"] = e["locked"]
-            elif os.path.isdir(os.path.join(e["path"], FLEET_DIR)):
-                s = {"workspace": None, "label": None, "path": e["path"], "panes": [], "locked": e["locked"]}
-                s.update(repo_paths(e["path"]))
+        for real, e in listing(root).items():
+            if real in seen:
+                continue  # listed once, also when several clones show it
+            seen.add(real)
+            stub = known.get(real)
+            has_fleet = stub is None and os.path.isdir(os.path.join(e["path"], FLEET_DIR))
+            if stub is None and not has_fleet and not others:
+                continue
+            info = stub if stub is not None else repo_paths(e["path"]) if os.path.isdir(e["path"]) else {}
+            own = info.get("main_root") if info.get("git") else root
+            locked = listing(own).get(real, e)["locked"]
+            if stub is not None:
+                stub["locked"] = locked
+            elif has_fleet:
+                s = {"workspace": None, "label": None, "path": e["path"], "panes": [], "locked": locked, **info}
                 stubs.append(s)
                 known[real] = s
             else:
-                others.append({"repo": os.path.basename(root), "path": e["path"], "branch": e["branch"],
-                               "kind": other_kind(e["path"]), "prunable": e["prunable"]})
-    return stubs, others
+                found.append({"repo": os.path.basename(own), "path": e["path"], "branch": e["branch"],
+                              "kind": other_kind(e["path"]), "prunable": e["prunable"]})
+    return stubs, found
 
 
 def collect_lanes(targets: list[str] | None = None, pr_lookup=None,
-                  select=None) -> tuple[list[dict], list[dict], list[str]]:
+                  select=None, others: bool = True) -> tuple[list[dict], list[dict], list[str]]:
     """(lanes with their verdicts, other worktrees, targets that name no lane). Only `targets`, when given.
 
     `select` (a stub -> bool) keeps only some lanes before their facts are read, so that `board` looks up the
-    pull requests of its own project only.
+    pull requests of its own project only. `others=False`: no other worktrees (lane_stubs).
     """
-    stubs, others = lane_stubs()
+    stubs, others = lane_stubs(others)
     missing: list[str] = []
     if targets is not None:
         chosen: list[dict] = []
@@ -2373,8 +2433,13 @@ def print_sweep(lanes: list[dict], others: list[dict]) -> None:
     groups = [(title, sorted((l for l in lanes if l["verdict"] == verdict),
                              key=lambda l: (l.get("repo") or "", l.get("branch") or l["path"])))
               for verdict, title in VERDICTS]
-    rows = [[l["target"], l.get("repo") or "-", l.get("branch") or "-"] for _, group in groups for l in group]
-    widths = [max([len(r[i]) for r in rows] or [0]) for i in range(3)]
+    owned = any(l.get("orch") for l in lanes)
+
+    def cells(l: dict) -> list[str]:
+        return [l["target"], l.get("repo") or "-", l.get("branch") or "-"] + (
+            [f"orch {l['orch']}" if l.get("orch") else "unowned"] if owned else [])
+    rows = [cells(l) for _, group in groups for l in group]
+    widths = [max([len(r[i]) for r in rows] or [0]) for i in range(len(rows[0]) if rows else 3)]
     if not lanes:
         print("No lanes: no worktree workspace is open in Herdr, and its worktrees directory is empty.\n")
     for title, group in groups:
@@ -2382,8 +2447,7 @@ def print_sweep(lanes: list[dict], others: list[dict]) -> None:
             continue
         print(f"{title} ({len(group)})")
         for l in group:
-            cells = [l["target"], l.get("repo") or "-", l.get("branch") or "-"]
-            print("  " + "  ".join(c.ljust(widths[i]) for i, c in enumerate(cells)) + "  " + lane_why(l))
+            print("  " + "  ".join(c.ljust(widths[i]) for i, c in enumerate(cells(l))) + "  " + lane_why(l))
         print()
     if others:
         counts: dict[str, dict[str, int]] = {}
@@ -2398,7 +2462,7 @@ def print_sweep(lanes: list[dict], others: list[dict]) -> None:
             print(f"  {prunable} of them have no folder any more (git worktree prune)")
         print()
     print("`fleet cleanup TARGET...` removes ready lanes. With --unmerged it also removes a clean lane without a merge,"
-          " and keeps its branch.")
+          " and keeps its branch." + (" A lane of another orch needs --other-orch." if owned else ""))
 
 
 def cmd_sweep(args: argparse.Namespace) -> int:
@@ -2474,6 +2538,7 @@ def clean_lane(f: dict, timeout: float) -> dict:
     none, then delete its branch when merged."""
     out: dict = {"target": f["target"], "path": f["path"], "ok": False, "exited": []}
     sessions: list[dict] = []
+    owner = f["orch"] if "orch" in f else lane_owner(f["path"])  # read before the removal: removed_records needs it
     try:
         for p in f["panes"]:
             if not p.get("agent"):
@@ -2509,13 +2574,24 @@ def clean_lane(f: dict, timeout: float) -> dict:
         if dirty:
             out["error"] = f"{plural(dirty, 'uncommitted change')} appeared after the check; the worktree stays"
             return out
+        herdr_error = None
         if f.get("workspace"):
-            herdr("worktree", "remove", "--workspace", f["workspace"], "--json", timeout=120)
-        else:
+            try:
+                herdr("worktree", "remove", "--workspace", f["workspace"], "--json", timeout=120)
+            except FleetError as e:
+                herdr_error = str(e)  # e.g. a workspace opened from a copied clone: git removes it from main_root
+        if not f.get("workspace") or (herdr_error and os.path.isdir(f["path"])):
             cp = run(["git", "-C", f["main_root"], "worktree", "remove", f["path"]], timeout=120)
             if cp.returncode != 0:
-                out["error"] = first_line(cp.stderr or cp.stdout) or "git worktree remove failed"
+                out["error"] = (first_line(cp.stderr or cp.stdout) or "git worktree remove failed") + (
+                    f" (herdr worktree remove failed first: {herdr_error})" if herdr_error else "")
                 return out
+            if herdr_error:
+                out["note"] = (f"herdr worktree remove failed ({herdr_error}); git removed the worktree from "
+                               f"{f['main_root']}: close the workspace with `herdr workspace close {f['workspace']}`")
+        elif herdr_error:
+            out["error"] = herdr_error
+            return out
         out["removed"] = True
         parent = os.path.dirname(os.path.realpath(f["path"]))
         if os.path.dirname(parent) == os.path.realpath(herdr_worktrees_dir()):
@@ -2530,20 +2606,45 @@ def clean_lane(f: dict, timeout: float) -> dict:
         out["error"] = str(e)
     finally:
         record("cleanup", f.get("main_root"), lane=f["path"], workspace=f.get("workspace"), branch=f.get("branch"),
-               verdict=f.get("verdict"), reasons=f.get("reasons"), exited=sessions, archive=out.get("archive"),
+               orch=owner, note=out.get("note"), verdict=f.get("verdict"), reasons=f.get("reasons"), exited=sessions, archive=out.get("archive"),
                removed=bool(out.get("removed")), branch_result=out.get("branch"), ok=out["ok"],
                error=out.get("error"), follow_ups_closed=out.get("follow_ups_closed"),
                follow_ups_released=out.get("follow_ups_released"), follow_up_error=out.get("follow_up_error"))
     return out
 
 
+def other_orch_refusals(lanes: list[dict], name: str | None, allowed: bool, verb: str) -> list[dict]:
+    """The `--other-orch` guard of cleanup and adopt: a lane whose lane.json names an orch other than the caller's
+    (current_orch in the lane's project, `name` from --orch) is refused unless `allowed`. An unowned lane, and a lane
+    of the caller's own orch, pass. A caller with no orch treats every owned lane as another orch's. An unknown
+    --orch raises."""
+    if allowed:
+        return []
+    out, mine = [], {}
+    for f in lanes:
+        owner = f["orch"] if "orch" in f else lane_owner(f["path"])
+        if not owner:
+            continue
+        root = os.path.realpath(f.get("main_root") or f["path"])
+        if root not in mine:
+            home = project_for(f.get("main_root") or f["path"], create=False)
+            if name and not home:
+                raise FleetError(f"--orch {name}: {f['path']} is in no fleet project")
+            mine[root] = current_orch(home, name)[0] if home else None
+        if owner != mine[root]:
+            out.append({"target": f.get("target") or f["path"], "owner": owner, "orch": mine[root],
+                        "reasons": [f"lane {f['path']} belongs to orch {owner}; pass --other-orch to {verb} it"]})
+    return out
+
+
 def cmd_cleanup(args: argparse.Namespace) -> int:
     require_herdr()
-    lanes, _, missing = collect_lanes(targets=args.targets)
+    lanes, _, missing = collect_lanes(targets=args.targets, others=False)
     if missing:
         raise FleetError(f"not a lane: {', '.join(missing)}. `fleet sweep` lists the lanes")
-    refused = [{"target": f["target"], "verdict": f["verdict"], "reasons": f["reasons"]}
-               for f in lanes if not (f["verdict"] == "ready" or (args.unmerged and not f["blockers"]))]
+    refused = other_orch_refusals(lanes, args.orch, args.other_orch, "remove")
+    refused += [{"target": f["target"], "verdict": f["verdict"], "reasons": f["reasons"]}
+                for f in lanes if not (f["verdict"] == "ready" or (args.unmerged and not f["blockers"]))]
     if refused:
         print(json.dumps({"ok": False, "changed": "nothing", "refused": refused}, indent=2, ensure_ascii=False))
         return 2
@@ -2555,6 +2656,63 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     ok = all(r["ok"] for r in results)
     print(json.dumps({"ok": ok, "lanes": results}, indent=2, ensure_ascii=False))
     return 0 if ok else 2
+
+
+def cmd_adopt(args: argparse.Namespace) -> int:
+    """Set or move the orch that owns each target lane, in its .fleet/lane.json. A target is a lane as sweep prints
+    it, or the top of any linked worktree (a hand-made one gets its .fleet/). Every check runs before any write: an
+    unknown orch, a lane outside a project, and a lane of another orch without --other-orch refuse the whole
+    command."""
+    require_herdr()
+    stubs, _ = lane_stubs(others=False)
+    me = os.environ.get("HERDR_PANE_ID") or None
+    chosen, refused = [], []
+    for t in args.targets:
+        s = match_target(t, stubs)
+        if s is None:
+            path = os.path.realpath(os.path.expanduser(t))
+            info = repo_paths(path)
+            if not info.get("linked"):
+                refused.append({"target": t, "reasons": [f"not a lane and not the top of a linked worktree: {t}; "
+                                                         "`fleet sweep` lists the lanes"]})
+                continue
+            s = {"workspace": None, "label": None, "path": path, "panes": [], **info}
+        if any(os.path.realpath(c["path"]) == os.path.realpath(s["path"]) for c, _, _ in chosen):
+            continue
+        home = project_for(s.get("main_root"), create=False) if s.get("main_root") else None
+        if not home:
+            refused.append({"target": t, "reasons": [f"{s['path']} is in no fleet project; `fleet orch claim` in "
+                                                     "its repository makes one"]})
+            continue
+        orchs = read_orchs(home)
+        try:
+            name, _ = current_orch(home, args.orch, orchs)
+        except FleetError as e:
+            refused.append({"target": t, "reasons": [str(e)]})
+            continue
+        if not name:
+            refused.append({"target": t, "reasons": [f"no orch to adopt it for in project {home.name}: run this from "
+                                                     "an orch's pane, or pass --orch NAME"]})
+            continue
+        chosen.append((s, home, name))
+    for s, home, name in chosen:
+        refused += other_orch_refusals([{**s, "target": s.get("workspace") or short_path(s["path"])}], name,
+                                       args.other_orch, "adopt")
+    if refused:
+        return refuse(refused=refused)
+    done = []
+    for s, home, name in chosen:
+        old = lane_owner(s["path"])
+        if old == name:
+            done.append({"lane": s["path"], "orch": name, "changed": False})
+            continue
+        with project_lock(home):
+            path = write_lane_owner(s["path"], home, name, me)
+        record("adopt", s["path"], home=home, lane=s["path"], workspace=s.get("workspace"),
+               branch=git_branch(s["path"]) or None, orch=name, old=old)
+        done.append({"lane": s["path"], "orch": name, "old": old, "changed": True, "lane_json": path})
+    print(json.dumps({"ok": True, "lanes": done}, indent=2, ensure_ascii=False))
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -3533,7 +3691,7 @@ def make_board(home: Path, since: float | None, names: dict[str, str], view: dic
     if not shutil.which("herdr"):
         raise FleetError("herdr not found in PATH")
     select = lane_selector(home, view)
-    lanes, _, _ = collect_lanes(select=select)
+    lanes, _, _ = collect_lanes(select=select, others=False)
     events = read_events([home])
     held, _ = lane_follow_ups(home)  # PROJECT.md, read once per board
     roots = orch_roots(home, view["orchs"]) if view else {}
@@ -3858,7 +4016,7 @@ def orch_rows(home: Path, orchs: dict[str, dict], is2: bool, states: dict[str, s
 def project_lane_stubs(home: Path) -> list[dict]:
     """The lane stubs of the project at `home` (lane_stubs with the project filter): herdr and git, no gh."""
     select = lane_selector(home)
-    return [s for s in lane_stubs()[0] if select(s)]
+    return [s for s in lane_stubs(others=False)[0] if select(s)]
 
 
 def cmd_orch(args: argparse.Namespace) -> int:
@@ -5586,6 +5744,7 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--base", help="base ref, e.g. origin/main")
     w.add_argument("--repo", help="repository (default: git top of cwd)")
     w.add_argument("--name", help="workspace label")
+    w.add_argument("--orch", help="the orch that owns the lane, in .fleet/lane.json (default: the caller's orch)")
     w.set_defaults(func=cmd_worktree)
 
     rs = sub.add_parser("reset", help="/clear (or /compact) a claude lane, then make it resume from .fleet/")
@@ -5622,6 +5781,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--workspace", help="workspace for --tab (default: the calling pane's)")
     s.add_argument("--repo", help="repository for --worktree (default: git top of cwd)")
     s.add_argument("--base", help="base ref for --worktree, e.g. origin/main")
+    s.add_argument("--orch", help="the orch that owns a new or unowned lane (default: the caller's orch)")
     s.add_argument("--cwd", help="working directory for split/tab/workspace "
                                  "(default: the split pane's directory, else the current one)")
     s.add_argument("--accept-trust", action="store_true", help="accept the agent's folder trust dialog")
@@ -5663,7 +5823,19 @@ def build_parser() -> argparse.ArgumentParser:
                     help="also remove a clean lane whose branch is not merged; the branch stays")
     cl.add_argument("--dry-run", action="store_true", help="print the plan and change nothing")
     cl.add_argument("--timeout", type=float, default=30, help="seconds to wait for each agent to exit")
+    cl.add_argument("--orch", help="act as this orch (default: the caller's orch)")
+    cl.add_argument("--other-orch", action="store_true",
+                    help="also remove a lane whose lane.json names another orch (only for a lane the user picked)")
     cl.set_defaults(func=cmd_cleanup)
+
+    ad = sub.add_parser("adopt", help="set or move the orch that owns a lane (.fleet/lane.json)",
+                        description="Each target becomes a lane of the caller's orch (or --orch NAME). A lane of "
+                                    "another orch needs --other-orch. A refusal exits 2 and changes nothing.")
+    ad.add_argument("targets", nargs="+", metavar="TARGET",
+                    help="a workspace id or a lane path, as fleet sweep prints it, or the top of a linked worktree")
+    ad.add_argument("--orch", help="the orch that adopts (default: the caller's orch)")
+    ad.add_argument("--other-orch", action="store_true", help="move a lane that another orch owns")
+    ad.set_defaults(func=cmd_adopt)
 
     lg = sub.add_parser("log", help="the project's event log, or its agent sessions with transcripts (reads only)")
     lg.add_argument("project", nargs="?", help="a project name (default: the project of this directory)")
