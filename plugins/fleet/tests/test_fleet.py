@@ -1709,6 +1709,14 @@ class FilesTests(unittest.TestCase):
         self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "SessionStart")
         self.assertIn("HANDOFF.md", out["hookSpecificOutput"]["additionalContext"])
 
+    def test_helper_child_exits_with_the_code_of_main(self):
+        # The launcher runs the script's own `sys.exit(main())`: an error of main is the child's exit code.
+        with tempfile.TemporaryDirectory() as tmp:
+            cp = subprocess.run([*HELPER, "log", "no-such-project", "--json"], capture_output=True, text=True,
+                                timeout=CHILD_LIMIT, env={**os.environ, "FLEET_HOME": str(Path(tmp) / "home")})
+        self.assertEqual((cp.returncode, cp.stdout, cp.stderr),
+                         (1, "", "fleet: no project 'no-such-project'. Projects: none yet\n"))
+
     def test_hook_command_survives_bad_input(self):
         # The script itself, as hooks.json runs it: bad input ends before any git call.
         cp = subprocess.run([sys.executable, str(SCRIPT), "hook", "session-start"], input="not json",
@@ -3685,6 +3693,7 @@ class OrchTests(unittest.TestCase):
         the subprocess boundary, before patient_run widens them: what the helper really passes to git."""
         self.assertIsInstance(fleet.subprocess, patient_fleet.PatientSubprocess)
         self.assertEqual(fleet.HOOK_GIT_TIMEOUT, 1)
+        self.assertEqual(patient_fleet.MIN_GIT_LIMIT, fleet.HOOK_GIT_TIMEOUT)  # a smaller git limit expires at once
         self.orch_setup()
         (self.repo / ".fleet").mkdir()
         data, env = {"source": "startup", "cwd": str(self.repo)}, {"HERDR_PANE_ID": "w1:p1"}
@@ -3717,6 +3726,33 @@ class OrchTests(unittest.TestCase):
         (self.project / "orch.json").unlink()  # with git answering, the same pane is no orch: the lane text
         self.assertEqual(text, fleet.session_start_context(data, env))
         self.assertIn("This worktree has fleet lane files", text)
+
+
+class PatientFleetTests(unittest.TestCase):
+    """The test harness's boundary (patient_fleet.py): its scopes nest, and a broken git limit expires at once."""
+
+    GIT = ["git", "--version"]
+
+    def test_scopes_nest(self):
+        with patient_fleet.record_git_limits() as outer:
+            with patient_fleet.record_git_limits() as inner:
+                patient_fleet.patient_run(self.GIT, capture_output=True, timeout=5)
+            patient_fleet.patient_run(self.GIT, capture_output=True, timeout=6)
+        self.assertEqual(([t for _, t in outer], [t for _, t in inner]), ([5, 6], [5]))
+        self.assertEqual(patient_fleet._records, [])
+        with patient_fleet.git_times_out():
+            with patient_fleet.git_times_out():
+                pass
+            with self.assertRaises(subprocess.TimeoutExpired):  # the outer scope is still open
+                patient_fleet.patient_run(self.GIT, capture_output=True, timeout=5)
+        self.assertEqual(patient_fleet.patient_run(self.GIT, capture_output=True, timeout=5).returncode, 0)
+
+    def test_a_limit_below_the_smallest_expires_at_once(self):
+        with self.assertRaises(subprocess.TimeoutExpired) as caught:
+            patient_fleet.patient_run(self.GIT, capture_output=True, timeout=0)
+        self.assertIn("below the smallest product limit, 1 s", caught.exception.output)
+        self.assertEqual(patient_fleet.patient_run(self.GIT, capture_output=True, timeout=1).returncode, 0)
+        self.assertEqual(patient_fleet.patient_run(self.GIT, capture_output=True).returncode, 0)  # no limit
 
 
 class FollowUpTests(unittest.TestCase):

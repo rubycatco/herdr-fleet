@@ -5,6 +5,8 @@ call in a hook, HOOK_GIT_TIMEOUT; 3 s in git_toplevel), and on a loaded machine 
 then gives other text, or none. While the tests run, each git call of the helper that has a limit gets at least
 GIT_TEST_LIMIT seconds, at the subprocess boundary (patient_run). The helper's own limits do not change:
 patient_run first notes the limit that the helper asked for, and test_hooks_pass_their_git_limit checks those.
+A limit below MIN_GIT_LIMIT, the product's smallest git limit, is broken: patient_run lets it expire at once
+(TimeoutExpired), as it would on any machine where git takes time, so the suite sees it in any git call.
 
 test_fleet.py loads the helper with load(). A test that runs the helper in a child process runs this file, which
 runs the script as __main__ (its own `sys.exit(main())`, argument and exit handling):
@@ -30,12 +32,13 @@ import time
 from contextlib import contextmanager
 
 GIT_TEST_LIMIT = 300  # seconds
+MIN_GIT_LIMIT = 1  # seconds: the helper's smallest git limit, HOOK_GIT_TIMEOUT (a test checks that they agree)
 
 _real_run = subprocess.run  # taken before any patch, so that patient_run never calls itself
 _real_sleep = time.sleep
 _lock = threading.Lock()
 _records: list[list] = []  # the lists of record_git_limits() that are open, in this process
-_timing_out = [False]
+_timing_out = [0]  # open git_times_out() scopes
 
 
 def _note(path_var: str, entry: dict) -> None:
@@ -47,7 +50,8 @@ def _note(path_var: str, entry: dict) -> None:
 
 def patient_run(cmd, *args, **kwargs):
     """subprocess.run, with at least GIT_TEST_LIMIT seconds for a git call that has a limit. It notes the limit
-    that the caller asked for first, and with git_times_out() it raises TimeoutExpired instead of running git."""
+    that the caller asked for first. With git_times_out(), or a limit below MIN_GIT_LIMIT, it raises
+    TimeoutExpired instead of running git."""
     if cmd and os.path.basename(str(cmd[0])) == "git":
         asked = kwargs.get("timeout")
         with _lock:
@@ -55,7 +59,10 @@ def patient_run(cmd, *args, **kwargs):
                 record.append((list(map(str, cmd[1:])), asked))
         _note("PATIENT_GIT_LOG", {"args": list(map(str, cmd[1:])), "timeout": asked})
         if _timing_out[0]:
-            raise subprocess.TimeoutExpired(cmd, asked)
+            raise subprocess.TimeoutExpired(cmd, asked, output="patient_fleet: git_times_out() is open")
+        if asked is not None and asked < MIN_GIT_LIMIT:
+            raise subprocess.TimeoutExpired(cmd, asked, output=f"patient_fleet: the helper asked git for {asked} s, "
+                                            f"below the smallest product limit, {MIN_GIT_LIMIT} s")
         if asked is not None:
             kwargs["timeout"] = max(asked, GIT_TEST_LIMIT)
     return _real_run(cmd, *args, **kwargs)
@@ -71,17 +78,20 @@ def record_git_limits():
         yield record
     finally:
         with _lock:
-            _records.remove(record)
+            _records[:] = [r for r in _records if r is not record]  # by identity: an equal list may be open too
 
 
 @contextmanager
 def git_times_out():
-    """Each git call in this process raises subprocess.TimeoutExpired at the boundary, as when its limit expires."""
-    _timing_out[0] = True
+    """Each git call in this process raises subprocess.TimeoutExpired at the boundary, as when its limit expires,
+    until every open scope has closed."""
+    with _lock:
+        _timing_out[0] += 1
     try:
         yield
     finally:
-        _timing_out[0] = False
+        with _lock:
+            _timing_out[0] -= 1
 
 
 def noting_sleep(seconds):
