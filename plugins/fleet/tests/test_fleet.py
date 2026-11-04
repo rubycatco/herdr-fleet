@@ -13,7 +13,8 @@ from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-import patient_fleet
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # also when unittest gets this file by its path
+import patient_fleet  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "fleet"
 # Each git call of the helper gets a long limit while the tests run (see patient_fleet.py), here and in a child.
@@ -111,7 +112,9 @@ class Clock:
     clock that the test can stop.
 
     strftime() without a time gives the fixed calendar, so the helper and the test name the same month's log even
-    when a month ends during the test. time() is the real clock until the test sets `stopped` (seconds since the
+    when a month ends during the test. That holds for every such strftime, not only the month: spawned_at and the
+    time in the names of handoff and inbox files stay at the second when the test began (with the real clock,
+    two handoffs in one second get the same name too). time() is the real clock until the test sets `stopped` (seconds since the
     epoch); then an age that the helper computes is the same however long the test takes. monotonic() and sleep()
     stay real, so the project lock and its deadlines work as they do."""
 
