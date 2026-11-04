@@ -1,7 +1,5 @@
 """Unit tests for scripts/fleet. Run: python3 -m unittest discover -s plugins/fleet/tests"""
 
-import importlib.machinery
-import importlib.util
 import io
 import json
 import os
@@ -15,11 +13,13 @@ from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+import patient_fleet
+
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "fleet"
-_loader = importlib.machinery.SourceFileLoader("fleet_cli", str(SCRIPT))
-_spec = importlib.util.spec_from_loader("fleet_cli", _loader)
-fleet = importlib.util.module_from_spec(_spec)
-_loader.exec_module(fleet)
+# Each git call of the helper gets a long limit while the tests run (see patient_fleet.py), here and in a child.
+fleet = patient_fleet.load(SCRIPT)
+HELPER = [sys.executable, str(Path(patient_fleet.__file__).resolve()), str(SCRIPT)]  # the helper in a child process
+CHILD_LIMIT = 300  # seconds for a child process: a guard against a hang, never a measure of speed
 
 # No test writes to the real ~/.fleet, also not through a subprocess.
 _FLEET_HOME = tempfile.TemporaryDirectory()
@@ -104,6 +104,38 @@ TRUST_SCREEN = """\
 
 def git(*args, cwd):
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+class Clock:
+    """fleet.time for a test: the real time module, with a calendar that is fixed when the test begins and a wall
+    clock that the test can stop.
+
+    strftime() without a time gives the fixed calendar, so the helper and the test name the same month's log even
+    when a month ends during the test. time() is the real clock until the test sets `stopped` (seconds since the
+    epoch); then an age that the helper computes is the same however long the test takes. monotonic() and sleep()
+    stay real, so the project lock and its deadlines work as they do."""
+
+    def __init__(self):
+        self.calendar = time.localtime()
+        self.stopped = None
+
+    def time(self):
+        return time.time() if self.stopped is None else self.stopped
+
+    def strftime(self, fmt, t=None):
+        return time.strftime(fmt, self.calendar if t is None else t)
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+def use_clock(test):
+    """Give the helper a Clock for the length of `test`, and return it."""
+    clock = Clock()
+    patch = mock.patch.object(fleet, "time", clock)
+    patch.start()
+    test.addCleanup(patch.stop)
+    return clock
 
 
 def install_stale_monitor(root, repo, lane, run_git):
@@ -1272,8 +1304,8 @@ class ProjectLogTests(unittest.TestCase):
         # The hook command: SessionEnd prints nothing; SessionStart after startup prints no context.
         for event, payload in (("session-end", {"session_id": "s-1", "reason": "prompt_input_exit"}),
                                ("session-start", {"session_id": "s-2", "source": "startup"})):
-            cp = subprocess.run([sys.executable, str(SCRIPT), "hook", event], cwd=self.repo, capture_output=True,
-                                text=True, timeout=20, input=json.dumps({**payload, "cwd": str(self.repo)}),
+            cp = subprocess.run([*HELPER, "hook", event], cwd=self.repo, capture_output=True,
+                                text=True, timeout=CHILD_LIMIT, input=json.dumps({**payload, "cwd": str(self.repo)}),
                                 env={**os.environ, **env})
             self.assertEqual((cp.returncode, cp.stdout), (0, ""))
         events = fleet.read_events([self.home / "projects" / "app"])
@@ -1305,7 +1337,8 @@ class ProjectLogTests(unittest.TestCase):
             if matcher == "clear|compact":
                 continue  # the re-brief also runs outside Herdr
             self.assertTrue(command.startswith('[ -n "$HERDR_PANE_ID" ] || exit 0;'), command)
-            cp = subprocess.run(["sh", "-c", command], cwd=self.repo, capture_output=True, text=True, timeout=20,
+            cp = subprocess.run(["sh", "-c", command], cwd=self.repo, capture_output=True, text=True,
+                                timeout=CHILD_LIMIT,
                                 input=json.dumps({"session_id": "s-1", "source": "startup", "cwd": str(self.repo)}),
                                 env=env)
             self.assertEqual((cp.returncode, cp.stdout, cp.stderr), (0, "", ""))
@@ -1663,16 +1696,17 @@ class FilesTests(unittest.TestCase):
         d.mkdir()
         (d / "HANDOFF.md").write_text("handoff")
         payload = json.dumps({"source": "compact", "cwd": str(self.repo), "hook_event_name": "SessionStart"})
-        cp = subprocess.run([sys.executable, str(SCRIPT), "hook", "session-start"], input=payload,
-                            capture_output=True, text=True, timeout=20)
+        cp = subprocess.run([*HELPER, "hook", "session-start"], input=payload,
+                            capture_output=True, text=True, timeout=CHILD_LIMIT)
         self.assertEqual(cp.returncode, 0)
         out = json.loads(cp.stdout)
         self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "SessionStart")
         self.assertIn("HANDOFF.md", out["hookSpecificOutput"]["additionalContext"])
 
     def test_hook_command_survives_bad_input(self):
+        # The script itself, as hooks.json runs it: bad input ends before any git call.
         cp = subprocess.run([sys.executable, str(SCRIPT), "hook", "session-start"], input="not json",
-                            capture_output=True, text=True, timeout=20)
+                            capture_output=True, text=True, timeout=CHILD_LIMIT)
         self.assertEqual(cp.returncode, 0)
         self.assertEqual(cp.stdout, "")
 
@@ -2682,6 +2716,7 @@ class OrchTests(unittest.TestCase):
         git("remote", "add", "origin", "git@github.com:acme/app.git", cwd=self.repo)
         git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init", cwd=self.repo)
         self.project = fleet.project_for(str(self.repo))
+        self.clock = use_clock(self)
         self.alive, self.unknown = set(), set()
         self.alive_patch = mock.patch.object(fleet, "pane_state", side_effect=lambda p: (
             "alive" if p in self.alive else "unknown" if p in self.unknown else "dead"))
@@ -3033,6 +3068,7 @@ class OrchTests(unittest.TestCase):
     def test_rebrief_shows_the_risk_note_only_for_a_lane_that_needs_the_user(self):
         self.orch_setup()
         board = fleet.read_json(self.project / "board.json")
+        self.stop_clock(board, 5)  # each re-brief says "from 5s ago", however long the test takes
         quiet = dict(board, lanes=[dict(board["lanes"][0], risk=None)])
         covered = dict(board, lanes=[dict(board["lanes"][0], risk={
             "matches": [{"category": "migration", "path": "db/migrate/1.sql"}], "needs_user": []})])
@@ -3045,6 +3081,7 @@ class OrchTests(unittest.TestCase):
             return [fleet.session_start_context({"source": s, "cwd": str(self.repo)}, env={"HERDR_PANE_ID": "w1:p1"})
                     for s in ("startup", "resume", "clear", "compact")]
         before = rebriefs(board)  # records as 0.6.0 wrote them, without `risk`
+        self.assertTrue(all("\nBoard from 5s ago (cached" in text for text in before), before)
         self.assertEqual(rebriefs(quiet), before)
         self.assertEqual(rebriefs(covered), before)
         for old, new in zip(before, rebriefs(risky)):
@@ -3172,7 +3209,7 @@ class OrchTests(unittest.TestCase):
         self.assertEqual((data["read_only"], data["since"]), (False, None))
         self.assertEqual([(c["lane"], c["old"], c["new"]) for c in data["changes"]], [("lane-a", None, "working")])
         base = fleet.read_json(self.project / "digest.json")
-        log = self.project / "events" / f"{time.strftime('%Y-%m')}.jsonl"
+        log = self.project / "events" / f"{self.clock.strftime('%Y-%m')}.jsonl"
         self.assertEqual(base["read"], {log.name: log.stat().st_size - len(log.read_bytes().splitlines(True)[-1])})
         self.assertEqual(base["lanes"], {str(a): {"lane": "lane-a", "branch": "feat/a", "phase": "working"}})
         self.assertTrue((self.project / "board.json").exists())
@@ -3358,26 +3395,27 @@ class OrchTests(unittest.TestCase):
         self.assertEqual(len(self.events("phase")), 1)
 
     def test_board_json_never_goes_back_in_time(self):
-        older, newer = fleet.precise_now(), None
-        time.sleep(0.01)
-        newer = fleet.precise_now()
+        # A fixed clock, one microsecond a step: the result never depends on how far the real clock moves.
+        older, newer, began, during, after = (f"2026-11-04T10:00:00.00000{i}+00:00" for i in range(1, 6))
         self.assertTrue(fleet.save_board(self.project, [{"lane": "new"}], newer))
         self.assertFalse(fleet.save_board(self.project, [{"lane": "old"}], older))
         self.assertEqual(fleet.read_json(self.project / "board.json")["lanes"], [{"lane": "new"}])
         # `board` stamps the board with the time its collection began, and says when it keeps a newer one.
-        made = []
+        collected = []
 
         def collect(*args, **kwargs):
-            made.append(fleet.precise_now())
-            fleet.save_board(self.project, [{"lane": "newer"}], fleet.precise_now())
+            fleet.save_board(self.project, [{"lane": "newer"}], during)  # another board, begun after this one
+            collected.append(True)
             return ([], [], [])
-        with mock.patch.object(fleet, "collect_lanes", side_effect=collect), \
+        with mock.patch.object(fleet, "precise_now", side_effect=lambda: after if collected else began), \
+                mock.patch.object(fleet, "collect_lanes", side_effect=collect), \
                 mock.patch.object(fleet.shutil, "which", return_value="/usr/bin/herdr"):
             self.assertIn("board.json holds a newer board", self.main("board")[1])
-        self.assertEqual(fleet.read_json(self.project / "board.json")["lanes"], [{"lane": "newer"}])
+        self.assertEqual(fleet.read_json(self.project / "board.json"), {"made": during, "project": "app",
+                                                                        "lanes": [{"lane": "newer"}]})
 
     def log_file(self, month=None):
-        return self.project / "events" / f"{month or time.strftime('%Y-%m')}.jsonl"
+        return self.project / "events" / f"{month or self.clock.strftime('%Y-%m')}.jsonl"
 
     def raw_event(self, text, ts="2026-11-03T10:00:00+00:00", month=None, end="\n"):
         path = self.log_file(month)
@@ -3485,8 +3523,9 @@ class OrchTests(unittest.TestCase):
         fleet.write_json(self.project / "board.json", {"made": fleet.now_iso(), "lanes": [
             {"lane": "x", "pr": "#4", "panes": "w2:p1", "last_event": 7, "phase": None, "blocked": ["?"]}, "bad"]})
         payload = json.dumps({"source": "clear", "cwd": str(self.repo)})
-        cp = subprocess.run([sys.executable, str(SCRIPT), "hook", "session-start"], input=payload, cwd=self.repo,
-                            capture_output=True, text=True, timeout=20, env={**os.environ, "HERDR_PANE_ID": "w1:p1"})
+        cp = subprocess.run([*HELPER, "hook", "session-start"], input=payload, cwd=self.repo,
+                            capture_output=True, text=True, timeout=CHILD_LIMIT,
+                            env={**os.environ, "HERDR_PANE_ID": "w1:p1"})
         context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
         self.assertIn("you orchestrate project app", context)
         self.assertNotIn("You implement this lane", context)
@@ -3530,8 +3569,13 @@ class OrchTests(unittest.TestCase):
             fleet.record("send", str(self.repo), by=False, pane="w2:p1", text=text)
         fleet.record("send", str(self.repo), by=False, pane="w1:p1", text="the orch's own")
 
+    def stop_clock(self, board, seconds):
+        """Stop the helper's wall clock `seconds` after the board was made: its age is then always the same."""
+        self.clock.stopped = fleet.event_time({"ts": board["made"]}) + seconds
+
     def test_rebrief_on_every_source(self):
         self.orch_setup()
+        self.stop_clock(fleet.read_json(self.project / "board.json"), 5)
         for source in ("startup", "resume", "clear", "compact"):
             text = fleet.session_start_context({"source": source, "cwd": str(self.repo)},
                                                env={"HERDR_PANE_ID": "w1:p1"})
@@ -3540,7 +3584,7 @@ class OrchTests(unittest.TestCase):
             self.assertIn("Never push to main.", text)
             self.assertIn("Add a CHANGELOG entry.", text)
             self.assertNotIn("Use sqlite", text)  # decisions stay in the file
-            self.assertRegex(text, r"Board from \d+s ago")
+            self.assertIn("\nBoard from 5s ago (cached; `board` refreshes it):\n", text)
             self.assertRegex(text, r"lane-a\s+review 1")
             self.assertIn("2 events since the last digest.", text)
             self.assertIn("digest` first, then load the fleet:fleet skill.", text)
@@ -3596,20 +3640,47 @@ class OrchTests(unittest.TestCase):
         self.assertIn("you orchestrate project app", text)
 
     def test_rebrief_hook_is_fast_and_offline(self):
+        """The hook's work is bounded: four quick git calls and files, never herdr, gh or a scan of the lanes. The
+        test counts that work instead of timing it, so a loaded machine cannot fail it."""
         self.orch_setup()
         bin_dir = self.root / "bin"
         bin_dir.mkdir()
-        os.symlink(shutil.which("git"), bin_dir / "git")  # git only: herdr and gh cannot run
+        calls = self.root / "git-calls"
+        # git only, through a wrapper that notes each call: herdr and gh cannot run.
+        (bin_dir / "git").write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{calls}"\nexec "{shutil.which("git")}" "$@"\n')
+        (bin_dir / "git").chmod(0o755)
         env = {"PATH": str(bin_dir), "FLEET_HOME": str(self.home), "HERDR_PANE_ID": "w1:p1", "HOME": str(self.root)}
         payload = json.dumps({"source": "startup", "cwd": str(self.repo), "session_id": "s-9"})
-        start = time.monotonic()
-        cp = subprocess.run([sys.executable, str(SCRIPT), "hook", "session-start"], input=payload, cwd=self.repo,
-                            capture_output=True, text=True, timeout=20, env=env)
-        elapsed = time.monotonic() - start
+        cp = subprocess.run([*HELPER, "hook", "session-start"], input=payload, cwd=self.repo,
+                            capture_output=True, text=True, timeout=CHILD_LIMIT, env=env)
         self.assertEqual((cp.returncode, cp.stderr), (0, ""))
-        self.assertLess(elapsed, 1.0)
         context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
         self.assertIn("you orchestrate project app (pane w1:p1)", context)
+        # The re-brief finds the project (two calls), then the session record finds it again and stops: no .fleet/.
+        identity = [f"-C {self.repo} rev-parse --git-common-dir --show-toplevel",
+                    f"-C {self.repo} config --get-regexp ^remote\\..*\\.url$"]
+        self.assertEqual(calls.read_text().splitlines(), identity * 2)
+
+    def test_hooks_pass_their_git_limit(self):
+        """The tests give each git call a long limit (patient_fleet.py), so that a slow git cannot change a result;
+        the hooks still ask for their own limit, HOOK_GIT_TIMEOUT (1 s), on each git call."""
+        self.assertIsInstance(fleet.subprocess, patient_fleet.PatientSubprocess)
+        self.assertEqual(fleet.HOOK_GIT_TIMEOUT, 1)
+        self.orch_setup()
+        (self.repo / ".fleet").mkdir()
+        limits = []
+        real = fleet.run
+
+        def run(cmd, *args, **kwargs):
+            if cmd[0] == "git":
+                limits.append(kwargs.get("timeout"))
+            return real(cmd, *args, **kwargs)
+        data, env = {"source": "startup", "cwd": str(self.repo)}, {"HERDR_PANE_ID": "w1:p1"}
+        with mock.patch.object(fleet, "run", run):
+            self.assertEqual(fleet.orch_match(data, env), (self.project, "w1:p1"))
+            self.assertEqual(limits, [1, 1])
+            self.assertIsNotNone(fleet.hook_session_event("session_start", data, env))
+        self.assertEqual(limits, [1] * 5)  # and the session record: the project twice more, then the branch
 
 
 class FollowUpTests(unittest.TestCase):
@@ -3632,6 +3703,7 @@ class FollowUpTests(unittest.TestCase):
         git("-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init",
             cwd=self.repo)
         self.project = fleet.project_for(str(self.repo))
+        self.clock = use_clock(self)
         self.md = self.project / "PROJECT.md"
 
     def tearDown(self):
