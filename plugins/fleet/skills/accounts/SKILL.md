@@ -24,4 +24,4 @@ allowed-tools:
 - A lane: `/fleet:handoff <pane> <account>`.
 - New lanes: pass `--account <account>` to `spawn` (see `/fleet:lane`).
 
-Account names are `provider:name` (for example `claude:team`), or a bare name when only one account of that agent has it.
+Account names are `provider:name` (for example `claude:work`), or a bare name when only one account of that agent has it.

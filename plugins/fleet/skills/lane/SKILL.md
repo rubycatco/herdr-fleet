@@ -68,7 +68,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --pane <pane_id> --role impl
   --prompt "Read .fleet/BRIEF.md and execute it."
 ```
 
-`ok: true` with status `working` means it started. Otherwise read the pane (`herdr pane read <pane_id> --source recent-unwrapped --lines 300`) and fix what blocks it.
+`ok: true` means it started: status `working`, or a note that the prompt shows as sent. Otherwise read the pane (`herdr pane read <pane_id> --source recent-unwrapped --lines 300`) and fix what blocks it.
 
 ## 4b. Plan first (instead of step 4)
 

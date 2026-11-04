@@ -44,7 +44,7 @@ Find a session id with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" status --j
    ```
    To resume instead: `spawn --split auto --name <label> --account <account> --accept-trust --resume <your session id> --prompt "You now run on <account> in a new pane. Continue where this conversation stopped."`
    If you orchestrate, pass `--role orchestrator`, and end the prompt with "Then run `fleet orch show` and `fleet digest`, and load the fleet:fleet skill.": the successor starts before step 6 moves the registration, so its first session start gets no project re-brief. Folder trust is kept per account, so another account can stop at the trust dialog; `--accept-trust` answers it, which is right here because this session already works in that folder.
-5. Check the result: `ok: true` and status `working`. Read the new pane once to see that it reads the handoff or continues the work.
+5. Check the result: `ok: true`, with status `working` or a note that the prompt shows as sent. Read the new pane once to see that it reads the handoff or continues the work.
 6. If you orchestrate, move the registration to the successor: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" orch claim --pane <new pane_id> --replace`. From then on, the SessionStart hook re-briefs the successor from the project home at each session start, not this pane, and the successor's first `digest` shows what happened since your last one. With an old FLEET.md, set its `Orchestrator:` line to the new `pane_id` instead.
 7. Tell the user: the new pane, account, model and handoff file. Then stop. Do no more work here: two sessions in one checkout conflict. Do not close this pane; the user closes it (`/exit`).
 

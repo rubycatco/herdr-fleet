@@ -46,7 +46,7 @@ Call 2, review:
 Call 3, verification, context, planning and accounts:
 1. Verification: "The project's documented checks, real results in STATUS.md (Recommended)", "Tests for the changed files only", "The full suite before each review".
 2. Lane context: "Reset at a commit once context passes about 60 % (Recommended)", "Only near auto-compaction (about 80 %)", "Never; I decide".
-3. Remuda mode, accounts. Build the options from `remuda.accounts`, for example "Lanes use my current account", "Spread lanes across accounts by remaining usage", "Ask me each time". Invite the user to pick Other and write rules in their own words, such as "team account for work repositories, max for personal projects, codex v0 when codex default passes 80 %".
+3. Remuda mode, accounts. Build the options from `remuda.accounts`, for example "Lanes use my current account", "Spread lanes across accounts by remaining usage", "Ask me each time". Invite the user to pick Other and write rules in their own words, such as "the work account for work repositories, the personal account for personal projects, the second Codex account when the first passes 80 %".
    Plain mode, placement instead: "A new worktree workspace per lane (Recommended)", "A split beside the orchestrator", "A new tab".
 4. Plan first, and the planner: "By the triage rules; planner on the strongest model available, high effort (Recommended)", "Always plan first, same planner", "Never; the implementer plans in STATUS.md". Invite the user to pick Other to name the planner's agent and model, for example "by the triage rules, planner Claude Code <model>, max effort".
 
