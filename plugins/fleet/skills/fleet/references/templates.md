@@ -149,7 +149,7 @@ Write findings to .fleet/REVIEW-<n>.md, most severe first, each with file:line, 
 
 ## RISK.md (only `fleet approve-risk` writes it)
 
-The record of the user's yes for a risky diff. `fleet risk` matches the lane's real changes (the paths of its own commits and of `git status`, outside `.fleet/`) against the project's high-risk patterns. A match is covered by the newest plan round when the user approved it and the plan shows that category, or by a line in this file for the same category and path. Everything else needs the user before merge. After the user's yes, `fleet approve-risk --by user` appends one line per path that needs the user, and records `risk_approved` with the HEAD commit:
+The record of the user's yes for a risky diff. `fleet risk` matches the lane's real changes (the paths of its own commits and of `git status`, outside `.fleet/`, whatever the file system monitor or the untracked cache say) against the project's high-risk patterns. A match is covered by the newest plan round when the user approved it and the plan shows that category, or by a line in this file for the same category and path. Everything else needs the user before merge. After the user's yes, `fleet approve-risk --by user` appends one line per path that needs the user, and records `risk_approved` with the HEAD commit:
 
 ```markdown
 # Risk approvals: <branch>
