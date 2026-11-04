@@ -33,7 +33,7 @@ Find a session id with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" status --j
 
 ## Self
 
-1. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" prep --handoff`. It returns `handoff_path`, `lane`, `fleet_md` and `pane_role`. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" orch show` too: `self` is true when you are the project's registered orchestrator.
+1. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" prep --handoff`. It returns `handoff_path`, `lane`, `fleet_md` and `pane_role`. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" orch show --json` too: `self` is true when you are the project's registered orchestrator.
 2. If you orchestrate, bring PROJECT.md up to date: decisions, follow-ups, the user's rules. Add follow-ups with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" follow-up add "<text>"`, and close finished ones with `follow-up done <ID>`, not by hand. The handoff file then needs only what is in flight. If `fleet_md` is set and you orchestrate that fleet the old way, bring FLEET.md up to date instead: lane table, decisions, next actions.
 3. Unless you resume: write the handoff file at `handoff_path` from the HANDOFF template in `${CLAUDE_PLUGIN_ROOT}/skills/fleet/references/templates.md`. A stranger must be able to continue from it: goal, state, exact next steps, decisions with reasons, the user's rules from this conversation, commands, what not to redo, open questions. Never copy a secret; name where it lives.
 4. Start the successor beside this pane:

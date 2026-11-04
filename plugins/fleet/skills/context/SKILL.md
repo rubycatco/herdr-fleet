@@ -31,7 +31,13 @@ Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" conventions` first. Its "Cont
 | Auto-compaction already ran, or the agent repeats itself or forgets rules | Treat it as above the threshold: `/clear` and re-brief at the next boundary. |
 | The account or model must change, or you are the orchestrator and your context is high | Hand off: `/fleet:handoff`. |
 
+For a Codex lane, every `/clear` or `/compact` in this table means a handoff: `fleet reset` supports Claude only (see the next section).
+
 ## Reset a lane
+
+First check the lane's agent: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" status --json`, field `agent` of the lane's pane. `reset` supports Claude only, and refuses a Codex pane. For a Codex lane, skip the steps below and hand it off with `/fleet:handoff <pane>` (its Lane steps): the lane writes HANDOFF.md, `retire` exits it, and a fresh agent starts in the same pane, re-briefed from HANDOFF.md, BRIEF.md and STATUS.md.
+
+For a Claude lane:
 
 1. Make sure STATUS.md is current. Ask the lane first:
    ```bash
@@ -50,6 +56,7 @@ A planner is short-lived: it ends at `PLAN READY`. Reset it only as you would an
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" reset <pane> --message "Re-read .fleet/BRIEF.md and .fleet/PLAN.md, change no file except PLAN.md, and continue the plan."
 ```
+A Codex planner cannot be reset: retire it (`retire <pane>`) and start a new planner in the same pane with the spawn command of `/fleet:lane` step 4b, with a prompt to continue the plan in .fleet/PLAN.md.
 A researcher is shorter still. When its context fills, ask it to write what it found into its research file, retire it with `--close`, and start a new researcher on the same file (`/fleet:research`, step 3).
 
 ## Yourself

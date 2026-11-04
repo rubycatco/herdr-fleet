@@ -88,7 +88,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --pane <pane_id> --role impl
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" approve-plan <cwd> --by orch
    ```
-   Any other risk: first ask the user, with the plan's approach and risks in a few lines. Pass `--by user` only after the user's yes. `approve-plan` refuses, and changes nothing, when the round is not ready or already approved, the worktree has changes outside `.fleet/` or a path outside it marked assume-unchanged or skip-worktree (`flagged`: git status cannot see a change there), or the lane has commits of its own (a planner changes and commits nothing but PLAN.md, which git does not track), or the risk needs the user. A path under `## Files` that matches a high-risk pattern makes the plan high risk whatever its `Risk:` line says: `--by orch` then refuses and names the matches (`high_risk`), so ask the user. `--by orch` also refuses a plan whose `## Files` lists no path: send it back to the planner, or ask the user. `--by user` is the only override, and it overrides only the risk and the missing files. When the project's patterns in PROJECT.md cannot be read, both refuse: fix the line that the reason names. Read its `reason` (with `paths`, `flagged` or `commits`), fix the cause, and run it again. When no branch, remote or tag holds the lane's base, or the lane had commits before the plan, pass `--base <ref>`.
+   Any other risk: first ask the user, with the plan's approach and risks in a few lines. Pass `--by user` only after the user's yes. `approve-plan` refuses, and changes nothing, when the round is not ready or already approved, the worktree has changes outside `.fleet/` or an existing path outside it marked assume-unchanged or skip-worktree (`flagged`: git status cannot see a change there; an absent skip-worktree path of a sparse checkout does not count), or the lane has commits of its own (a planner changes and commits nothing but PLAN.md, which git does not track), or the risk needs the user. A path under `## Files` that matches a high-risk pattern makes the plan high risk whatever its `Risk:` line says: `--by orch` then refuses and names the matches (`high_risk`), so ask the user. `--by orch` also refuses a plan whose `## Files` lists no path: send it back to the planner, or ask the user. `--by user` is the only override, and it overrides only the risk and the missing files. When the project's patterns in PROJECT.md cannot be read, both refuse: fix the line that the reason names. Read its `reason` (with `paths`, `flagged` or `commits`), fix the cause, and run it again. When no branch, remote or tag holds the lane's base, or the lane had commits before the plan, pass `--base <ref>`.
 6. Exit the planner, keep the pane, and start the implementer in it:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" retire <pane_id>
@@ -113,4 +113,12 @@ When the watcher ends:
 - 0: run `/fleet:review` for this lane.
 - 4 (blocked): read the pane. Cancel an unsafe prompt with `herdr pane send-keys <pane_id> Escape` and re-instruct with `send`. Then watch again.
 - 6 (stopped): read STATUS.md (`Blocked`) and the pane. Answer with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" send <pane_id> --text "..."`. Then watch again.
-- 5 (exited): read the pane. Start the agent again with `spawn --pane <pane_id> --role impl ...` and a prompt that points at BRIEF.md and STATUS.md.
+- 5: read the `event` field of the watch result.
+  - `agent-exited`: the shell pane stays. Read the pane. Start the agent again in it with `spawn --pane <pane_id> --role impl ...` and a prompt that points at BRIEF.md and STATUS.md.
+  - `pane-gone`: the pane is closed, but the worktree stays. Open a new pane in it and start the agent there, with the settings of step 4:
+    ```bash
+    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --new-workspace --cwd <cwd> --role impl --name <label> \
+      --agent <agent> [--model <model>] [--effort <effort>] [--permission-mode <mode>] [--account <account>] --accept-trust \
+      --prompt "Read .fleet/BRIEF.md and .fleet/STATUS.md and continue this lane."
+    ```
+    Its `pane_id` is the lane's new pane: watch that one.

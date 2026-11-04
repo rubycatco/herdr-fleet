@@ -4963,7 +4963,8 @@ def build_parser() -> argparse.ArgumentParser:
                         description="Appends 'PLAN APPROVED: <n> by <who> <date>' and records plan_approved. It "
                                     "refuses, changing nothing, when PLAN.md is missing, has no 'PLAN READY: <n>' "
                                     "line (for --round N), already approves round n, the worktree has changes "
-                                    "outside .fleet/ or paths outside it marked assume-unchanged or skip-worktree, "
+                                    "outside .fleet/ or existing paths outside it marked assume-unchanged or "
+                                    "skip-worktree (an absent skip-worktree path does not count), "
                                     "the lane has commits of its own (or a detached HEAD without "
                                     "--base), or the project's high-risk paths in PROJECT.md cannot be read. With "
                                     "--by orch it also refuses when the Risk: line is not 'none', when ## Files "
@@ -4976,8 +4977,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="who approves: user only after the user said yes; a high-risk plan needs it")
     ap.add_argument("--round", type=int, metavar="N", help="the round to approve (default: the newest)")
     ap.add_argument("--base", metavar="REF",
-                    help="the lane's base: its own commits are REF..HEAD (default: the commits of HEAD that no other "
-                         "branch, remote branch or tag holds); also allows a detached HEAD")
+                    help="the lane's base: its own commits are REF..HEAD (default: the commits of HEAD that no tag "
+                         "and no branch holds, leaving out the current branch and <remote>/<current branch> on "
+                         "each remote); also allows a detached HEAD")
     ap.set_defaults(func=cmd_approve_plan)
 
     rk = sub.add_parser("risk", help="the lane's changed paths that match a high-risk pattern, and who approved "

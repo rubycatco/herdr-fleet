@@ -33,9 +33,9 @@ Lessons from fleet runs that each cost hours. `fleet spawn`, `fleet send` and `f
 
 ## Context and handoff
 
-- **Reset long lanes at a commit boundary.** A lane past about 60 % context, or one that has compacted, gets slower and loses detail. At its next commit, make sure STATUS.md is current, then `fleet reset <pane>` (`/clear` plus a resume prompt). The SessionStart hook points the fresh session at `.fleet/`.
+- **Reset long lanes at a commit boundary.** A lane past about 60 % context, or one that has compacted, gets slower and loses detail. At its next commit, make sure STATUS.md is current, then `fleet reset <pane>` (`/clear` plus a resume prompt). The SessionStart hook points the fresh session at `.fleet/`. `fleet reset` works for Claude lanes only. Hand a Codex lane off instead (`/fleet:handoff <pane>`): a fresh agent in the same pane, re-briefed from the lane's files.
 - **Keep the orchestrator's state outside its context.** An orchestrator that compacts loses pane ids and decisions unless a file has them. The lanes are derived (`fleet board`, the event log); decisions, follow-ups and the user's rules go to the project's PROJECT.md, which the SessionStart hook shows to the orchestrator pane. Older fleets kept all of it in a hand-written FLEET.md, which drifted from the truth.
-- **Switching accounts means a new pane.** An agent's account is fixed at launch. To move a lane or yourself to another account, hand off (`/fleet:handoff`): write HANDOFF.md and start a successor, or, for a Claude agent with healthy context, resume the same session on the new account (`fleet spawn --resume`).
+- **Switching accounts means a new agent process.** An agent's account is fixed at launch. To move a lane or yourself to another account, hand off (`/fleet:handoff`): write HANDOFF.md and start a successor, or, for a Claude agent with healthy context, resume the same session on the new account (`fleet spawn --resume`). A lane's successor starts in the lane's own pane after `fleet retire`; you, the caller, move to a new pane, because the helper never drives its own pane.
 
 ## Cleanup
 

@@ -21,7 +21,7 @@ You stay small: a researcher pane digs, and you read only its answer. The questi
 ## 1. Look for an earlier answer
 
 1. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" conventions`. Its `## Planning and research` section names the researcher's agent and model; by default, the implementer settings.
-2. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" orch show --json`. `home` is the project home.
+2. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" orch show --json`. `home` is the project home. When it exits 1 with "this directory is in no fleet project", the repository has no project home yet (or the directory is not in a git repository: then change to a checkout of the project first). Create the home with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" orch claim`, as in `/fleet:fleet` ("Start here", step 3): it creates the project home and its PROJECT.md, and registers your pane as the project's one orchestrator. A new project has no orchestrator yet, so the claim does not refuse. Then run `orch show --json` again.
 3. Read the files in `<home>/research/`. When one already answers the question, use it and stop. `fleet board` lists the ones that are still open.
 
 ## 2. Write the research file

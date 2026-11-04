@@ -43,23 +43,26 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --from <impl pane> --role cr
   --prompt "Read .fleet/REVIEW-REQUEST-<n>.md and follow it."
 ```
 
-The split starts in the lane's worktree. `--accept-trust` answers the folder trust dialog there, because the critic's account has not seen this new worktree. Then, for each critic, start a background watcher (Bash with `run_in_background: true`):
+The split starts in the lane's worktree. `--accept-trust` answers the folder trust dialog there, because the critic's account has not seen this new worktree. Then, for each critic, start a background watcher (Bash with `run_in_background: true`) on that critic's own output file, the one that the request names for it:
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" watch <critic pane> --marker "VERDICT:" --file .fleet/REVIEW-<n>.md
 ```
 
+With two critics, the Codex critic's watcher reads `.fleet/REVIEW-<n>-codex.md` and the Claude critic's reads `.fleet/REVIEW-<n>-claude.md`. A watcher reads only the file that `--file` names, so a watcher on `REVIEW-<n>.md` never sees their verdicts.
+
 A critic from an earlier round can take the re-check instead of a new one: it remembers its findings. Send it the new request with `send <critic pane> --file <worktree>/.fleet/REVIEW-REQUEST-<n>.md`.
 
 ## 4. Rule on the findings
 
-Read each review file yourself. For each finding, decide: fix, decline with a reason, or ask the user (product and design decisions belong to the user). Where two critics disagree, the disagreement is usually a design decision: decide it, or ask. Add your rulings to the review file under `## Orchestrator rulings`.
+Read each review file yourself. For each finding, decide: fix, decline with a reason, or ask the user (product and design decisions belong to the user). Where two critics disagree, the disagreement is usually a design decision: decide it, or ask. Add your rulings to each review file under `## Orchestrator rulings`.
 
 - `VERDICT: APPROVE` and nothing left to fix: the lane is done. Retire the critics and continue with the finish steps in `/fleet:fleet`.
 - Otherwise, send the implementer one pointer:
   ```bash
   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" send <impl pane> --text "Read .fleet/REVIEW-<n>.md and its Orchestrator rulings. Fix or decline each finding, record each disposition in .fleet/STATUS.md, commit, then add the line READY FOR REVIEW: round <n+1> to STATUS.md and stop."
   ```
+  With two critics, name each review file in the pointer: "Read .fleet/REVIEW-<n>-codex.md and .fleet/REVIEW-<n>-claude.md and their Orchestrator rulings. ..." and the rest as above.
   Watch for `READY FOR REVIEW: round <n+1>` and repeat from step 1.
 
 ## 5. Stop
