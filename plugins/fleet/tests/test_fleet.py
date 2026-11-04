@@ -2556,6 +2556,13 @@ class DocsTests(unittest.TestCase):
         self.assertNotIn("second lane", lane)
         self.assertIn("open the lane without `--from`", lane)
         self.assertIn("Go on only when it prints `ok: true`", lane)
+        # The close rule as it is: a merged pull request, or a merged lane whose branch moved; reflog expiry releases.
+        for doc in (templates, readme, lane, (skills / "cleanup" / "SKILL.md").read_text(),
+                    (skills / "fleet" / "SKILL.md").read_text()):
+            self.assertNotIn("since the take", doc)
+            self.assertNotIn("since it took", doc)
+            self.assertIn("reflog expiry", doc)
+            self.assertIn("rebase", doc)
         for doc in (templates, readme):  # uniqueness from the counter; the history is best effort
             self.assertIn("follow-ups.json", doc)
             self.assertIn("best effort", doc)
@@ -3715,13 +3722,34 @@ class FollowUpTests(unittest.TestCase):
         counter.write_text('{"next": 5}')
         self.assertEqual(self.fu("add", "f")["id"], "F22")
         self.assertEqual(json.loads(counter.read_text()), {"next": 23})
-        # A broken counter refuses and changes nothing.
+        # A broken counter refuses every write and changes nothing; a no-op does not read it.
+        self.fu("take", "F21", "--lane", "feat/x")
         for broken in ('{"next": "x"}', "not json", '{"next": 0}', "[]"):
             counter.write_text(broken)
-            before = self.text()
-            res = self.fu("add", "g", code=2)
-            self.assertIn("follow-ups.json", res["refused"])
-            self.assertEqual((self.text(), counter.read_text()), (before, broken))
+            before, n = self.text(), len(self.events())
+            for argv in (("add", "g"), ("done", "F22"), ("release", "F21"), ("take", "F22", "--lane", "feat/y")):
+                res = self.fu(*argv, code=2)
+                self.assertIn("follow-ups.json", res["refused"], argv)
+            self.assertEqual((self.text(), counter.read_text(), len(self.events())), (before, broken, n))
+            self.assertEqual(self.fu("take", "F21", "--lane", "feat/x")["changed"], "nothing")
+
+    def test_done_moves_the_counter_past_the_ids_it_removes(self):
+        self.write(fleet.PROJECT_TEMPLATE.format(name="app"))
+        counter = self.project / "follow-ups.json"
+        self.assertEqual(self.fu("add", "a")["id"], "F1")
+        self.assertEqual(json.loads(counter.read_text()), {"next": 2})
+        # A hand-numbered higher line, removed by done before any add: its ID stays used.
+        self.write(self.text().replace("- [F1] a\n", "- [F1] a\n- [F2] Hand-written numbered work\n"))
+        self.fu("done", "F2")
+        self.assertEqual(json.loads(counter.read_text()), {"next": 3})
+        self.assertEqual(self.fu("add", "b")["id"], "F3")
+        # A migrated file without a counter, whose done event does not land: the counter still holds the ID.
+        counter.unlink()
+        self.write(self.text().replace("- [F3] b\n", "- [F3] b\n- [F9] migrated\n"))
+        with mock.patch.object(fleet, "record", return_value=None):
+            self.fu("done", "F9")
+        self.assertEqual(json.loads(counter.read_text()), {"next": 10})
+        self.assertEqual(self.fu("add", "c")["id"], "F10")
 
     def test_the_last_id(self):
         self.write("## Follow-ups\n- [F999999998] near the end\n")
@@ -3820,75 +3848,97 @@ class FollowUpTests(unittest.TestCase):
         return fleet.finish_lane(fleet.lane_facts(stub, None, str(self.root), lambda p, b: (pr, None),
                                                   lambda p, pr: None))
 
+    def head(self, path):
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=path, capture_output=True, text=True).stdout.strip()
+
     def held(self, extra=""):
         self.write("# Project: app\n\n## Follow-ups\n- [F3] Do a (lane: lane-a)\n  if ready:\n      run_task()\n"
                    "- [F4] Do b (lane: lane-b)\n- hand-written (lane: lane-a)\n" + extra + "\n## Notes\n- none\n")
 
     def merged_lane(self, name="lane-a"):
-        """A lane that took F3, then committed, and that main merged."""
+        """A lane with a commit of its own, merged into main."""
         path = self.make_lane(name)
-        self.fu("take", "F3", "--lane", name)  # already held by this lane: no change, so release and take
-        self.fu("release", "F3")
-        self.fu("take", "F3", "--lane", name)
         self.commit(path)
         git("merge", "-q", "--no-ff", "-m", "merge", name, cwd=self.repo)
         return path
 
-    def test_cleanup_closes_what_a_merged_lane_worked_on(self):
-        self.held()
-        path = self.merged_lane()
-        taken = self.events("follow_up_taken")[-1]
-        self.assertEqual(taken["head"], subprocess.run(["git", "rev-parse", "lane-a~1"], cwd=self.repo,
-                                                       capture_output=True, text=True).stdout.strip())
-        f = self.facts(path)
-        self.assertEqual((f["verdict"], f["merged_into"]), ("ready", "main"))
-        # F3 was taken before the lane's commit: done. The hand-written mark (F5 since the take) has no take event:
-        # released.
-        self.assertEqual(fleet.cleanup_plan(f)["follow_ups"],
-                         {"close": [{"id": "F3", "text": "Do a"}], "release": [{"id": "F5", "text": "hand-written"}]})
+    def clean(self, f):
+        """The dry run's plan and the cleanup's result for lane `f`; they must agree."""
+        plan = fleet.cleanup_plan(f)["follow_ups"]
         out = fleet.clean_lane(f, 5)
+        done = "close" if out["follow_ups_closed"] else "release" if out["follow_ups_released"] else None
+        self.assertEqual(list(plan), [done] if done else [])
+        return out
+
+    def test_cleanup_closes_the_follow_ups_of_a_merged_lane_that_moved(self):
+        self.held()
+        f = self.facts(self.merged_lane())
+        self.assertEqual((f["verdict"], f["merged_into"], f["branch_moved"]), ("ready", "main", True))
+        self.assertEqual(fleet.cleanup_plan(f)["follow_ups"],
+                         {"close": [{"id": "F3", "text": "Do a"}, {"id": None, "text": "hand-written"}]})
+        out = self.clean(f)
         self.assertEqual((out["ok"], out["removed"], out["branch"]), (True, True, "deleted lane-a"))
         self.assertEqual((out["follow_ups_closed"], out["follow_ups_released"], out["follow_up_error"]),
-                         (["F3"], ["F5"], None))
-        self.assertEqual(self.text(), "# Project: app\n\n## Follow-ups\n- [F4] Do b (lane: lane-b)\n- [F5] hand-written\n"
-                                      "\n## Notes\n- none\n")
+                         (["F3", "F5"], [], None))
+        self.assertEqual(self.text(), "# Project: app\n\n## Follow-ups\n- [F4] Do b (lane: lane-b)\n\n## Notes\n- none\n")
         event = self.events("cleanup")[-1]
-        self.assertEqual((event["follow_ups_closed"], event["follow_ups_released"]), (["F3"], ["F5"]))
-        self.assertIn("follow-ups closed F3; follow-ups released F5", fleet.describe_event(event))
-        done = self.events("follow_up_done")[-1]
-        self.assertEqual((done["id"], done["branch"], done["detail"]), ("F3", "lane-a", "  if ready:\n      run_task()"))
-        self.assertIn("lane lane-a merged and removed", done["reason"])
+        self.assertEqual(event["follow_ups_closed"], ["F3", "F5"])
+        self.assertIn("follow-ups closed F3, F5", fleet.describe_event(event))
+        done = self.events("follow_up_done")
+        self.assertEqual([(e["id"], e["branch"]) for e in done], [("F3", "lane-a"), ("F5", "lane-a")])
+        self.assertEqual(done[0]["detail"], "  if ready:\n      run_task()")
+        self.assertIn("lane lane-a merged and removed", done[0]["reason"])
 
-    def test_cleanup_releases_what_a_lane_without_commits_took(self):
+    def test_cleanup_releases_the_follow_ups_of_a_lane_without_commits(self):
         self.held()
-        path = self.make_lane()
-        self.fu("release", "F3")
-        self.fu("take", "F3", "--lane", "lane-a")
-        f = self.facts(path)
-        self.assertEqual((f["verdict"], f["reasons"]), ("ready", ["in main"]))
-        self.assertEqual(list(fleet.cleanup_plan(f)["follow_ups"]), ["release"])
-        out = fleet.clean_lane(f, 5)
+        f = self.facts(self.make_lane())
+        self.assertEqual((f["verdict"], f["reasons"], f["branch_moved"]), ("ready", ["in main"], False))
+        out = self.clean(f)
         self.assertEqual((out["ok"], out["follow_ups_closed"], out["follow_ups_released"]), (True, [], ["F3", "F5"]))
         self.assertIn("- [F3] Do a\n  if ready:", self.text())
 
-    def test_cleanup_closes_everything_of_a_merged_pull_request(self):
+    def test_cleanup_closes_the_follow_ups_of_a_merged_pull_request(self):
         self.held()
         path = self.make_lane()
         self.commit(path)
-        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=path, capture_output=True, text=True).stdout.strip()
-        f = self.facts(path, pr={"number": 5, "state": "MERGED", "headRefOid": head})
+        f = self.facts(path, pr={"number": 5, "state": "MERGED", "headRefOid": self.head(path)})
         self.assertEqual(f["verdict"], "ready")
-        out = fleet.clean_lane(f, 5)
-        self.assertEqual((out["follow_ups_closed"], out["follow_ups_released"]), (["F3", "F5"], []))
+        self.assertEqual((self.clean(f)["follow_ups_closed"]), ["F3", "F5"])
+
+    def test_cleanup_releases_when_the_reflog_cannot_tell(self):
+        logs = self.repo / ".git" / "logs" / "refs" / "heads"
+        # No reflog at all.
+        self.held()
+        path = self.merged_lane()
+        (logs / "lane-a").unlink()
+        f = self.facts(path)
+        self.assertEqual((f["verdict"], f["branch_moved"]), ("ready", None))
+        self.assertEqual(self.clean(f)["follow_ups_released"], ["F3", "F5"])
+        # The creation entry expired: the oldest entry is a commit.
+        self.held()
+        path = self.merged_lane("lane-b")
+        log = logs / "lane-b"
+        log.write_text("".join(log.read_text().splitlines(keepends=True)[1:]))
+        f = self.facts(path)
+        self.assertEqual((f["verdict"], f["branch_moved"]), ("ready", None))
+        self.assertEqual(self.clean(f)["follow_ups_released"], ["F4"])
+
+    def test_cleanup_closes_for_a_lane_that_was_only_rebased(self):
+        self.held()
+        path = self.make_lane()
+        self.commit(self.repo, "main moves on")
+        git("rebase", "-q", "main", cwd=path)  # no commit of its own, but its branch moved: the accepted edge
+        f = self.facts(path)
+        self.assertEqual((f["verdict"], f["branch_moved"]), ("ready", True))
+        self.assertEqual(self.clean(f)["follow_ups_closed"], ["F3", "F5"])
 
     def test_cleanup_unmerged_releases(self):
         self.held()
         path = self.make_lane()
         self.commit(path)
         f = self.facts(path)
-        self.assertEqual((f["verdict"], f["blockers"]), ("keep", []))
-        self.assertEqual(list(fleet.cleanup_plan(f)["follow_ups"]), ["release"])
-        out = fleet.clean_lane(f, 5)
+        self.assertEqual((f["verdict"], f["blockers"], f["branch_moved"]), ("keep", [], True))
+        out = self.clean(f)
         self.assertEqual((out["ok"], out["follow_ups_released"], out["follow_ups_closed"]), (True, ["F3", "F5"], []))
         self.assertIn("- [F3] Do a\n  if ready:\n      run_task()\n- [F4] Do b (lane: lane-b)\n- [F5] hand-written\n",
                       self.text())
@@ -3901,10 +3951,7 @@ class FollowUpTests(unittest.TestCase):
             path = self.root / f"lane-{events}"
             git("worktree", "add", "-q", "-B", "lane-a", str(path), "main", cwd=self.repo)
             self.commit(path)
-            f = self.facts(path, pr={"number": 5, "state": "MERGED",
-                                     "headRefOid": subprocess.run(["git", "rev-parse", "HEAD"], cwd=path,
-                                                                  capture_output=True, text=True).stdout.strip()})
-            out = fleet.clean_lane(f, 5)
+            out = fleet.clean_lane(self.facts(path, pr={"number": 5, "state": "MERGED", "headRefOid": self.head(path)}), 5)
             self.assertEqual((out["ok"], out["removed"]), (True, True), copy)
             self.assertIn("F3 is on more than one line", out["follow_up_error"])
             self.assertEqual((out["follow_ups_closed"], out["follow_ups_released"]), ([], []))
@@ -3926,6 +3973,14 @@ class FollowUpTests(unittest.TestCase):
         self.assertEqual((out["ok"], out["removed"]), (True, True))
         self.assertIn("is busy", out["follow_up_error"])
         self.assertIn("(lane: lane-b)", self.text())
+        # A broken counter: reported, nothing changed.
+        self.held(extra="- [F6] Do d (lane: lane-d)\n")
+        before = self.text()
+        (self.project / "follow-ups.json").write_text("broken json")
+        out = fleet.clean_lane(self.facts(self.merged_lane("lane-d")), 5)
+        self.assertEqual((out["ok"], out["removed"], out["follow_ups_closed"]), (True, True, []))
+        self.assertIn("follow-ups.json", out["follow_up_error"])
+        self.assertEqual(((self.project / "follow-ups.json").read_text(), self.text()), ("broken json", before))
         # No PROJECT.md is no failure.
         self.md.unlink()
         f = self.facts(self.make_lane("lane-c"))
@@ -3942,7 +3997,7 @@ class FollowUpTests(unittest.TestCase):
                 mock.patch.object(fleet, "collect_lanes", return_value=([f], [], [])):
             code, out = self.main("cleanup", f["target"], "--dry-run")
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(out)["plan"][0]["follow_ups"]["close"], [{"id": "F3", "text": "Do a"}])
+        self.assertEqual(json.loads(out)["plan"][0]["follow_ups"]["close"][0], {"id": "F3", "text": "Do a"})
         self.assertEqual((self.text(), len(self.events())), (before, events))
         self.assertTrue(Path(f["path"]).is_dir())
 

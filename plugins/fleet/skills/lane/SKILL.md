@@ -41,7 +41,7 @@ With `--from <ID>`, link the follow-up to the lane right away:
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" follow-up take <ID> --lane <branch>
 ```
 
-Go on only when it prints `ok: true`. Any refusal (exit code 2, for example `held_by` when another lane took it since step 1): stop and ask the user. After the take, the board shows the ID on the lane, and `fleet cleanup` closes the follow-up when it removes the lane after its work merged (it records the branch's commit now, so a lane that merges no commit of its own releases the follow-up instead).
+Go on only when it prints `ok: true`. Any refusal (exit code 2, for example `held_by` when another lane took it since step 1): stop and ask the user. After the take, the board shows the ID on the lane. When `fleet cleanup` removes the lane, it closes the follow-up as done if the lane's pull request merged, or if the lane is merged and its branch moved since `fleet worktree` created it (a rebase counts as a move); otherwise, or when reflog expiry hides the branch's creation, it releases it.
 
 ## 3. Write the brief
 

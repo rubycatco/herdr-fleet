@@ -1498,8 +1498,7 @@ def describe_event(e: dict) -> str:
         text = (f'{e.get("id") or "?"} "{e.get("text") or ""}"'
                 + (" (ID given to a hand-written line)" if e.get("assigned") else ""))
     elif kind == "follow_up_taken":
-        text = (f'{e.get("id") or "?"} taken by {e.get("branch") or "?"}'
-                + (f" at {e['head'][:8]}" if e.get("head") else "") + f': "{e.get("text") or ""}"')
+        text = f'{e.get("id") or "?"} taken by {e.get("branch") or "?"}: "{e.get("text") or ""}"'
     elif kind == "follow_up_released":
         text = f'{e.get("id") or "?"} released from {e.get("branch") or "?"}: "{e.get("text") or ""}"'
     elif kind == "follow_up_done":
@@ -1963,7 +1962,21 @@ def lane_facts(stub: dict, caller_pane: str | None, caller_cwd: str, pr_lookup=N
     f["merged_into"] = next((b for b in bases if git_ok(path, "merge-base", "--is-ancestor", "HEAD", b)), None)
     f["pr"], f["pr_error"] = (pr_lookup or pr_for_branch)(path, f["branch"]) if f["branch"] else (None, None)
     f["ahead"], f["ahead_of"] = commits_ahead(path, f["head"], f["pr"], f["merged_into"], commits_lookup)
+    f["branch_moved"] = branch_moved(path, f["branch"], f["head"])
     return f
+
+
+def branch_moved(path: str, branch: str, head: str | None) -> bool | None:
+    """Whether the branch moved since it was created: the oldest entry of its reflog, `branch: Created from ...`,
+    is not HEAD. None when that cannot be told: no reflog, no entry, or the creation entry expired."""
+    out = git_out(path, "reflog", "show", "--format=%H %gs", f"refs/heads/{branch}", "--")
+    oldest = (out or "").splitlines()[-1:]
+    if not oldest or not head:
+        return None
+    oid, _, subject = oldest[0].partition(" ")
+    if not subject.startswith("branch: Created from"):
+        return None
+    return oid != head
 
 
 def lane_blockers(f: dict) -> list[str]:
@@ -2216,7 +2229,7 @@ def cleanup_plan(f: dict) -> dict:
 
 def planned_follow_ups(f: dict) -> dict:
     """What cleanup would do with the follow-ups that the lane's branch holds: {close: [{id, text}], release: [...]},
-    or {error}, by the same rule. Reads only (no lock): a line without an ID shows with id None and gets one at the
+    or {error}, by the same rule as the cleanup (lane_work_merged). Reads only (no lock): a line without an ID shows with id None and gets one at the
     cleanup."""
     branch = f.get("branch")
     if not branch:
@@ -2226,13 +2239,7 @@ def planned_follow_ups(f: dict) -> dict:
     if error:
         return {"error": error}
     items = held.get(branch) or []
-    if not items:
-        return {}
-    decide = lane_close_rule(f, home)
-    out: dict = {}
-    for it in items:
-        out.setdefault("close" if decide(it) else "release", []).append(it)
-    return out
+    return {("close" if lane_work_merged(f) else "release"): items} if items else {}
 
 
 def finish_branch(f: dict) -> str:
@@ -2683,24 +2690,24 @@ def with_lane_mark(content: str, m: re.Match, branch: str | None) -> str:
 
 def follow_up_apply(home: Path, action: str, number: int | None = None, body: str | None = None,
                     branch: str | None = None, reason: str | None = None, source: str | None = None,
-                    head: str | None = None, decide=None, wait: float | None = None) -> dict:
+                    close: bool = False, wait: float | None = None) -> dict:
     """Run one follow-up action on PROJECT.md under the project lock.
 
     `action`: list (only give IDs), add, take, release, done, or lane (cleanup: every item whose lane mark is
-    `branch`; `decide(item)` says whether it is closed as done, else it is released). Every refusal and every
-    action that needs no change come first and write nothing. Then the items without an ID get theirs, the counter
-    moves, PROJECT.md is written once, and the events are recorded. Returns the result: `ok` False with `refused`
+    `branch`: closed as done with `close`, else released). Every refusal and every
+    action that needs no change come first and write nothing. Then the counter moves (every write), the items
+    without an ID get theirs, PROJECT.md is written once, and the events are recorded. Returns the result: `ok` False with `refused`
     for a refusal (`missing` when there is no PROJECT.md). Raises FleetError when the lock or PROJECT.md cannot be
     had, and OSError when a write fails.
     """
     with project_lock(home, wait):
         try:
-            return follow_up_locked(home, action, number, body, branch, reason, source, head, decide)
+            return follow_up_locked(home, action, number, body, branch, reason, source, close)
         except FollowUpRefused as e:
             return {"ok": False, "refused": str(e), **e.fields}
 
 
-def follow_up_locked(home: Path, action: str, number, body, branch, reason, source, head, decide) -> dict:
+def follow_up_locked(home: Path, action: str, number, body, branch, reason, source, close) -> dict:
     text = read_project_md(home)
     if text is None:
         raise FollowUpRefused(NO_PROJECT_MD, missing=True)
@@ -2742,15 +2749,18 @@ def follow_up_locked(home: Path, action: str, number, body, branch, reason, sour
     unnumbered = [it for it in doc["items"] if it["number"] is None]
     if action == "list" and not unnumbered:
         return {**result, **nothing}
-    # 2. The IDs: every item without one, then the new item.
+    # 2. The counter, for every write: at least 1 + the highest ID in PROJECT.md before this change, then past the
+    # IDs that this write gives (every item without one, then the new item). It is written before PROJECT.md, so
+    # that an ID that this write removes or gives stays used, whatever happens to its event.
     lines = doc["lines"]
     need = len(unnumbered) + (action == "add")
     events: list[tuple[str, dict]] = []
     assigned = []
+    first = next_follow_up_number(home, doc)
+    if need and first + need - 1 > FOLLOW_UP_MAX:
+        raise FollowUpRefused(f"the next follow-up ID would be past F{FOLLOW_UP_MAX}")
+    write_json(home / FOLLOW_UPS_FILE, {"next": first + need})
     if need:
-        first = next_follow_up_number(home, doc)
-        if first + need - 1 > FOLLOW_UP_MAX:
-            raise FollowUpRefused(f"the next follow-up ID would be past F{FOLLOW_UP_MAX}")
         n = first
         for it in unnumbered:
             content, m = lines[it["line"]][0], it["match"]
@@ -2759,7 +2769,6 @@ def follow_up_locked(home: Path, action: str, number, body, branch, reason, sour
             events.append(("follow_up_added", {"id": f"F{n}", "text": it["text"], "assigned": "list"}))
             n += 1
         new_number = n
-        write_json(home / FOLLOW_UPS_FILE, {"next": first + need})  # before PROJECT.md uses the IDs
         # Line indices stay the same: only the content of the numbered lines changed.
         doc = parse_follow_ups(join_lines([list(l) for l in lines], doc["final_newline"], doc["eol"]))
         lines = doc["lines"]
@@ -2794,8 +2803,7 @@ def follow_up_locked(home: Path, action: str, number, body, branch, reason, sour
         lines[item["line"]][0] = with_lane_mark(lines[item["line"]][0], item["match"], mark)
         result.update(lane=mark, changed="taken" if action == "take" else "released")
         events.append((f"follow_up_{'taken' if action == 'take' else 'released'}",
-                       {"id": item["id"], "text": item["text"], "branch": branch if mark else item["lane"],
-                        "head": head if mark else None}))
+                       {"id": item["id"], "text": item["text"], "branch": branch if mark else item["lane"]}))
     elif action == "done":
         item = by_line[target["line"]]
         removed.update(item["lines"])
@@ -2806,7 +2814,7 @@ def follow_up_locked(home: Path, action: str, number, body, branch, reason, sour
     elif action == "lane":
         for old in selected:
             item = by_line[old["line"]]
-            if decide(item):
+            if close:
                 removed.update(item["lines"])
                 result["closed"].append(item["id"])
                 events.append(("follow_up_done", {"id": item["id"], "text": item["text"], "branch": branch,
@@ -2862,44 +2870,19 @@ def lane_follow_ups(home: Path | None) -> tuple[dict[str, list[dict]], str | Non
     return out, None
 
 
-def taken_heads(home: Path, branch: str) -> dict[str, str] | None:
-    """{follow-up ID: the commit of `branch` when it took it}, from the newest follow_up_taken event of each ID
-    with that branch; None when a log file cannot be read."""
-    d = home / EVENTS_DIR
-    try:
-        names = sorted(n for n in os.listdir(d) if n.endswith(".jsonl"))
-        events = [e for n in names for e in jsonl_events((d / n).read_bytes())]
-    except FileNotFoundError:
-        return {}
-    except OSError:
-        return None
-    events.sort(key=event_time)
-    heads: dict[str, str] = {}
-    for e in events:
-        if e.get("event") == "follow_up_taken" and e.get("branch") == branch and e.get("id"):
-            if e.get("head"):
-                heads[e["id"]] = e["head"]
-            else:
-                heads.pop(e["id"], None)
-    return heads
-
-
-def lane_close_rule(f: dict, home: Path):
-    """decide(item) for the cleanup of lane `f`: True closes the follow-up as done, False releases it. Done only
-    when the lane's pull request merged, or when the lane is merged and its HEAD moved since it took the
-    follow-up (a lane without commits of its own did no work for it). When that cannot be told, it is released."""
+def lane_work_merged(f: dict) -> bool:
+    """Whether cleanup closes the follow-ups of lane `f` as done (else it releases them): its pull request merged,
+    or it is merged and its branch moved since the lane was created (`branch_moved` in the facts). An error, or a
+    reflog that lost the branch's creation, turns a close into a release, never the reverse."""
     if f.get("verdict") != "ready":
-        return lambda item: False
-    if ((f.get("pr") or {}).get("state")) == "MERGED":
-        return lambda item: True
-    if not f.get("merged_into") or not f.get("head"):
-        return lambda item: False
-    heads = taken_heads(home, f["branch"]) or {}
-    return lambda item: bool(heads.get(item.get("id") or "")) and heads[item["id"]] != f["head"]
+        return False
+    if (f.get("pr") or {}).get("state") == "MERGED":
+        return True
+    return bool(f.get("merged_into")) and f.get("branch_moved") is True
 
 
 def close_lane_follow_ups(f: dict) -> dict:
-    """After cleanup removed a lane: close or release the follow-ups that its branch holds (see lane_close_rule).
+    """After cleanup removed a lane: close or release the follow-ups that its branch holds (see lane_work_merged).
     Never raises: a failure is reported in `follow_up_error`. No project and no PROJECT.md are no failure."""
     out: dict = {"follow_ups_closed": [], "follow_ups_released": [], "follow_up_error": None}
     branch = f.get("branch")
@@ -2909,7 +2892,7 @@ def close_lane_follow_ups(f: dict) -> dict:
         home = project_for(f.get("main_root"), create=False)
         if home is None:
             return out
-        res = follow_up_apply(home, "lane", branch=branch, decide=lane_close_rule(f, home),
+        res = follow_up_apply(home, "lane", branch=branch, close=lane_work_merged(f),
                               reason=f"closed by fleet cleanup: lane {branch} merged and removed")
         if res["ok"]:
             out.update(follow_ups_closed=res["closed"], follow_ups_released=res["released"])
@@ -2922,17 +2905,6 @@ def close_lane_follow_ups(f: dict) -> dict:
 
 def follow_up_text(value: str | None) -> str:
     return " ".join((value or "").split())
-
-
-def branch_head(home: Path, branch: str, from_cwd: bool) -> str | None:
-    """The commit of the local branch, from the current checkout when it is in the project; None when git cannot
-    tell."""
-    cwd = os.getcwd()
-    if not from_cwd:
-        found = project_for(cwd, create=False)
-        if found is None or os.path.realpath(found) != os.path.realpath(home):
-            return None
-    return git_out(cwd, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}")
 
 
 def cmd_follow_up(args: argparse.Namespace) -> int:
@@ -2995,7 +2967,6 @@ def cmd_follow_up(args: argparse.Namespace) -> int:
             if not BRANCH_MARK.fullmatch(args.lane or ""):
                 return refuse(**base, refused=f"not a branch for a lane mark: {args.lane!r}")
             fields["branch"] = args.lane
-            fields["head"] = branch_head(home, args.lane, from_cwd=not getattr(args, "project", None))
         elif action == "done":
             fields["reason"] = follow_up_text(args.reason) or None
     res = follow_up_apply(home, action, **fields)
@@ -4942,8 +4913,9 @@ def build_parser() -> argparse.ArgumentParser:
                                     "records an event (follow_up_added, _taken, _released, _done; best effort, as "
                                     "every event, so the history of a removed follow-up can miss a step). A refusal "
                                     "exits 2 and changes nothing. After it removes a lane, `fleet cleanup` closes "
-                                    "its follow-ups when its pull request merged or it is merged with commits since "
-                                    "the take, and releases them otherwise.")
+                                    "its follow-ups when its pull request merged, or it is merged and its branch "
+                                    "moved since the lane was created (a rebase counts); otherwise, or when git "
+                                    "cannot tell (reflog expiry), it releases them.")
     fus = fu.add_subparsers(dest="action", required=True)
     fu_project = argparse.ArgumentParser(add_help=False)
     fu_project.add_argument("--project", help="a project name (default: the project of this directory)")
