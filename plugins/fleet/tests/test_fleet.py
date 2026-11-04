@@ -3079,6 +3079,46 @@ class DocsTests(FleetTestCase):
         self.assertEqual([(i["id"], i["lane"]) for i in items], [("F1", None), ("F2", "fix/upload-retry")])
 
 
+    def test_docs_name_several_orchs(self):
+        skills = self.PLUGIN / "skills"
+        skill = (skills / "fleet" / "SKILL.md").read_text()
+        for text in ("`orch list`", "`orch rename OLD NEW`", "`orch claim --name <theme>`", "`adopt TARGET...",
+                     "`board --all`", "--orch N", "--other-orch", "ORCH.md", "lane.json", "format 2"):
+            self.assertIn(text, skill)
+        self.assertIn("lane.json", (skills / "lane" / "SKILL.md").read_text())
+        cleanup = (skills / "cleanup" / "SKILL.md").read_text()
+        self.assertIn("--other-orch", cleanup)
+        self.assertIn("pass --other-orch to remove it", cleanup)  # the refusal text, as the helper prints it
+        self.assertIn('f"lane {f[\'path\']} belongs to orch {owner}; pass --other-orch to {verb} it"',
+                      SCRIPT.read_text())  # the helper's text, which the skills quote with placeholders
+        self.assertIn('"remove")', SCRIPT.read_text().split("def cmd_cleanup", 1)[1].split("\ndef ", 1)[0])
+        self.assertIn("ORCH.md", (skills / "context" / "SKILL.md").read_text())
+        self.assertIn("--replace", (skills / "handoff" / "SKILL.md").read_text())
+        self.assertIn("digest --orch <name>", (skills / "handoff" / "SKILL.md").read_text())
+        self.assertIn("board --all", (skills / "review" / "SKILL.md").read_text())
+        self.assertIn("orch claim --name <theme>", (skills / "onboard" / "SKILL.md").read_text())
+        # The ORCH.md template is the helper's, with placeholders, and its sections read as empty.
+        orch = self.template("ORCH.md")
+        self.assertEqual(orch + "\n", fleet.ORCH_TEMPLATE.format(name="<name>", project="<project>"))
+        for title in ("Decisions", "Notes"):
+            self.assertEqual(fleet.section_text(orch, title), [], title)
+        templates = (skills / "fleet" / "references" / "templates.md").read_text()
+        self.assertIn("lane.json", templates)
+        self.assertIn("shared", self.template("PROJECT.md") + templates.split("## PROJECT.md", 1)[1].split("```", 1)[0])
+        readme = (self.PLUGIN.parent.parent / "README.md").read_text()
+        for text in ("## Orchestrators", "`orchs/<name>/`", "`lane.json`", "format 2", '"format": 2',
+                     "`--other-orch`", "### Several clones of one repository", "orch rename default <theme-a>",
+                     "/reload-plugins", "`orch_rename`", "`adopt`", "field `orch`", "board --all"):
+            self.assertIn(text, readme)
+        self.assertNotIn("## One orchestrator per project", readme)
+        # The rule for a checkout that several orchestrators share, in the README and the fleet skill's rules.
+        rules = skill.split("## Rules", 1)[1]
+        for doc in (readme, rules):
+            for text in ("default branch", "git fetch", "fast-forward", "git merge --ff-only", "in lanes",
+                         "each worktree has its own", "its own clone"):
+                self.assertIn(text, doc)
+        self.assertEqual(fleet.VERSION, "0.9.0")
+
 class OrchTests(FleetTestCase):
     """orch, board, digest and the orch re-brief, in a temporary FLEET_HOME. herdr and gh never run."""
 

@@ -71,3 +71,4 @@ Give one line each:
 - `/fleet:context` keeps context small.
 - `/fleet:accounts` shows accounts and usage (remuda mode only).
 - `/fleet:cleanup` removes finished lanes, after you pick them.
+- Several themes in one project: one orchestrator pane per theme, each opened with `fleet orch claim --name <theme>`; `fleet orch list` shows them.
