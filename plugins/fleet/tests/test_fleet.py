@@ -3327,6 +3327,7 @@ class FollowUpTests(unittest.TestCase):
         # A file that is not UTF-8 is never written.
         self.md.write_bytes(b"## Follow-ups\n- caf\xe9\n")
         self.assertEqual(self.main("follow-up", "add", "x")[0], 1)
+        self.assertEqual(self.main("follow-up", "list")[0], 1)
         self.assertEqual(self.md.read_bytes(), b"## Follow-ups\n- caf\xe9\n")
 
     def test_events_in_the_log(self):
@@ -3445,6 +3446,21 @@ class FollowUpTests(unittest.TestCase):
         self.assertLessEqual(max(len(l) for l in text.splitlines()), 160)
         self.assertEqual(fleet.removed_records([{"event": "cleanup", "removed": True, "lane": "/tmp/gone",
                                                  "ts": fleet.now_iso()}], 0, set(), {})[0]["follow_ups"], [])
+
+    def test_digest_shows_the_follow_up_events_of_other_panes(self):
+        fleet.write_json(self.project / "orch.json", {"pane": "w1:p1"})
+        fleet.record("follow_up_taken", None, home=self.project, by=False, pane="w2:p1", id="F3", text="Do a",
+                     branch="lane-a")
+        fleet.record("follow_up_added", None, home=self.project, by=False, pane="w1:p1", id="F4", text="own")
+        with mock.patch.object(fleet, "collect_lanes", return_value=([], [], [])), \
+                mock.patch.object(fleet.shutil, "which", return_value="/usr/bin/herdr"), \
+                mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1"}):
+            buf = io.StringIO()
+            with chdir(self.repo), redirect_stdout(buf):
+                self.assertEqual(fleet.main(["digest", "--peek"]), 0)
+        out = buf.getvalue()
+        self.assertIn('F3 taken by lane-a: "Do a"', out)
+        self.assertNotIn('"own"', out)  # the orchestrator's own events are filtered, as for every kind
 
     def test_rebrief_shows_the_ids(self):
         self.held()

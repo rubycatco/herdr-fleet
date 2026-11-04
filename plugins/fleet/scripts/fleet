@@ -2737,10 +2737,7 @@ def cmd_follow_up(args: argparse.Namespace) -> int:
     base = {"project": home.name, "project_md": str(home / PROJECT_MD)}
     action = args.action
     if action == "list":
-        try:
-            text = read_project_md(home)
-        except FleetError as e:
-            return refuse(**base, refused=str(e))
+        text = read_project_md(home)  # a file that cannot be read is an error (exit 1), as for every action
         if text is None:
             res = {"ok": True, "changed": "nothing", "follow_ups": [], "sections": 0, "other_lines": 0,
                    "note": NO_PROJECT_MD}
