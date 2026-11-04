@@ -1827,6 +1827,79 @@ class ApprovePlanTests(unittest.TestCase):
         self.assertEqual(plain.stdout, "")  # what the gate read before
         self.assertEqual(self.refused("--by", "user", reason="outside .fleet/")["paths"], ["new.py"])
 
+    def note(self, lane=None):
+        """The board's note for the lane at plan ready, which says what approve-plan says."""
+        record = fleet.board_record({"path": str(lane or self.lane), "panes": [], "pr": None, "branch": None}, [])
+        self.assertEqual(record["phase"], "plan ready 1")
+        return record.get("warning")
+
+    def gate_reads(self):
+        """What the gate read before 0.8.1: git status as `status_paths` ran it, without the scan options."""
+        return subprocess.run(["git", "status", "--porcelain", "-z", "--untracked-files=all",
+                               "--ignore-submodules=none"], cwd=self.lane, capture_output=True, text=True).stdout
+
+    def test_a_stale_monitor_cannot_hide_a_change(self):
+        self.plan.write_text(self.PLAN)
+        install_stale_monitor(self.root, self.repo, self.lane, lambda path, *args: git(*args, cwd=path))
+        self.assertIsNone(self.note())  # without a change the gate passes
+        (self.lane / "app.py").write_text("x = 2\n")
+        self.assertEqual(self.gate_reads(), "")  # the monitor missed it
+        out = self.refused("--by", "user", reason="1 changed path outside .fleet/")
+        self.assertEqual((out["changes"], out["paths"]), (1, ["app.py"]))
+        self.assertEqual(self.note(), "1 changed path outside .fleet/: approve-plan refuses")
+        (self.lane / "app.py").write_text("x = 1\n")
+        self.assertIsNone(self.note())
+        self.assertEqual(self.approve("--by", "orch")[0], 0)
+
+    def test_a_stale_untracked_cache_cannot_hide_a_new_file(self):
+        # The untracked cache serves `--untracked-files=all` only when the config's mode is all too, and it goes
+        # stale only when a monitor says that no directory changed.
+        self.plan.write_text(self.PLAN)
+        git("config", "status.showUntrackedFiles", "all", cwd=self.lane)
+        install_stale_monitor(self.root, self.repo, self.lane, lambda path, *args: git(*args, cwd=path))
+        for _ in range(3):
+            self.gate_reads()
+        self.assertIsNone(self.note())
+        (self.lane / "new.py").write_text("")
+        self.assertEqual(self.gate_reads(), "")  # neither the monitor nor the cache shows it
+        self.assertEqual(self.refused("--by", "user", reason="1 changed path outside .fleet/")["paths"], ["new.py"])
+        self.assertEqual(self.note(), "1 changed path outside .fleet/: approve-plan refuses")
+
+    def test_refuses_flagged_paths(self):
+        self.plan.write_text(self.PLAN)
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            with self.subTest(flag):
+                git("update-index", flag, "app.py", cwd=self.lane)
+                (self.lane / "app.py").write_text("x = 2\n")
+                self.assertEqual(fleet.status_paths(str(self.lane)), [])  # git status does not look at it
+                for by in ("orch", "user"):
+                    out = self.refused("--by", by, reason="1 path marked assume-unchanged or skip-worktree")
+                    self.assertEqual(out["flagged"], 1)
+                self.assertEqual(self.note(), "1 path marked assume-unchanged or skip-worktree: approve-plan refuses")
+                git("update-index", flag.replace("--", "--no-", 1), "app.py", cwd=self.lane)
+                git("checkout", "app.py", cwd=self.lane)
+        # A skip-worktree path that is absent (a sparse checkout) holds no work.
+        git("update-index", "--skip-worktree", "app.py", cwd=self.lane)
+        (self.lane / "app.py").unlink()
+        self.assertIsNone(self.note())
+        self.assertEqual(self.approve("--by", "orch")[0], 0)
+
+    def test_a_failing_ls_files_refuses(self):
+        self.plan.write_text(self.PLAN)
+        with mock.patch.object(fleet, "flagged_count", return_value=None):
+            self.refused("--by", "user", reason="git ls-files failed")
+            self.assertEqual(self.note(), "git ls-files failed: approve-plan refuses")
+        # Both say every reason, in the same order: changes, flags, commits.
+        self.commit(self.lane, "lib.py", "", "planner wrote code")
+        (self.lane / "app.py").write_text("x = 2\n")
+        git("update-index", "--assume-unchanged", "lib.py", cwd=self.lane)
+        (self.lane / "lib.py").write_text("y = 1\n")
+        self.assertEqual(self.note(), "1 changed path outside .fleet/, 1 path marked assume-unchanged or "
+                                      "skip-worktree, 1 lane commit: approve-plan refuses")
+        self.refused("--by", "user", reason="1 changed path outside .fleet/")
+        git("checkout", "app.py", cwd=self.lane)
+        self.refused("--by", "user", reason="1 path marked assume-unchanged or skip-worktree")
+
     def test_a_rename_out_of_fleet_is_a_change(self):
         # A base that tracks a file in .fleet/; the lane moves it to a code path, staged, without a commit.
         (self.repo / ".fleet").mkdir(exist_ok=True)
@@ -2242,6 +2315,26 @@ class RiskDiffTests(RiskLaneCase):
         git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "bump", cwd=self.lane)
         git("config", "diff.ignoreSubmodules", "all", cwd=self.lane)
         self.assertIn("db/migrate", self.changed()[0])
+
+    def test_a_stale_monitor_cannot_hide_an_uncommitted_change(self):
+        # migrations/001.sql is on main before the lane's branch: only git status can show the lane's change.
+        self.commit(self.repo, "migrations/001.sql", "create\n", "a migration on main")
+        git("merge", "-q", "--ff-only", "main", cwd=self.lane)
+        self.assertEqual(fleet.lane_commits(str(self.lane)), ([], None))
+        install_stale_monitor(self.root, self.repo, self.lane, lambda path, *args: git(*args, cwd=path))
+        self.assertEqual(self.changed(), ([], None))
+        (self.lane / "migrations" / "001.sql").write_text("drop\n")
+        plain = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=self.lane,
+                               capture_output=True, text=True)
+        self.assertEqual(plain.stdout, "")  # the monitor missed it
+        self.assertEqual(self.changed(), (["migrations/001.sql"], None))
+        state = self.state()
+        self.assertEqual([(m["category"], m["path"], m["covered_by"]) for m in state["needs_user"]],
+                         [("migration", "migrations/001.sql", None)])
+        buf = io.StringIO()
+        with chdir(self.lane), redirect_stdout(buf):
+            fleet.main(["risk", "--json"])
+        self.assertEqual([m["path"] for m in json.loads(buf.getvalue())["needs_user"]], ["migrations/001.sql"])
 
     def test_a_root_commit_counts_whatever_log_showroot_says(self):
         solo = self.root / "solo"

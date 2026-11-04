@@ -56,7 +56,7 @@ from contextlib import ExitStack, contextmanager
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 FLEET_DIR = ".fleet"
 LANE_FILES = ("BRIEF.md", "STATUS.md", "HANDOFF.md", "PLAN.md")
@@ -1783,8 +1783,8 @@ def repo_paths(path: str) -> dict:
             "main_root": main_root, "repo": os.path.basename(main_root)}
 
 
-# Global git options for the checks that decide whether a worktree can go: no file system monitor and no untracked
-# cache may let git skip its scan of the worktree, and the check never writes the index.
+# Global git options for the checks that gate a lane (sweep, cleanup, approve-plan, risk): no file system monitor
+# and no untracked cache may let git skip its scan of the worktree, and the check never writes the index.
 SCAN_OPTIONS = ("--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false")
 
 
@@ -1814,7 +1814,7 @@ def flagged_count(path: str) -> int | None:
     skip-worktree (`S`) and that exist in the worktree. git status does not look at them, so nobody can tell
     whether they hold work. A skip-worktree path that is absent (a sparse checkout) holds none. Reads only; None
     when git fails."""
-    out = git_text(path, *SCAN_OPTIONS, "ls-files", "-v", "-z", errors="surrogateescape")
+    out = git_text(path, "ls-files", "-v", "-z", errors="surrogateescape", options=SCAN_OPTIONS)
     if out is None:
         return None
     count = 0
@@ -3156,14 +3156,20 @@ def board_record(f: dict, events: list[dict], home: Path | None = None,
 
 
 def plan_gate_note(path: str) -> str | None:
-    """What makes `approve-plan` refuse in this lane, from the same checks, or None. Only for `plan ready`."""
+    """What makes `approve-plan` refuse in this lane, from the same checks in the same order, or None. Only for
+    `plan ready`."""
     paths = status_paths(path)
+    flagged = flagged_count(path)
     commits, why = lane_commits(path)
     parts = []
     if paths is None:
         parts.append("git status failed")
     elif outside_fleet(paths):
         parts.append(f"{plural(len(outside_fleet(paths)), 'changed path')} outside {FLEET_DIR}/")
+    if flagged is None:
+        parts.append("git ls-files failed")
+    elif flagged:
+        parts.append(flagged_reason(flagged))
     if commits is None:
         parts.append("the lane's own commits cannot be counted" + (" (HEAD is detached)" if "detached" in why else ""))
     elif commits:
@@ -4193,11 +4199,13 @@ def match_risk(paths: list[str], patterns: list[dict]) -> list[dict]:
 # approve-plan: the gate between a planner and the implementer
 
 
-def git_text(path: str, *args: str, timeout: float = 15, errors: str = "replace") -> str | None:
+def git_text(path: str, *args: str, timeout: float = 15, errors: str = "replace",
+             options: tuple[str, ...] = ()) -> str | None:
     """stdout of a git command run in `path`, decoded with replacement (a path need not be UTF-8); None when git
-    fails or cannot run. errors="surrogateescape" keeps a name that goes back to git as an argument exact."""
+    fails or cannot run. errors="surrogateescape" keeps a name that goes back to git as an argument exact.
+    `options`: global options that go before the command (SCAN_OPTIONS), so `args` always starts with it."""
     try:
-        cp = subprocess.run(["git", "-C", path, *args], capture_output=True, timeout=timeout)
+        cp = subprocess.run(["git", "-C", path, *options, *args], capture_output=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         return None
     return cp.stdout.decode("utf-8", errors=errors) if cp.returncode == 0 else None
@@ -4209,8 +4217,8 @@ def status_entries(path: str, untracked: str, scan: bool = False) -> list[list[s
     untracked directory as one entry), and each submodule change shows, whatever the user's git settings say.
     -z never quotes a path. With `scan`, git also scans the worktree whatever the file system monitor and the
     untracked cache say (SCAN_OPTIONS). None when git fails."""
-    out = git_text(path, *(SCAN_OPTIONS if scan else ()), "status", "--porcelain", "-z",
-                   f"--untracked-files={untracked}", "--ignore-submodules=none")
+    out = git_text(path, "status", "--porcelain", "-z", f"--untracked-files={untracked}", "--ignore-submodules=none",
+                   options=SCAN_OPTIONS if scan else ())
     if out is None:
         return None
     fields = out.split("\0")
@@ -4232,8 +4240,10 @@ def status_entries(path: str, untracked: str, scan: bool = False) -> list[list[s
 
 def status_paths(path: str) -> list[str] | None:
     """Every path that `git status` reports in the checkout at `path`, both sides of a rename or copy, with each
-    untracked file listed (`status_entries` at `all`, flattened). None when git fails."""
-    entries = status_entries(path, "all")
+    untracked file listed, whatever the file system monitor and the untracked cache say (`status_entries` at
+    `all` with `scan`, flattened). Paths that the index marks assume-unchanged or skip-worktree are not among
+    them: git status does not look at those (`flagged_count`). None when git fails."""
+    entries = status_entries(path, "all", scan=True)
     return None if entries is None else [p for paths in entries for p in paths]
 
 
@@ -4285,7 +4295,11 @@ def lane_commits(path: str, base: str | None = None) -> tuple[list[str] | None, 
 
 def lane_changed_paths(path: str, base: str | None = None) -> tuple[list[str] | None, str | None]:
     """(every path that the lane changed, sorted; why that cannot be told): the paths that the lane's own commits
-    touched (the commits of `lane_revs`, both sides of a rename) and the paths of `git status`, outside .fleet/.
+    touched (the commits of `lane_revs`, both sides of a rename) and the paths of `git status` (`status_paths`,
+    which scans whatever the file system monitor and the untracked cache say), outside .fleet/.
+
+    No check of the paths that the index marks assume-unchanged or skip-worktree, unlike approve-plan: the risk
+    gate gates what the lane commits, and `git log` reads commits without the index.
 
     A merge commit lists nothing, so a merge from the default branch brings none of its files. Known gaps: an
     edit made while resolving a conflict inside a merge commit is not listed; with `base`, a lane that merged
@@ -4378,8 +4392,10 @@ def high_risk_text(matches: list[dict], limit: int = 5) -> str:
 
 def cmd_approve_plan(args: argparse.Namespace) -> int:
     """Append `PLAN APPROVED: <n> by <who> <date>` to the lane's PLAN.md. It refuses, and writes nothing, unless
-    round n is ready and not yet approved, the worktree has no change outside .fleet/, the lane has no commit
-    of its own, the project's high-risk patterns can be read, and either the user approves or the plan is low
+    round n is ready and not yet approved, the worktree has no change outside .fleet/ (`status_paths`, which
+    scans whatever the file system monitor and the untracked cache say) and no path outside it that the index
+    marks assume-unchanged or skip-worktree (`flagged_count`: git status does not look at those), the lane has
+    no commit of its own, the project's high-risk patterns can be read, and either the user approves or the plan is low
     risk: `Risk: none`, at least one path under `## Files`, and no such path that a high-risk pattern matches.
     `--by user` overrides only the risk and the missing files."""
     start = os.path.abspath(os.path.expanduser(args.dir or os.getcwd()))
@@ -4411,6 +4427,14 @@ def cmd_approve_plan(args: argparse.Namespace) -> int:
         return refuse(**out, reason=f"the worktree has {plural(len(changed), 'changed path')} outside {FLEET_DIR}/: "
                                     f"a planner changes no file except {PLAN_FILE}",
                       changes=len(changed), paths=changed[:5])
+    flagged = flagged_count(top)
+    if flagged is None:
+        return refuse(**out, reason="git ls-files failed, so the worktree cannot be checked")
+    if flagged:
+        return refuse(**out, reason=f"the worktree has {flagged_reason(flagged)} outside {FLEET_DIR}/: git status "
+                                    "does not look at them, so a change there cannot be seen. Clear the flags "
+                                    "(git update-index --no-assume-unchanged / --no-skip-worktree)",
+                      flagged=flagged)
     if args.base is not None:
         out["base"] = args.base
     commits, why = lane_commits(top, args.base)
