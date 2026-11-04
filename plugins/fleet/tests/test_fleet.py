@@ -1876,7 +1876,10 @@ class ApprovePlanTests(unittest.TestCase):
         self.plan.write_text(self.PLAN)
         install_stale_monitor(self.root, self.repo, self.lane, lambda path, *args: git(*args, cwd=path))
         self.assertIsNone(self.note())  # without a change the gate passes
-        (self.lane / "app.py").write_text("x = 2\n")
+        # Another size: a git without nanosecond times (Apple's) compares mtimes in whole seconds, so a change of
+        # the same size in the second of the checkout looks clean to git itself once the plain status below has
+        # written the index in a later second; the gate would miss it whatever its scan options.
+        (self.lane / "app.py").write_text("x = 20\n")
         self.assertEqual(self.gate_reads(), "")  # the monitor missed it
         out = self.refused("--by", "user", reason="1 changed path outside .fleet/")
         self.assertEqual((out["changes"], out["paths"]), (1, ["app.py"]))
