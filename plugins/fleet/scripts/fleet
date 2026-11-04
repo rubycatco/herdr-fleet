@@ -1765,18 +1765,52 @@ def repo_paths(path: str) -> dict:
             "main_root": main_root, "repo": os.path.basename(main_root)}
 
 
+# Global git options for the checks that decide whether a worktree can go: no file system monitor and no untracked
+# cache may let git skip its scan of the worktree, and the check never writes the index.
+SCAN_OPTIONS = ("--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false")
+
+
+def in_fleet_dir(path: str) -> bool:
+    """A path under the lane's .fleet/ directory. A file or symlink named .fleet is not: only the directory holds
+    the lane's records, and only the directory is archived."""
+    return path.startswith(FLEET_DIR + "/")
+
+
 def count_dirty(entries: list[list[str]] | None) -> int | None:
-    """The changes in `status_entries`, not counting the lane's .fleet/: one for each entry with a path outside
-    it. A rename stays one change, and a rename out of .fleet/ counts."""
+    """The changes in `status_entries`, not counting the lane's .fleet/ directory: one for each entry with a path
+    outside it. A rename stays one change, and a rename out of .fleet/ counts."""
     if entries is None:
         return None
-    return sum(1 for paths in entries if outside_fleet(paths))
+    return sum(1 for paths in entries if not all(in_fleet_dir(p) for p in paths))
 
 
 def dirty_count(path: str) -> int | None:
     """The uncommitted changes of the lane at `path`, for sweep and cleanup: each untracked directory counts as one,
-    whatever the user's git settings say. None when git status fails."""
-    return count_dirty(status_entries(path, "normal"))
+    whatever the user's settings for untracked files, the file system monitor or the untracked cache say. None
+    when git status fails."""
+    return count_dirty(status_entries(path, "normal", scan=True))
+
+
+def flagged_count(path: str) -> int | None:
+    """Paths outside .fleet/ that the index marks assume-unchanged (a lowercase tag in `git ls-files -v`) or
+    skip-worktree (`S`) and that exist in the worktree. git status does not look at them, so nobody can tell
+    whether they hold work. A skip-worktree path that is absent (a sparse checkout) holds none. Reads only; None
+    when git fails."""
+    out = git_text(path, *SCAN_OPTIONS, "ls-files", "-v", "-z", errors="surrogateescape")
+    if out is None:
+        return None
+    count = 0
+    for entry in out.split("\0"):
+        if len(entry) < 3:
+            continue
+        tag, name = entry[0], entry[2:]
+        if (tag.islower() or tag == "S") and not in_fleet_dir(name) and os.path.lexists(os.path.join(path, name)):
+            count += 1
+    return count
+
+
+def flagged_reason(n: int) -> str:
+    return f"{plural(n, 'path')} marked assume-unchanged or skip-worktree"
 
 
 def base_refs(path: str) -> list[str]:
@@ -1898,6 +1932,7 @@ def lane_facts(stub: dict, caller_pane: str | None, caller_cwd: str, pr_lookup=N
     f["branch"] = git_out(path, "symbolic-ref", "--quiet", "--short", "HEAD") or None
     f["head"] = git_out(path, "rev-parse", "HEAD")
     f["dirty"] = dirty_count(path)
+    f["flagged"] = flagged_count(path)
     if f["branch"] is None:
         # A detached checkout (a review at one commit, say) loses nothing when a branch, remote or tag holds HEAD.
         f["unreachable"] = count_out(git_out(path, "rev-list", "--count", "HEAD", "--not", "--branches",
@@ -1947,6 +1982,11 @@ def lane_blockers(f: dict) -> list[str]:
         out.append("git status failed")
     elif dirty:
         out.append(plural(dirty, "uncommitted change"))
+    flagged = f.get("flagged", 0)  # lane_facts sets it for every linked worktree
+    if flagged is None:
+        out.append("git ls-files failed")
+    elif flagged:
+        out.append(flagged_reason(flagged))
     return out
 
 
@@ -2194,8 +2234,15 @@ def clean_lane(f: dict, timeout: float) -> dict:
         except OSError as e:
             out["error"] = f"could not archive .fleet/ ({e}); the worktree stays"
             return out
-        # Count again, right before the removal: an agent can write a file while it exits, and neither removal
-        # command sees an untracked file that the user's git settings hide. Never --force.
+        # Check again, right before the removal: an agent can write a file or flag a path while it exits, and
+        # neither removal command sees an untracked file that the user's git settings hide. Never --force.
+        flagged = flagged_count(f["path"])
+        if flagged is None:
+            out["error"] = "git ls-files failed; the worktree stays"
+            return out
+        if flagged:
+            out["error"] = f"{flagged_reason(flagged)}; the worktree stays"
+            return out
         dirty = dirty_count(f["path"])
         if dirty is None:
             out["error"] = "git status failed; the worktree stays"
@@ -3579,12 +3626,14 @@ def git_text(path: str, *args: str, timeout: float = 15, errors: str = "replace"
     return cp.stdout.decode("utf-8", errors=errors) if cp.returncode == 0 else None
 
 
-def status_entries(path: str, untracked: str) -> list[list[str]] | None:
+def status_entries(path: str, untracked: str, scan: bool = False) -> list[list[str]] | None:
     """The entries of `git status` in the checkout at `path`, one list of paths each: `[<to>, <from>]` for a rename
     or copy, `[<path>]` otherwise. Untracked files show in the mode `untracked` (`all`: each file; `normal`: an
     untracked directory as one entry), and each submodule change shows, whatever the user's git settings say.
-    -z never quotes a path. None when git fails."""
-    out = git_text(path, "status", "--porcelain", "-z", f"--untracked-files={untracked}", "--ignore-submodules=none")
+    -z never quotes a path. With `scan`, git also scans the worktree whatever the file system monitor and the
+    untracked cache say (SCAN_OPTIONS). None when git fails."""
+    out = git_text(path, *(SCAN_OPTIONS if scan else ()), "status", "--porcelain", "-z",
+                   f"--untracked-files={untracked}", "--ignore-submodules=none")
     if out is None:
         return None
     fields = out.split("\0")
