@@ -956,11 +956,13 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(list(self.home.rglob("lanes")), [])  # no archive either
 
     def test_cleanup_keeps_a_lane_that_changes_while_its_agent_exits(self):
-        # Once with the file in plain sight, once hidden by the git settings: then neither removal command
-        # would refuse, and only the count again stands between the file and its deletion.
-        for name, hide in (("late.txt", False), ("hidden.txt", True)):
+        # Once hidden by the git settings: then neither removal command would refuse, and only the count again
+        # stands between the file and its deletion. Then once in plain sight.
+        for name, hide in (("hidden.txt", True), ("late.txt", False)):
             if hide:
                 self.git(self.lane_path, "config", "status.showUntrackedFiles", "no")
+            else:
+                self.git(self.lane_path, "config", "--unset", "status.showUntrackedFiles")
             out = self.clean(write=name)
             self.assertEqual((out["ok"], out.get("removed"), out["exited"]), (False, None, ["w1:p1"]))
             self.assertEqual(out["error"], "1 uncommitted change appeared after the check; the worktree stays")
