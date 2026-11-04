@@ -35,10 +35,15 @@ In a child, environment variables name files that get one JSON line for each eve
     PATIENT_GIT_LOG    each git call: its arguments and the limit that the helper asked for (before widening);
     PATIENT_SLEEP_LOG  each time.sleep request: the seconds and the file of the caller;
     PATIENT_GIT_TAKES  seconds: the child runs as inside git_takes(PATIENT_GIT_TAKES);
-    PATIENT_RAISE_IN   a function name: the first call of that function of the script raises RuntimeError
-                       (through sys.settrace, which then stops), so a test can make the real entry fail anywhere.
+    PATIENT_RAISE_IN   NAME or NAME:TYPE: the first call of the script's function NAME raises TYPE, RuntimeError
+                       (the default), SystemExit (code 7), KeyboardInterrupt or FakeClockLimit (through sys.settrace,
+                       which then stops), so a test can make the real entry fail anywhere. An injection that never
+                       fired fails the child: when the script ends (SystemExit too), the launcher writes
+                       "patient_fleet: PATIENT_RAISE_IN=... never fired" to stderr and exits NEVER_FIRED (97).
 
-A test's calendar goes to its child too (test_fleet.helper_env), so that both name and lock the same month's log:
+A test's calendar goes to its child too (test_fleet.helper_env), so that both name and lock the same month's log;
+helper_env also gives the child the parent's TZ, so that the child turns these seconds back into the parent's
+calendar:
     PATIENT_CALENDAR   seconds since the epoch: time.strftime and time.localtime without a time give this instant;
     PATIENT_TIME       seconds since the epoch: time.time gives this instant (the parent's stopped wall clock).
 datetime stays real, as in the parent: it only stamps events and never names a file.
@@ -60,6 +65,7 @@ from contextlib import contextmanager
 import argparse, concurrent.futures, datetime, fcntl, glob, shlex, shutil, textwrap, uuid  # noqa: E401,F401
 
 GIT_TEST_LIMIT = 300  # seconds
+NEVER_FIRED = 97  # the exit code of a child whose PATIENT_RAISE_IN never fired
 MIN_GIT_LIMIT = 0.25  # seconds: the helper's smallest git limit, HOOK_GIT_MIN (a test checks that they agree)
 
 _real_run = subprocess.run  # taken before any patch, so that patient_run never calls itself
@@ -249,14 +255,26 @@ if __name__ == "__main__":
     if os.environ.get("PATIENT_TIME"):
         stopped = float(os.environ["PATIENT_TIME"])
         time.time = lambda: stopped
-    if os.environ.get("PATIENT_RAISE_IN"):
-        target, script_path = os.environ["PATIENT_RAISE_IN"], os.path.realpath(script)
+    injection, fired = os.environ.get("PATIENT_RAISE_IN"), []
+    if injection:
+        target, _, kind = injection.partition(":")
+        script_path = os.path.realpath(script)
+        make = {"": RuntimeError, "RuntimeError": RuntimeError, "SystemExit": lambda _: SystemExit(7),
+                "KeyboardInterrupt": KeyboardInterrupt, "FakeClockLimit": FakeClockLimit}[kind]
 
         def _raise_in(frame, event, arg):
             if event == "call" and frame.f_code.co_name == target and \
                     os.path.realpath(frame.f_code.co_filename) == script_path:
-                raise RuntimeError(f"patient_fleet: injected in {target}")
+                fired.append(target)
+                raise make(f"patient_fleet: injected in {target}")
             return None
         sys.settrace(_raise_in)
     sys.argv = [script, *sys.argv[2:]]
-    runpy.run_path(script, run_name="__main__")  # the script's own `sys.exit(main())` ends the process
+    try:
+        runpy.run_path(script, run_name="__main__")  # the script's own `sys.exit(main())` ends the process
+    finally:
+        if injection and not fired:
+            sys.stdout.flush()
+            sys.stderr.write(f"patient_fleet: PATIENT_RAISE_IN={injection} never fired\n")
+            sys.stderr.flush()
+            os._exit(NEVER_FIRED)

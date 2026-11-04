@@ -1180,17 +1180,31 @@ def now_iso() -> str:
 
 
 def read_json(path: Path) -> dict:
+    """The JSON object in `path`; {} when the file cannot be read or parsed (any exception: a deeply nested file
+    makes the parser raise RecursionError) or holds no object."""
     try:
         data = json.loads(Path(path).read_text())
-    except (OSError, ValueError):
+    except Exception:
         return {}
     return data if isinstance(data, dict) else {}
 
 
 def write_json(path: Path, data: dict) -> None:
+    """Replace `path` with `data`, through a temporary file that is flushed and synced first: a crash leaves the old
+    file or the new one, never an empty one."""
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w") as fh:
+            fh.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def text_or_none(value) -> str | None:
@@ -1263,17 +1277,26 @@ def find_project(keys: list[str], learn: bool = False) -> Path | None:
     repository without one.
     """
     projects = [(d, read_json(d / PROJECT_FILE)) for d in project_dirs()]
+    picked = pick_project(keys, projects)
+    if picked is None:
+        return None
+    d, data = picked
+    known = project_keys(data)
+    missing = [k for k in keys if k not in known]
+    if learn and missing:
+        data.pop("remotes", None)
+        data["keys"] = known + missing
+        write_json(d / PROJECT_FILE, data)
+    return d
+
+
+def pick_project(keys: list[str], projects: list[tuple[Path, dict]]) -> tuple[Path, dict] | None:
+    """The rule of find_project: the first (home, project.json data) of `projects` that knows a key, the keys tried in
+    order."""
     for key in keys:
         for d, data in projects:
-            known = project_keys(data)
-            if key not in known:
-                continue
-            missing = [k for k in keys if k not in known]
-            if learn and missing:
-                data.pop("remotes", None)
-                data["keys"] = known + missing
-                write_json(d / PROJECT_FILE, data)
-            return d
+            if key in project_keys(data):
+                return d, data
     return None
 
 
@@ -1420,8 +1443,8 @@ class HookGitFailed(Exception):
 def no_git_entry(path: str) -> bool:
     """True when nothing tells git where a repository is: GIT_DIR is not set, and no `.git` entry (a file or a
     directory) exists in `path` or in any parent. Only then does git's exit code 128 mean "no repository" in
-    project_home's refusal. The hook does not use it: for a registered orch pane, every exit code 128 is outcome c
-    of orch_match."""
+    project_home's refusal. The hook does not use it: for a registered orch pane, every exit code 128 is the note
+    (orch_decide)."""
     if os.environ.get("GIT_DIR"):
         return False
     d = os.path.realpath(path)
@@ -3832,49 +3855,95 @@ def helper_command(env) -> str:
     return f'python3 "{base}/scripts/fleet"'
 
 
-class OrchUnconfirmed(Exception):
-    """Orch candidates name this pane, but the hook cannot confirm the session's project (outcome c of orch_match)."""
-
-    def __init__(self, homes: list[Path], pane: str, cause: str):
-        super().__init__(cause)
-        self.homes, self.pane, self.cause = homes, pane, cause
+HOOK_BAD_INPUT = "the hook input could not be read"
+REBRIEF, ORDINARY, NOTE = "re-brief", "ordinary", "note"  # the outcomes of orch_decide
 
 
 def orch_candidates(env) -> tuple[str | None, list[Path]]:
-    """(this pane, the homes whose orch.json names it). Reads files only, never git. No candidate: the pane is no
-    orch, and the hook treats it as any other pane."""
+    """(this pane, the homes whose orch.json names it). Reads files only, never git, and each file alone: a file that
+    cannot be read or parsed names no pane and drops no other file's candidate. No candidate: the pane is no orch,
+    and the hook treats it as any other pane. The hook reads this once, as its snapshot."""
     pane = text_or_none(env.get("HERDR_PANE_ID"))
     if not pane:
         return None, []
-    return pane, sorted(p.parent for p in (fleet_home() / PROJECTS_DIR).glob(f"*/{ORCH_FILE}")
-                        if read_json(p).get("pane") == pane)
+    homes = []
+    for p in sorted((fleet_home() / PROJECTS_DIR).glob(f"*/{ORCH_FILE}")):
+        try:
+            if read_json(p).get("pane") == pane:
+                homes.append(p.parent)
+        except Exception:
+            continue
+    return pane, homes
 
 
-def orch_match(data: dict, env, run: HookRun | None = None) -> tuple[Path, str] | None:
-    """For a pane that orch candidates name, exactly three outcomes:
-    (a) git gives the identity of the session's directory (top and remotes), and it is a candidate's project:
-        (project home, pane);
-    (b) git gives the identity, and it is no candidate's project: None (the pane is not this project's orch);
-    (c) anything else: OrchUnconfirmed. That is every failure of git (exit code 128 for any reason, "no repository"
-        too: `orch claim` needs a checkout, so a registered pane without one has usually lost it), a timeout, no
-        time left, and an exception of any type.
-    None for a pane that no candidate names. Runs git (two calls, within the deadline of `run`) only for a pane
-    with candidates."""
-    pane, homes = orch_candidates(env)
-    if not homes:
-        return None
+def orch_decide(data: dict, homes: list[Path], run: HookRun) -> tuple[str, object]:
+    """The outcome for a pane that the orch candidates `homes` name (the hook's one snapshot), as a value:
+    (REBRIEF, home): git gives the identity of the session's directory (top and remotes), and find_project's key
+        rule (pick_project) picks a candidate's project;
+    (ORDINARY, None): git gives the identity, the rule picks no candidate, and the project.json of every candidate
+        was read and has keys: the pane is not this project's orch;
+    (NOTE, cause): anything else. That is every failure of git (exit code 128 for any reason, "no repository" too:
+        `orch claim` needs a checkout, so a registered pane without one has usually lost it), a timeout, no time
+        left, a candidate's project.json that cannot be read or has no keys, and an exception of any type.
+    Runs git (two calls, within the deadline of `run`) and reads each project.json once."""
     try:
         cwd = text_or_none(data.get("cwd")) or os.getcwd()
         if not os.path.isdir(cwd):
-            raise HookGitFailed(HOOK_NO_REPOSITORY, f"no directory {cwd}")
-        home = find_project((run or HookRun()).identity(cwd)["keys"])
+            return NOTE, HOOK_NO_REPOSITORY
+        keys = run.identity(cwd)["keys"]
+        projects = [(d, read_json(d / PROJECT_FILE)) for d in project_dirs()]
+        picked = pick_project(keys, projects)
+        if picked is not None:
+            for h in homes:
+                if os.path.realpath(h) == os.path.realpath(picked[0]):
+                    return REBRIEF, h
+        known = {os.path.realpath(d): project_keys(d_data) for d, d_data in projects}
+        unread = [h.name for h in homes if not known.get(os.path.realpath(h))]
+        if unread:
+            return NOTE, f"the project file of {', '.join(unread)} could not be read"
+        return ORDINARY, None
     except HookGitFailed as e:
-        raise OrchUnconfirmed(homes, pane, e.cause)
+        return NOTE, e.cause
     except Exception as e:
-        raise OrchUnconfirmed(homes, pane, f"an error in the hook: {type(e).__name__}")
-    if home and any(os.path.realpath(home) == os.path.realpath(h) for h in homes):
-        return home, pane
-    return None
+        return NOTE, f"an error in the hook: {type(e).__name__}"
+
+
+def orch_context(data: dict, env, run: HookRun, pane: str, homes: list[Path]) -> tuple[str, str | None]:
+    """(outcome, text) for a pane that the orch candidates `homes` name: the re-brief, the ordinary path's text (it
+    may be None) or the note. A re-brief that fails or is empty gives the note."""
+    kind, value = orch_decide(data, homes, run)
+    if kind == REBRIEF:
+        try:
+            text = orch_rebrief(value, pane, data, env)
+            if text:
+                return REBRIEF, text
+            cause = "its re-brief failed: it is empty"
+        except Exception as e:
+            cause = f"its re-brief failed: {type(e).__name__}"
+        return NOTE, orch_note([value], pane, cause, env)
+    if kind == ORDINARY:
+        try:
+            return ORDINARY, lane_context(data, env, run)
+        except Exception as e:
+            return NOTE, orch_note(homes, pane, f"an error in the hook: {type(e).__name__}", env)
+    return NOTE, orch_note(homes, pane, value, env)
+
+
+def orch_note(homes: list[Path], pane: str, cause: str, env) -> str:
+    """orch_unconfirmed_note; when that fails, a fixed text that calls no helper function."""
+    try:
+        return orch_unconfirmed_note(homes, pane, cause, env)
+    except Exception:
+        return orch_fixed_note(homes, pane, cause)
+
+
+def orch_fixed_note(homes: list[Path], pane: str, cause: str) -> str:
+    """The note when orch_unconfirmed_note cannot be built: the pane, the candidate project names, the cause and the
+    digest command. It calls no helper function."""
+    return (f"Fleet orchestrator: this pane ({pane}) is registered as the orchestrator of "
+            f"{', '.join(h.name for h in homes)}, but this hook could not confirm that this session works in that "
+            f"project ({cause}), so it gives no re-brief. If you orchestrate it, run the fleet helper's `digest` "
+            f"command first, then read the project's PROJECT.md.")
 
 
 def orch_unconfirmed_note(homes: list[Path], pane: str, cause: str, env) -> str:
@@ -4862,27 +4931,30 @@ def task_rebrief(role: str | None, entry: dict, d: Path, pane: str, what: str) -
 
 
 def session_start_context(data: dict, env: dict | None = None, run: HookRun | None = None) -> str | None:
-    """Text for a session that was just cleared or compacted in a fleet checkout.
+    """Text for a session that starts, was resumed, cleared or compacted: what the hook entry prints for this input
+    (one candidate read, then the same decision; cmd_hook takes the candidates before it reads its input).
 
-    The registered orch pane of a project gets a re-brief from the project home on every source. For any
-    other pane, the pane's role comes from .fleet/panes.json (written by `fleet spawn --role`), so a critic
-    or an unrelated session in the same checkout is not told that it implements the lane. A pane that orch
-    candidates name and whose project the hook cannot confirm gets a short note instead (orch_match, outcome c), as
-    does the orch when its re-brief fails. Its git calls share the deadline of `run`.
+    A pane that orch candidates name gets one of orch_context's outcomes: the re-brief from the project home on
+    every source, the ordinary path, or a short note. Any other pane gets lane_context.
     """
     env = os.environ if env is None else env
     run = run or HookRun()
     try:
-        match = orch_match(data, env, run)
-    except OrchUnconfirmed as e:
-        return orch_unconfirmed_note(e.homes, e.pane, e.cause, env)
+        pane, homes = orch_candidates(env)
     except Exception:
-        match = None  # the candidates could not be read: the pane is known as no orch, as for any other pane
-    if match:
-        try:
-            return orch_rebrief(*match, data, env)
-        except Exception as e:
-            return orch_unconfirmed_note([match[0]], match[1], f"its re-brief failed: {type(e).__name__}", env)
+        pane, homes = None, []
+    if homes:
+        return orch_context(data, env, run, pane, homes)[1]
+    return lane_context(data, env, run)
+
+
+def lane_context(data: dict, env, run: HookRun) -> str | None:
+    """The ordinary path: text for a session that was just cleared or compacted in a fleet checkout.
+
+    The pane's role comes from .fleet/panes.json (written by `fleet spawn --role`), so a critic or an unrelated
+    session in the same checkout is not told that it implements the lane. The checkout's top is the one that git
+    confirmed (HookRun.top), else the session's directory; its git calls share the deadline of `run`.
+    """
     source = data.get("source")
     if source not in ("clear", "compact"):
         return None
@@ -4950,40 +5022,72 @@ def session_start_context(data: dict, env: dict | None = None, run: HookRun | No
     return "\n\n".join(parts) or None
 
 
-def cmd_hook(args: argparse.Namespace) -> int:
-    """SessionStart: record the session, and re-brief after /clear or compaction. SessionEnd: record the end.
-    All git calls share one deadline, counted from HOOK_STARTED (see HOOK_BUDGET); the re-brief comes first."""
-    run = HookRun(args.event, start=HOOK_STARTED)
+def read_hook_input() -> dict | None:
+    """The hook's input: the JSON object on stdin ({} for none, or a terminal). None when stdin cannot be read, is not
+    UTF-8, not JSON or not an object."""
     try:
-        raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+        if sys.stdin is None or sys.stdin.isatty():
+            return {}
+        buffer = getattr(sys.stdin, "buffer", None)
+        raw = buffer.read().decode("utf-8") if buffer is not None else sys.stdin.read()
         data = json.loads(raw) if raw.strip() else {}
     except Exception:
-        return 0
-    if not isinstance(data, dict):
-        return 0
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def print_session_start(text: str) -> None:
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}))
+    sys.stdout.flush()
+
+
+def orch_session_start(run: HookRun, pane: str, homes: list[Path], env) -> dict | None:
+    """SessionStart for a pane that the orch candidates `homes` name (the snapshot): it prints the output of one of
+    orch_context's outcomes, or the note when the input cannot be read. From here to the output (print and flush
+    included), an Exception, SystemExit or KeyboardInterrupt gives the note and no record. Not BaseException: the
+    test harness's FakeClockLimit must still end the process. Returns the input to record, or None."""
+    try:
+        data = read_hook_input()
+        if data is None:
+            text = orch_note(homes, pane, HOOK_BAD_INPUT, env)
+        else:
+            text = orch_context(data, env, run, pane, homes)[1]
+        if text:
+            print_session_start(text)
+        return data
+    except (Exception, SystemExit, KeyboardInterrupt) as e:
+        try:
+            print_session_start(orch_note(homes, pane, f"an error in the hook: {type(e).__name__}", env))
+        except (Exception, SystemExit, KeyboardInterrupt):
+            pass  # the output itself fails: nothing more can reach the session
+        return None
+
+
+def cmd_hook(args: argparse.Namespace) -> int:
+    """SessionStart: record the session, and re-brief after /clear or compaction. SessionEnd: record the end.
+    All git calls share one deadline, counted from HOOK_STARTED (see HOOK_BUDGET); the re-brief comes first.
+    SessionStart reads the orch candidates first, once, before its input (orch_session_start); a pane that none
+    names keeps the ordinary behaviour, where an input that cannot be read gives no output."""
+    run = HookRun(args.event, start=HOOK_STARTED)
+    homes: list[Path] = []
     if args.event == "session-start":
         try:
             pane, homes = orch_candidates(os.environ)
         except Exception:
-            pane, homes = None, []  # no candidate known: today's behaviour
-        try:
-            context = session_start_context(data, run=run)
-            out = json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}) \
-                if context else None
-        except Exception as e:
-            # A pane that orch candidates name never loses its re-brief silently: anything that raises before the
-            # output gives the note.
-            out = None
-            if homes:
-                try:
-                    note = orch_unconfirmed_note(homes, pane, f"an error in the hook: {type(e).__name__}", os.environ)
-                    out = json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
-                                                             "additionalContext": note}})
-                except Exception:
-                    out = None
-        if out:
-            print(out)
-            sys.stdout.flush()
+            pane, homes = None, []  # no candidate known: the ordinary behaviour
+    if homes:
+        data = orch_session_start(run, pane, homes, os.environ)
+    else:
+        data = read_hook_input()
+        if data is not None and args.event == "session-start":
+            try:
+                context = lane_context(data, os.environ, run)
+            except Exception:
+                context = None
+            if context:
+                print_session_start(context)
+    if data is None:
+        return 0
     try:
         hook_session_event("session_start" if args.event == "session-start" else "session_end", data, run=run)
     except Exception:

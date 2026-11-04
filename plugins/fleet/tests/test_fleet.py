@@ -155,8 +155,12 @@ class Clock:
 
 
 def helper_env(env: dict) -> dict:
-    """`env` for a HELPER child, with the test's calendar when the test has a Clock: parent and child then name and
-    lock the same month's log, also when a month ends during the test."""
+    """`env` for a HELPER child, with the test's calendar when the test has a Clock, and the parent's TZ (none when
+    the parent has none): parent and child then name and lock the same month's log, also when a month ends during
+    the test and whatever the timezone."""
+    env = {k: v for k, v in env.items() if k != "TZ"}
+    if os.environ.get("TZ") is not None:
+        env["TZ"] = os.environ["TZ"]
     return {**env, **fleet.time.child_env()} if isinstance(fleet.time, Clock) else env
 
 
@@ -3588,8 +3592,8 @@ class OrchTests(FleetTestCase):
             context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
             self.assertIn(f"{NOTE} ({cause})", context, target)
             self.assertNotIn("You implement", context, target)
-        # A failure before that point behaves as on main.
-        with mock.patch.object(fleet, "orch_match", side_effect=RuntimeError("boom")):
+        # A candidate read that fails knows no candidate: the pane behaves as on main.
+        with mock.patch.object(fleet, "orch_candidates", side_effect=RuntimeError("boom")):
             self.assertEqual(fleet.session_start_context({"source": "clear", "cwd": str(self.repo)},
                                                          env={"HERDR_PANE_ID": "w1:p1"}), before)
 
@@ -3691,18 +3695,21 @@ class OrchTests(FleetTestCase):
         text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)}, env={"HERDR_PANE_ID": "w1:p1"})
         self.assertIn("you orchestrate project app", text)
 
-    def hook_child(self, event, payload, path_dirs=(), cwd=True, **env):
+    def hook_child(self, event, payload, path_dirs=(), cwd=True, raw=None, stdin=None, **env):
         """The real hook entry in a child (HELPER: the script as __main__, with the stopped hook clock). PATH holds
-        only `path_dirs`, so herdr and gh cannot run. Returns (completed process, git limits asked, waits asked)."""
+        only `path_dirs`, so herdr and gh cannot run. Its input is `payload` as JSON, else the bytes `raw`, else the
+        file descriptor `stdin`. Returns (completed process with text output, git limits asked, waits asked)."""
         limits, sleeps = self.root / "git-limits.jsonl", self.root / "sleeps.jsonl"
         for f in (limits, sleeps):
             f.unlink(missing_ok=True)
         env = {"PATH": os.pathsep.join(map(str, path_dirs)) or str(self.root / "no-bin"), "FLEET_HOME": str(self.home),
                "HERDR_PANE_ID": "w1:p1", "HOME": str(self.root), "PATIENT_GIT_LOG": str(limits),
                "PATIENT_SLEEP_LOG": str(sleeps), **env}
-        cp = subprocess.run([*HELPER, "hook", event], input=json.dumps(payload), cwd=self.repo if cwd is True else cwd,
-                            capture_output=True,
-                            text=True, timeout=CHILD_LIMIT, env=helper_env(env))
+        given = {"stdin": stdin} if stdin is not None else \
+            {"input": raw if raw is not None else json.dumps(payload).encode()}
+        cp = subprocess.run([*HELPER, "hook", event], **given, cwd=self.repo if cwd is True else cwd,
+                            capture_output=True, timeout=CHILD_LIMIT, env=helper_env(env))
+        cp.stdout, cp.stderr = cp.stdout.decode(), cp.stderr.decode()
         asked = [json.loads(line)["timeout"] for line in limits.read_text().splitlines()] if limits.exists() else []
         waits = [json.loads(line) for line in sleeps.read_text().splitlines()] if sleeps.exists() else []
         return cp, asked, waits
@@ -3767,7 +3774,8 @@ class OrchTests(FleetTestCase):
         data, env = {"source": "startup", "cwd": str(self.repo)}, {"HERDR_PANE_ID": "w1:p1"}
         run = fleet.HookRun("session-start")
         with patient_fleet.record_git_limits() as calls:
-            self.assertEqual(fleet.orch_match(data, env, run), (self.project, "w1:p1"))
+            self.assertEqual(fleet.orch_candidates(env), ("w1:p1", [self.project]))  # files only
+            self.assertEqual(fleet.orch_decide(data, [self.project], run), (fleet.REBRIEF, self.project))
             self.assertEqual([limit for _, limit in calls], [6, 6])
             self.assertIsNotNone(fleet.hook_session_event("session_start", data, env, run))
         # The session record reuses the project of the run, and asks only for the branch.
@@ -3838,8 +3846,8 @@ class OrchTests(FleetTestCase):
         before = log.read_bytes()
         with patient_fleet.record_git_limits() as calls, patient_fleet.git_times_out():
             data = {"source": "clear", "cwd": str(self.repo)}
-            with self.assertRaises(fleet.OrchUnconfirmed):
-                fleet.orch_match(data, env)
+            self.assertEqual(fleet.orch_decide(data, [self.project], fleet.HookRun()),
+                             (fleet.NOTE, fleet.HOOK_NO_ANSWER))
             self.assertIsNone(fleet.hook_session_event("session_start", data, env))
             texts = {source: fleet.session_start_context({**data, "source": source}, env)
                      for source in ("startup", "resume", "clear", "compact")}
@@ -3897,12 +3905,14 @@ class OrchTests(FleetTestCase):
                       json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
         # In-process, the same outcomes.
         env = {"HERDR_PANE_ID": "w1:p1"}
-        with self.assertRaises(fleet.OrchUnconfirmed) as caught:
-            fleet.orch_match({"cwd": str(plain)}, env)
-        self.assertEqual((caught.exception.cause, caught.exception.homes), (fleet.HOOK_NO_REPOSITORY, [self.project]))
-        self.assertIsNone(fleet.orch_match({"cwd": str(other)}, env))
-        self.assertIsNone(fleet.orch_match({"cwd": str(plain)}, {"HERDR_PANE_ID": "w5:p5"}))
-        self.assertEqual(fleet.orch_match({"cwd": str(self.repo)}, env), (self.project, "w1:p1"))
+        self.assertEqual(fleet.orch_candidates(env), ("w1:p1", [self.project]))
+        self.assertEqual(fleet.orch_candidates({"HERDR_PANE_ID": "w5:p5"}), ("w5:p5", []))
+        homes = [self.project]
+        self.assertEqual(fleet.orch_decide({"cwd": str(plain)}, homes, fleet.HookRun()),
+                         (fleet.NOTE, fleet.HOOK_NO_REPOSITORY))
+        self.assertEqual(fleet.orch_decide({"cwd": str(other)}, homes, fleet.HookRun()), (fleet.ORDINARY, None))
+        self.assertEqual(fleet.orch_decide({"cwd": str(self.repo)}, homes, fleet.HookRun()),
+                         (fleet.REBRIEF, self.project))
         # project_home's refusal still tells "no repository" by the .git entries; the hook does not use that.
         with mock.patch.dict(os.environ, {"GIT_DIR": str(plain / "nowhere")}):
             self.assertFalse(fleet.no_git_entry(str(self.root)))
@@ -4132,60 +4142,212 @@ class OrchTests(FleetTestCase):
         self.assertAlmostEqual(patient_fleet.HOOK_CLOCK.now - patient_fleet.FakeClock.START, 11 * 20 * 0.05)
 
     def test_the_hook_entry_never_loses_the_orch_note(self):
-        """The catch-all of the hook entry: when anything raises before the output, a pane that orch candidates name
-        gets the note; a pane that none names keeps today's behaviour (no output)."""
+        """The boundary of the hook entry: when anything raises between the candidate read and the output, a pane
+        that orch candidates name gets the note; a pane that none names keeps today's behaviour (no output)."""
         self.orch_setup()
         git_dir = Path(shutil.which("git")).parent
         payload = {"source": "compact", "cwd": str(self.repo)}
-        cp, _, _ = self.hook_child("session-start", payload, [git_dir], PATIENT_RAISE_IN="session_start_context")
+        cp, _, _ = self.hook_child("session-start", payload, [git_dir], PATIENT_RAISE_IN="orch_context")
         self.assertEqual((cp.returncode, cp.stderr), (0, ""))
         self.assertIn(f"orchestrator of project app, but this hook {NOTE} (an error in the hook: RuntimeError)",
                       json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
-        cp, _, _ = self.hook_child("session-start", payload, [git_dir], PATIENT_RAISE_IN="session_start_context",
+        cp, _, _ = self.hook_child("session-start", payload, [git_dir], PATIENT_RAISE_IN="lane_context",
                                    HERDR_PANE_ID="w5:p5")
         self.assertEqual((cp.returncode, cp.stdout, cp.stderr), (0, "", ""))
         # In-process through main: the same, and a failing candidate read gives no note.
-        for side_effect, pane, want in ((RuntimeError("boom"), "w1:p1", NOTE), (RuntimeError("boom"), "w5:p5", None)):
+        for target, pane, want in (("orch_context", "w1:p1", NOTE), ("lane_context", "w5:p5", None)):
             buf = io.StringIO()
-            with mock.patch.object(fleet, "session_start_context", side_effect=side_effect), \
+            with mock.patch.object(fleet, target, side_effect=RuntimeError("boom")), \
                     mock.patch.dict(os.environ, {"HERDR_PANE_ID": pane}), \
                     mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), redirect_stdout(buf):
                 self.assertEqual(fleet.main(["hook", "session-start"]), 0)
             self.assertEqual(want in buf.getvalue() if want else buf.getvalue(), True if want else "", pane)
         buf = io.StringIO()
-        with mock.patch.object(fleet, "session_start_context", side_effect=RuntimeError("boom")), \
+        with mock.patch.object(fleet, "lane_context", side_effect=RuntimeError("boom")), \
                 mock.patch.object(fleet, "orch_candidates", side_effect=OSError("unreadable")), \
                 mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1"}), \
                 mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), redirect_stdout(buf):
             self.assertEqual(fleet.main(["hook", "session-start"]), 0)
         self.assertEqual(buf.getvalue(), "")
 
+    def test_one_snapshot_one_decision(self):
+        """SessionStart reads the orch candidates once, before its input, and decides once against that snapshot,
+        through the real entry on every source: a file that cannot be parsed drops no other candidate; a
+        candidate's project.json that cannot be read gives the note, never the lane text."""
+        self.orch_setup()
+        d = self.repo / ".fleet"
+        d.mkdir()
+        (d / "BRIEF.md").write_text("brief")
+        (d / "STATUS.md").write_text("status")
+        fleet.save_panes(d, {"w1:p1": {"role": "impl"}})  # the lane text, if the pane were taken as no orch
+        git_dir = Path(shutil.which("git")).parent
+        deep = self.home / "projects" / "aaa-deep"  # read before app's orch.json
+        deep.mkdir()
+        (deep / "orch.json").write_text("[" * 10000 + "0" + "]" * 10000)
+        with self.assertRaises(RecursionError):
+            json.loads((deep / "orch.json").read_text())
+        self.assertEqual(fleet.read_json(deep / "orch.json"), {})
+        self.assertEqual(fleet.orch_candidates({"HERDR_PANE_ID": "w1:p1"}), ("w1:p1", [self.project]))
+        project_json = self.project / "project.json"
+        good = project_json.read_text()
+        for source in ("startup", "resume", "clear", "compact"):
+            payload = {"source": source, "cwd": str(self.repo)}
+            cp, _, _ = self.hook_child("session-start", payload, [git_dir])
+            self.assertEqual((cp.returncode, cp.stderr), (0, ""), source)
+            self.assertIn("you orchestrate project app (pane w1:p1)",
+                          json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"], source)
+            # app's project.json truncated: git still names the checkout, but the comparison cannot be made.
+            project_json.write_text("{")
+            try:
+                cp, _, _ = self.hook_child("session-start", payload, [git_dir])
+            finally:
+                project_json.write_text(good)
+            self.assertEqual((cp.returncode, cp.stderr), (0, ""), source)
+            context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
+            self.assertIn(f"orchestrator of project app, but this hook {NOTE} (the project file of app could not be "
+                          "read)", context, source)
+            self.assertNotIn("You implement", context, source)
+        # A project.json with no keys is no comparison either; another project's checkout with readable files is.
+        other = self.root / "other"
+        other.mkdir()
+        git("init", "-q", "-b", "main", cwd=other)
+        self.assertEqual(fleet.orch_decide({"cwd": str(other)}, [self.project], fleet.HookRun()),
+                         (fleet.ORDINARY, None))
+        fleet.write_json(project_json, {"name": "app"})
+        self.assertEqual(fleet.orch_decide({"cwd": str(other)}, [self.project], fleet.HookRun()),
+                         (fleet.NOTE, "the project file of app could not be read"))
+        project_json.write_text(good)
+        # One candidate read per SessionStart, before the input is read; none for SessionEnd.
+        order = []
+        real_candidates, real_input = fleet.orch_candidates, fleet.read_hook_input
+        for event, pane, want in (("session-start", "w1:p1", ["candidates", "input"]),
+                                  ("session-start", "w5:p5", ["candidates", "input"]),
+                                  ("session-end", "w1:p1", ["input"])):
+            order.clear()
+            with mock.patch.object(fleet, "orch_candidates",
+                                   side_effect=lambda env: order.append("candidates") or real_candidates(env)), \
+                    mock.patch.object(fleet, "read_hook_input",
+                                      side_effect=lambda: order.append("input") or real_input()), \
+                    mock.patch.dict(os.environ, {"HERDR_PANE_ID": pane}), \
+                    mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"source": "compact",
+                                                                            "cwd": str(self.repo)}))), \
+                    redirect_stdout(io.StringIO()):
+                self.assertEqual(fleet.main(["hook", event]), 0)
+            self.assertEqual(order, want, (event, pane))
+
+    def test_the_hook_input_and_the_boundary(self):
+        """A pane that orch candidates name: input that cannot be read gives the note; SystemExit and
+        KeyboardInterrupt after the candidate read give the note and exit 0; a note that cannot be built gives the
+        fixed note. FakeClockLimit (the harness's failure) still ends the process. A pane that no candidate names
+        keeps today's behaviour: no output."""
+        self.orch_setup()
+        git_dir = Path(shutil.which("git")).parent
+        for raw in (b"{", b"[]", b"\xff{}", json.dumps({"source": "compact", "cwd": str(self.repo)}).encode()[:-1]):
+            cp, _, _ = self.hook_child("session-start", None, [git_dir], raw=raw)
+            self.assertEqual((cp.returncode, cp.stderr), (0, ""), raw)
+            self.assertIn(f"orchestrator of project app, but this hook {NOTE} (the hook input could not be read)",
+                          json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"], raw)
+            cp, _, _ = self.hook_child("session-start", None, [git_dir], raw=raw, HERDR_PANE_ID="w5:p5")
+            self.assertEqual((cp.returncode, cp.stdout, cp.stderr), (0, "", ""), raw)
+        (self.root / "write-only").touch()
+        unreadable = os.open(self.root / "write-only", os.O_WRONLY)  # stdin open for writing: a read raises OSError
+        self.addCleanup(os.close, unreadable)
+        cp, _, _ = self.hook_child("session-start", None, [git_dir], stdin=unreadable)
+        self.assertEqual((cp.returncode, cp.stderr), (0, ""))
+        self.assertIn(f"{NOTE} (the hook input could not be read)",
+                      json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
+        cp, _, _ = self.hook_child("session-start", None, [git_dir], stdin=unreadable, HERDR_PANE_ID="w5:p5")
+        self.assertEqual((cp.returncode, cp.stdout, cp.stderr), (0, "", ""))
+        plain = self.root / "plain"
+        plain.mkdir()
+        fixed = ("Fleet orchestrator: this pane (w1:p1) is registered as the orchestrator of app, but this hook could "
+                 "not confirm that this session works in that project (git found no repository here), so it gives no "
+                 "re-brief. If you orchestrate it, run the fleet helper's `digest` command first, then read the "
+                 "project's PROJECT.md.")
+        for source in ("startup", "resume", "clear", "compact"):
+            payload = {"source": source, "cwd": str(self.repo)}
+            for injection, cause in (("orch_rebrief:SystemExit", "an error in the hook: SystemExit"),
+                                     ("identity_from:KeyboardInterrupt", "an error in the hook: KeyboardInterrupt")):
+                cp, _, _ = self.hook_child("session-start", payload, [git_dir], PATIENT_RAISE_IN=injection)
+                self.assertEqual((cp.returncode, cp.stderr), (0, ""), (source, injection))
+                context = json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"]
+                self.assertIn(f"orchestrator of project app, but this hook {NOTE} ({cause})", context)
+            # The note builder fails: the fixed note.
+            cp, _, _ = self.hook_child("session-start", {"source": source, "cwd": str(plain)}, [git_dir],
+                                       PATIENT_RAISE_IN="orch_unconfirmed_note")
+            self.assertEqual((cp.returncode, cp.stderr), (0, ""), source)
+            self.assertEqual(json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"], fixed, source)
+            # The harness's FakeClockLimit is no product failure: the child ends with it, and prints no note.
+            cp, _, _ = self.hook_child("session-start", payload, [git_dir], PATIENT_RAISE_IN="orch_rebrief:FakeClockLimit")
+            self.assertEqual((cp.returncode, cp.stdout), (1, ""), source)
+            self.assertIn("\nFakeClockLimit: patient_fleet: injected in orch_rebrief", cp.stderr, source)
+        self.assertEqual(fleet.orch_fixed_note([self.project], "w1:p1", fleet.HOOK_NO_REPOSITORY), fixed)
+
+    def test_write_json_syncs_before_it_replaces(self):
+        path = self.root / "data.json"
+        fleet.write_json(path, {"a": 1})
+        synced = []
+        with mock.patch.object(fleet.os, "fsync", side_effect=lambda fd: synced.append(fd)) as fsync, \
+                mock.patch.object(fleet.os, "replace", side_effect=lambda *a: synced.append("replace") or
+                                  os.rename(*a)):
+            fleet.write_json(path, {"a": 2})
+        self.assertTrue(fsync.called)
+        self.assertEqual(synced[-1], "replace")
+        self.assertEqual(fleet.read_json(path), {"a": 2})
+        with mock.patch.object(fleet.os, "replace", side_effect=OSError("disk")), self.assertRaises(OSError):
+            fleet.write_json(path, {"a": 3})
+        self.assertEqual((fleet.read_json(path), sorted(p.name for p in self.root.glob(".data.json*"))), ({"a": 2}, []))
+
     def test_parent_and_child_share_the_calendar(self):
         """At the last second of a month, a HELPER child names and locks the parent's month's log, not the next
-        one: the child gets the parent's calendar (helper_env)."""
-        import fcntl
+        one: the child gets the parent's calendar and TZ (helper_env). Also with a parent TZ that is not the
+        machine's zone, where the child would otherwise read the calendar's seconds as another day."""
+        import calendar
         self.orch_setup()
         (self.repo / ".fleet").mkdir()
-        self.clock.calendar = time.strptime("2026-10-31 23:59:59", "%Y-%m-%d %H:%M:%S")
-        log = self.log_file()
-        self.assertEqual(log.name, "2026-10.jsonl")
-        log.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(log, os.O_WRONLY | os.O_CREAT, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        last = time.strptime("2026-10-31 23:59:59", "%Y-%m-%d %H:%M:%S")
+        machine = calendar.timegm(last) - time.mktime(last)  # the machine's (or the run's) UTC offset then
+        self.month_boundary(last, "s-31")
+        # A parent zone west of the machine's: in the machine's zone, the parent's last second of October is
+        # already November. (On a machine at -12 h, the first second of November at +14 h is still October.)
+        zone, when = ("Etc/GMT+12", last) if machine > -12 * 3600 else \
+            ("Etc/GMT-14", time.strptime("2026-11-01 00:00:00", "%Y-%m-%d %H:%M:%S"))
         try:
-            cp, _, waits = self.hook_child("session-start", {"source": "startup", "cwd": str(self.repo),
-                                                             "session_id": "s-31"}, [Path(shutil.which("git")).parent])
+            with mock.patch.dict(os.environ, {"TZ": zone}):
+                time.tzset()
+                self.assertNotEqual(calendar.timegm(when) - time.mktime(when), machine)
+                self.month_boundary(when, "s-41")
+                self.assertEqual(helper_env({"TZ": "UTC"})["TZ"], zone)
         finally:
-            os.close(fd)
-        self.assertEqual(cp.returncode, 0)
-        self.assertTrue(any(Path(w["file"]).resolve() == SCRIPT for w in waits))  # it met the parent's lock
-        self.assertFalse(any("s-31" in f.read_text() for f in log.parent.glob("*.jsonl")))
-        cp, _, _ = self.hook_child("session-start", {"source": "startup", "cwd": str(self.repo), "session_id": "s-32"},
-                                   [Path(shutil.which("git")).parent])
-        self.assertIn('"session":"s-32"', log.read_text())  # the parent's month
+            time.tzset()  # the run's own zone again
+        if "TZ" not in os.environ:
+            self.assertNotIn("TZ", helper_env({"TZ": "UTC"}))  # no TZ of its own: the child has none either
         self.assertEqual(helper_env({})["PATIENT_CALENDAR"], repr(time.mktime(self.clock.calendar)))
         self.clock.stopped = 1_700_000_000.0
         self.assertEqual(helper_env({})["PATIENT_TIME"], "1700000000.0")
+
+    def month_boundary(self, last, session):
+        """With the parent's calendar at `last` and its month's log locked, a child hook waits for that lock and does
+        not write elsewhere; once the log is free, it records `session` there."""
+        import fcntl
+        self.clock.calendar = time.localtime(time.mktime(last))
+        log = self.log_file()
+        self.assertEqual(log.name, time.strftime("%Y-%m.jsonl", last))
+        log.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(log, os.O_WRONLY | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        git_dir = Path(shutil.which("git")).parent
+        try:
+            cp, _, waits = self.hook_child("session-start", {"source": "startup", "cwd": str(self.repo),
+                                                             "session_id": session}, [git_dir])
+        finally:
+            os.close(fd)
+        self.assertEqual(cp.returncode, 0)
+        self.assertTrue(any(Path(w["file"]).resolve() == SCRIPT for w in waits), session)  # it met the lock
+        self.assertFalse(any(session in f.read_text() for f in log.parent.glob("*.jsonl")))
+        cp, _, _ = self.hook_child("session-start", {"source": "startup", "cwd": str(self.repo),
+                                                     "session_id": session + "b"}, [git_dir])
+        self.assertIn(f'"session":"{session}b"', log.read_text())  # the parent's month
 
     def test_a_hook_never_makes_a_second_home(self):
         """One name whose folder exists and whose project.json comes later (another process is writing it): the
@@ -4342,6 +4504,23 @@ class PatientFleetTests(FleetTestCase):
         clock.reset()
         self.assertEqual(clock.now, patient_fleet.FakeClock.START)
         self.assertIs(time.monotonic, patient_fleet._real_monotonic)  # the tests' own clock stays real
+
+    def test_an_injection_that_never_fires_fails_the_child(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        script = Path(tmp.name) / "script.py"
+        script.write_text("import sys\n\ndef target():\n    return 0\n\ntry:\n    target()\nexcept Exception:\n"
+                          "    pass\nsys.exit(int(sys.argv[1]))\n")
+        for injection, code, want in (("target", "0", 0), ("target:SystemExit", "0", 7), ("nothing", "0", 97),
+                                      ("nothing", "3", 97), (None, "3", 3)):
+            env = {k: v for k, v in os.environ.items() if k != "PATIENT_RAISE_IN"}
+            if injection:
+                env["PATIENT_RAISE_IN"] = injection
+            cp = subprocess.run([*HELPER[:2], str(script), code], capture_output=True, text=True, timeout=60, env=env)
+            self.assertEqual(cp.returncode, want, (injection, cp.stderr))
+            self.assertEqual("never fired" in cp.stderr, want == patient_fleet.NEVER_FIRED, injection)
+            if want == patient_fleet.NEVER_FIRED:  # also when the script ends with its own SystemExit
+                self.assertIn("patient_fleet: PATIENT_RAISE_IN=nothing never fired", cp.stderr)
 
     def test_a_wait_without_end_fails_instead_of_hanging(self):
         clock, limit = patient_fleet.HOOK_CLOCK, patient_fleet.FakeClock.LIMIT
