@@ -43,19 +43,24 @@ In a child, environment variables name files that get one JSON line for each eve
 
 A child can also stand in for a second fleet command that runs at the same time as another one (the races of the
 lane owner, test_fleet.OwnerRaceTests). Then the clock is the real one (a held project lock must make the other
-command wait for real), and Herdr, gh and the panes are stubs. Every bound of such a child derives from
-GIT_TEST_LIMIT, the time that a git call may take here, so that no wait of a race expires because of a delay that the
-harness permits: a pause waits PAUSE_LIMIT, the project lock waits RACE_LOCK_WAIT (the script's LOCK_WAIT: a holder
-may pause and run git), and the test itself has one watchdog, RACE_WATCHDOG, that ends its children and fails it:
+command wait for real), and Herdr, gh and the panes are stubs. Such a race has one time bound only, the test's
+watchdog (RACE_WATCHDOG real seconds for the whole test): no wait of a race expires before it, whatever the git calls
+of the other child take (each may take GIT_TEST_LIMIT, and a child makes several before it meets the other). The
+test passes the seconds left of its watchdog to each child (PATIENT_WATCHDOG); a pause and a wait for the project
+lock (the script's project_lock without its own `wait`) end when their condition comes, when the parent test ends
+(it kills its children; a pause also ends when its parent process is gone), or at that watchdog:
     PATIENT_SERVICES   a JSON file {"stubs": [...], "checkouts": [...], "pane_state": "dead"}: enumerate_lanes gives
                        stubs and checkouts, pane_state the state, pane_info {}, the pull request lookup none,
-                       require_herdr passes, and herdr() raises (no Herdr at all);
+                       require_herdr passes, herdr() raises (no Herdr at all), and project_lock waits until the
+                       watchdog;
+    PATIENT_WATCHDOG   seconds: the time left of the test's watchdog when it started the child (RACE_WATCHDOG
+                       without it);
     PATIENT_CALL       NAME: call the script's function NAME with the JSON list PATIENT_ARGS as its arguments and
                        print its result as JSON, instead of main();
     PATIENT_SYNC       a directory for the files below, and PATIENT_ID the child's name in it;
     PATIENT_PAUSE      NAME or after:NAME: at the first call of the script's function NAME (or when it returns), the
-                       child creates <sync>/<id>.ready and waits until <sync>/<id>.go exists (at most PAUSE_LIMIT
-                       real seconds, then it fails: no test hangs);
+                       child creates <sync>/<id>.ready and waits until <sync>/<id>.go exists (until its parent
+                       is gone or the watchdog expires at the latest, then it fails: no test hangs);
     PATIENT_NOTE       NAME: each call of the script's function NAME creates <sync>/<id>.<NAME> (it never waits).
 PATIENT_PAUSE and PATIENT_NOTE trace calls with sys.settrace, as PATIENT_RAISE_IN does: a child uses one or the other.
 
@@ -84,9 +89,7 @@ import argparse, concurrent.futures, datetime, fcntl, glob, shlex, shutil, textw
 
 GIT_TEST_LIMIT = 300  # seconds
 NEVER_FIRED = 97  # the exit code of a child whose PATIENT_RAISE_IN never fired
-PAUSE_LIMIT = GIT_TEST_LIMIT  # real seconds that a PATIENT_PAUSE waits for its go file
-RACE_LOCK_WAIT = PAUSE_LIMIT + GIT_TEST_LIMIT  # a PATIENT_SERVICES child's LOCK_WAIT: past a pause, and a git call
-RACE_WATCHDOG = 2 * RACE_LOCK_WAIT  # real seconds for a whole race test (test_fleet.OwnerRaceTests)
+RACE_WATCHDOG = 4 * GIT_TEST_LIMIT  # real seconds for a whole race test (test_fleet.OwnerRaceTests): its one bound
 MIN_GIT_LIMIT = 0.25  # seconds: the helper's smallest git limit, HOOK_GIT_MIN (a test checks that they agree)
 
 _real_run = subprocess.run  # taken before any patch, so that patient_run never calls itself
@@ -263,14 +266,25 @@ def _touch(name: str) -> None:
     open(os.path.join(os.environ["PATIENT_SYNC"], f"{os.environ['PATIENT_ID']}.{name}"), "a").close()
 
 
+_parent = os.getppid()  # the test that started this child
+_watchdog_end = _real_monotonic() + float(os.environ.get("PATIENT_WATCHDOG") or RACE_WATCHDOG)
+
+
+def _watchdog_left() -> float:
+    """Real seconds until the test's watchdog expires (0 after it)."""
+    return max(0.0, _watchdog_end - _real_monotonic())
+
+
 def _pause() -> None:
-    """PATIENT_PAUSE: say ready, then wait for the go file (real time, bounded)."""
+    """PATIENT_PAUSE: say ready, then wait for the go file (real time) until the parent test is gone or its
+    watchdog expires."""
     _touch("ready")
     go = os.path.join(os.environ["PATIENT_SYNC"], f"{os.environ['PATIENT_ID']}.go")
-    end = _real_monotonic() + PAUSE_LIMIT
     while not os.path.exists(go):
-        if _real_monotonic() > end:
-            raise RuntimeError(f"patient_fleet: no {go} within {PAUSE_LIMIT} s")
+        if os.getppid() != _parent:
+            raise RuntimeError(f"patient_fleet: the test that started this child is gone; no {go}")
+        if not _watchdog_left():
+            raise RuntimeError(f"patient_fleet: no {go} before the test's watchdog")
         _real_sleep(0.01)
 
 
@@ -278,7 +292,9 @@ def _stub_services(g: dict) -> None:
     """PATIENT_SERVICES: Herdr, gh and the panes as stubs, in the script's own globals."""
     with open(os.environ["PATIENT_SERVICES"]) as fh:
         spec = json.load(fh)
-    g["LOCK_WAIT"] = RACE_LOCK_WAIT  # project_lock reads it at each call
+    project_lock = g["project_lock"]
+    # A wait for the lock ends at the test's watchdog: the holder may pause, and run git before its pause.
+    g["project_lock"] = lambda home, wait=None: project_lock(home, _watchdog_left() if wait is None else wait)
     g["require_herdr"] = lambda: None
     g["enumerate_lanes"] = lambda: (spec.get("stubs", []), spec.get("checkouts", []))
     g["pane_state"] = lambda pane: spec.get("pane_state", "dead")

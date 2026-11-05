@@ -1406,6 +1406,47 @@ class LaneOwnerTests(FleetTestCase):
         self.assertEqual(self.main("adopt", ws, "--orch", "billing", pane="w9:p9")[0], 0)
         self.assertEqual(self.owner(lane)["orch"], "billing")
 
+    def test_a_refused_adopt_changes_no_lane(self):
+        """The owner checks of adopt run before the preparation: a batch that they refuse prepares no lane (no
+        .fleet/, no exclude entry, no git). A refusal under the lock (an owner changed since the first check)
+        removes the empty .fleet/ that the preparation made, and leaves a .fleet/ that was there or holds a file."""
+        self.claim("w1:p1")
+        self.claim("w2:p1", "billing")
+        theirs = self.worktree("feat/theirs", pane="w2:p1")
+        hands = {}
+        for name in ("a", "b"):
+            hands[name] = self.root / f"hand-{name}"  # made by hand: no .fleet/ yet
+            git("worktree", "add", "-q", "-b", f"feat/hand-{name}", str(hands[name]), cwd=self.repo)
+        with mock.patch.object(fleet, "lane_owner_prep", wraps=fleet.lane_owner_prep) as prep:
+            code, out = self.main("adopt", str(hands["a"]), str(theirs))
+        self.assertEqual((code, out["changed"]), (2, "nothing"), out)
+        self.assertEqual([r["reasons"] for r in out["refused"]],
+                         [[f"lane {theirs} belongs to orch billing; pass --other-orch to adopt it"]])
+        prep.assert_not_called()
+        self.assertFalse((hands["a"] / ".fleet").exists())
+        # Under the lock: the unowned lane became billing's since the first check.
+        unowned = self.worktree("feat/unowned", pane="w9:p9")
+        real_lock = fleet.project_lock
+
+        @contextmanager
+        def lock(home, *args, **kwargs):
+            with real_lock(home, *args, **kwargs):
+                fleet.write_json(unowned / ".fleet" / "lane.json", {"orch": "billing"})
+                (hands["b"] / ".fleet" / "note.txt").write_text("kept\n")
+                yield
+        with mock.patch.object(fleet, "project_lock", lock):
+            code, out = self.main("adopt", str(hands["a"]), str(hands["b"]), str(unowned))
+        self.assertEqual((code, out["changed"]), (2, "nothing"), out)
+        self.assertEqual([r["reasons"] for r in out["refused"]],
+                         [[f"lane {unowned} belongs to orch billing; pass --other-orch to adopt it"]])
+        self.assertFalse((hands["a"] / ".fleet").exists())  # made by the preparation, still empty: removed
+        self.assertEqual(os.listdir(hands["b"] / ".fleet"), ["note.txt"])  # holds a file: stays
+        self.assertEqual(self.owner(unowned)["orch"], "billing")  # was there: stays
+        self.assertEqual(self.events("adopt"), [])
+        # Without a refusal, the same lanes are adopted.
+        code, out = self.main("adopt", str(hands["a"]), str(hands["b"]))
+        self.assertEqual((code, [l["orch"] for l in out["lanes"]]), (0, ["default", "default"]), out)
+
     def cleanup(self, *argv, pane="w1:p1"):
         return self.main("cleanup", *argv, "--unmerged", pane=pane)
 
@@ -1579,9 +1620,11 @@ class LaneOwnerTests(FleetTestCase):
 
     @contextmanager
     def git_under_lock(self):
-        """A list that gets each git command that the helper starts while it holds a project lock."""
+        """A list that gets each git or herdr command that the helper starts while it holds a project lock: git at
+        the subprocess boundary (run, git_text), herdr also at fleet.herdr (the tests' Herdr stub runs git of its own
+        in this process, which the boundary does not see)."""
         held, calls = [], []
-        real_lock, real_run = fleet.project_lock, fleet.subprocess.run
+        real_lock, real_run, real_herdr = fleet.project_lock, fleet.subprocess.run, fleet.herdr
 
         @contextmanager
         def lock(home, *args, **kwargs):
@@ -1593,10 +1636,16 @@ class LaneOwnerTests(FleetTestCase):
                     held.pop()
 
         def run(cmd, *args, **kwargs):
-            if held and os.path.basename(str(cmd[0])) == "git":
-                calls.append(" ".join(map(str, cmd[1:])))
+            if held and os.path.basename(str(cmd[0])) in ("git", "herdr"):
+                calls.append(" ".join([os.path.basename(str(cmd[0])), *map(str, cmd[1:])]))
             return real_run(cmd, *args, **kwargs)
-        with mock.patch.object(fleet, "project_lock", lock), mock.patch.object(fleet.subprocess, "run", run):
+
+        def herdr(*args, **kwargs):
+            if held:
+                calls.append(" ".join(["herdr", *map(str, args)]))
+            return real_herdr(*args, **kwargs)
+        with mock.patch.object(fleet, "project_lock", lock), mock.patch.object(fleet.subprocess, "run", run), \
+                mock.patch.object(fleet, "herdr", herdr):
             yield calls
 
     def test_no_git_under_the_owner_lock(self):
@@ -1626,6 +1675,11 @@ class LaneOwnerTests(FleetTestCase):
         self.assertNotIn("removing", self.owner(lanes["kept"]))
         self.assertFalse(lanes["gone"].exists())
         self.assertEqual(calls, [])
+        # The detector itself: git and herdr (the stub too) under a held lock are seen.
+        with self.git_under_lock() as calls, fleet.project_lock(self.project):
+            fleet.git_text(str(self.repo), "rev-parse", "HEAD")
+            fleet.herdr("workspace", "list")
+        self.assertEqual(calls, ["git -C %s rev-parse HEAD" % self.repo, "herdr workspace list"])
 
     def test_spawn_refuses_a_lane_being_removed(self):
         """A lane that a live cleanup marked gets no new agent, owned or not: spawn refuses before any pane exists,
@@ -1727,7 +1781,8 @@ class LaneOwnerTests(FleetTestCase):
 class OwnerRaceTests(FleetTestCase):
     """The owner of a lane under commands that run at the same time, each in its own process (patient_fleet.py with
     PATIENT_SERVICES: Herdr and gh are stubs, the clock and the project lock are real). A child pauses at a named
-    function until the test lets it go, so the order is set by files, never by timing; every wait is bounded."""
+    function until the test lets it go, so the order is set by files, never by timing. The test's watchdog
+    (RACE_WATCHDOG) is the one time bound: every wait, in the test and in its children, ends at it at the latest."""
 
     def setUp(self):
         self.children = []
@@ -1760,7 +1815,8 @@ class OwnerRaceTests(FleetTestCase):
         ([name, args]). With `pause`, it waits at that function (see PATIENT_PAUSE); `notes` are its PATIENT_NOTE,
         `extra` more environment."""
         env = {**os.environ, **self.env, "HERDR_PANE_ID": pane, "PATIENT_SERVICES": str(self.services),
-               "PATIENT_SYNC": str(self.sync), "PATIENT_ID": name, "PATIENT_NOTE": notes, **extra}
+               "PATIENT_SYNC": str(self.sync), "PATIENT_ID": name, "PATIENT_NOTE": notes,
+               "PATIENT_WATCHDOG": str(max(0.0, self.deadline - time.monotonic())), **extra}
         env.pop("CLAUDE_CODE_SESSION_ID", None)
         if pause:
             env["PATIENT_PAUSE"] = pause
@@ -1818,6 +1874,22 @@ class OwnerRaceTests(FleetTestCase):
                         (self.flag(f"{a}.ready") and self.flag(f"{b}.project_lock")) or
                         (self.flag(f"{b}.ready") and self.flag(f"{a}.project_lock")), "both children at the race")
         self.go(a, b)
+
+    def test_the_watchdog_ends_the_waits_of_a_child(self):
+        """A paused child, and a child that waits for the project lock, wait until the test's watchdog (here 1 s
+        left), then fail; neither has a bound of its own."""
+        code, out, err = self.done(self.child("p", ["adopt", str(self.lane)], "w1:p1", pause="write_lane_owner",
+                                              PATIENT_WATCHDOG="1"))
+        self.assertEqual(code, 1, err)
+        self.assertIn("before the test's watchdog", err)
+        self.assertIsNone(fleet.lane_owner(str(self.lane)))
+        with fleet.project_lock(self.project):
+            start = time.monotonic()
+            code, out, err = self.done(self.child("l", ["adopt", str(self.lane)], "w1:p1", PATIENT_WATCHDOG="1"))
+        self.assertGreaterEqual(time.monotonic() - start, 0.9)
+        self.assertNotEqual(code, 0, (out, err))
+        self.assertIn("is busy", f"{out} {err}")
+        self.assertIsNone(fleet.lane_owner(str(self.lane)))
 
     def test_two_adopts_at_once(self):
         """Two orchs adopt the same unowned lane at once, without --other-orch: one wins, the other is refused
@@ -3521,6 +3593,11 @@ class DocsTests(FleetTestCase):
         for text in ("git cannot tell the project of <path>; the worktree stays", "Remove the `removing` key"):
             self.assertIn(text, cleanup)
         self.assertIn("remove the `removing` key from", fleet.removal_refusal("<path>", 1, "adopt"))
+        # Review round 3, finding 1 (F16): the known limit of a repository without a project, by the guarantee.
+        self.assertIn("in a repository that has no fleet project yet (no fleet event was ever recorded there, so only "
+                      "a worktree made by hand can be a lane), `cleanup` takes no project lock, and an `orch claim` "
+                      "that creates the project and an `adopt` of that lane while the cleanup runs do not stop the "
+                      "removal; the checks for uncommitted and unmerged work still run right before it", readme)
         # The rule for a checkout that several orchestrators share, in the README and the fleet skill's rules.
         rules = skill.split("## Rules", 1)[1]
         for doc in (readme, rules):
@@ -4560,6 +4637,12 @@ class OrchTests(FleetTestCase):
         new name."""
         self.old_owner_sees_the_adopt(rename=True)
 
+    def rebrief(self, pane):
+        """The SessionStart re-brief of the orch of `pane`, from files only."""
+        [cand] = self.cands(pane)
+        with mock.patch.object(fleet, "collect_lanes", side_effect=AssertionError("no scan")):
+            return fleet.orch_rebrief(cand, pane, {"source": "clear"}, {})
+
     def old_owner_sees_the_adopt(self, rename):
         lanes = self.two_orchs()
         a = str(lanes["a"])
@@ -4568,13 +4651,16 @@ class OrchTests(FleetTestCase):
         self.adopt(lanes.values(), a, "--other-orch", pane="w2:p1")
         [adopt] = self.events("adopt")
         self.assertEqual((adopt["orch"], adopt["old"]), ("billing", "default"))
+        self.assertIn("\n1 event since the last digest.", self.rebrief("w1:p1"))  # the re-brief counts it too
         if rename:
             with mock.patch.object(fleet, "project_lane_stubs", return_value=[]), \
                     mock.patch.object(fleet, "require_herdr"):
                 self.assertEqual(self.main("orch", "rename", "default", "alpha", pane="w1:p1")[0], 0)
+            self.assertIn("\n1 event since the last digest.", self.rebrief("w1:p1"))  # through the former name
         old = "alpha" if rename else "default"
         shown = self.texts(lanes.values(), "w1:p1")
         self.assertEqual(shown.count("adopt"), 1, shown)  # once, to the orch that lost the lane
+        self.assertIn("\n0 events since the last digest.", self.rebrief("w1:p1"))
         self.assertEqual(self.texts(lanes.values(), "w1:p1"), [])  # and not again
         self.assertNotIn("adopt", self.texts(lanes.values(), "w2:p1"))  # B's own pane ran it
         for name in (old, "billing"):
@@ -5654,6 +5740,31 @@ class OrchTests(FleetTestCase):
         self.assertEqual(fleet.event_lane_owner(str(self.repo / "src")), "billing")
         fifo.write_text(json.dumps({"orch": "billing", "pad": " " * fleet.LANE_FILE_MAX}))
         self.assertIsNone(fleet.event_lane_owner(str(self.repo)))
+
+    def test_a_lane_json_that_grows_past_the_limit_gives_no_owner(self):
+        """The owner read takes at most LANE_FILE_MAX + 1 bytes, and more than LANE_FILE_MAX bytes give no owner, also
+        when the file was small at fstat and grew before the read (here os.read of that file gives the grown
+        record); a record of exactly LANE_FILE_MAX bytes gives its owner."""
+        (self.repo / ".fleet").mkdir()
+        path = self.repo / ".fleet" / "lane.json"
+        fleet.write_json(path, {"orch": "billing"})
+        real_read, asked = os.read, []
+
+        def grown(size):
+            text = json.dumps({"orch": "billing", "pad": ""})
+            text = json.dumps({"orch": "billing", "pad": "x" * (size - len(text))})
+            self.assertEqual(len(text), size)
+            return text.encode()
+
+        for size, owner in ((fleet.LANE_FILE_MAX + 1, None), (fleet.LANE_FILE_MAX, "billing")):
+            def read(fd, n, data=grown(size)):
+                if os.fstat(fd).st_ino != path.stat().st_ino:
+                    return real_read(fd, n)
+                asked.append(n)
+                return data[:n]
+            with mock.patch.object(os, "read", read):
+                self.assertEqual(fleet.event_lane_owner(str(self.repo)), owner, size)
+        self.assertEqual(asked, [fleet.LANE_FILE_MAX + 1] * 2)
 
     def test_the_record_waits_end_at_the_runs_end(self):
         """A held event log, and project names whose project.json never comes: the record's waits give up at the

@@ -2782,7 +2782,8 @@ def cmd_adopt(args: argparse.Namespace) -> int:
     """Set or move the orch that owns each target lane, in its .fleet/lane.json. A target is a lane as sweep prints
     it, or the top of any linked worktree (a hand-made one gets its .fleet/). Every check runs before any write: an
     unknown orch, a lane outside a project, and a lane of another orch without --other-orch refuse the whole
-    command."""
+    command. The owner checks run before the preparation (.fleet/ and its exclude entry, the branch) and again
+    under the locks; a refusal there removes the empty .fleet/ that the preparation made."""
     require_herdr()
     stubs, _ = lane_stubs(others=False)
     me = os.environ.get("HERDR_PANE_ID") or None
@@ -2828,8 +2829,10 @@ def cmd_adopt(args: argparse.Namespace) -> int:
                 out.append({"target": target, "owner": owner, "orch": name,
                             "reasons": [other_orch_reason(s["path"], owner, "adopt")]})
         return out
+    refused += owner_refusals()  # read-only (lane.json files): a batch refused here changes no lane
     if refused:
-        return refuse(refused=refused + owner_refusals())
+        return refuse(refused=refused)
+    made = [s["path"] for s, _, _ in chosen if not os.path.lexists(Path(s["path"]) / FLEET_DIR)]
     preps = {s["path"]: lane_owner_prep(s["path"]) for s, _, _ in chosen}  # git, before the locks
     done = []
     # Every check and every write under the lock of each project, taken in one order: an adopt or a spawn that
@@ -2839,6 +2842,11 @@ def cmd_adopt(args: argparse.Namespace) -> int:
             locks.enter_context(project_lock(Path(home)))
         refused = owner_refusals()
         if refused:
+            for path in made:  # the .fleet/ that the preparation made, while it is still empty
+                try:
+                    (Path(path) / FLEET_DIR).rmdir()
+                except OSError:
+                    pass
             return refuse(refused=refused)
         for s, home, name in chosen:
             old = lane_owner(s["path"])
@@ -4875,7 +4883,9 @@ def cached_board(path: Path) -> list[dict]:
 
 def cached_view(home: Path, name: str | None, orchs: dict[str, dict], is2: bool) -> dict | None:
     """The view of orch `name` for the re-brief's event count, from files only: the lanes and branches of every
-    orch's cached board, with the owner that each record names. None (every event) for a project with one orch."""
+    orch's cached board, with the owner that each record names, and the former names of the registry (an event of
+    a renamed orch, or an adopt from it, goes to the orch that has the name now, as in a digest). None (every
+    event) for a project with one orch."""
     if len(orchs) < 2 or not name:
         return None
     lanes: dict[str, str | None] = {}
@@ -4888,7 +4898,7 @@ def cached_view(home: Path, name: str | None, orchs: dict[str, dict], is2: bool)
             lanes.setdefault(os.path.realpath(r["path"]), owner)
             if text_or_none(r.get("branch")):
                 branches.setdefault(r["branch"], owner)
-    return {"name": name, "lanes": lanes, "branches": branches}
+    return {"name": name, "lanes": lanes, "branches": branches, "aliases": orch_aliases(orchs)}
 
 
 def orch_rebrief(cand: tuple[Path, str, dict], pane: str, data: dict, env) -> str:
