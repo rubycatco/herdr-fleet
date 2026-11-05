@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import contextmanager, nullcontext, redirect_stdout
@@ -5224,11 +5225,10 @@ class OrchTests(FleetTestCase):
         text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)}, env={"HERDR_PANE_ID": "w1:p1"})
         self.assertIn("you orchestrate project app", text)
 
-    def hook_child(self, event, payload, path_dirs=(), cwd=True, raw=None, stdin=None, timeout=CHILD_LIMIT, **env):
+    def hook_child(self, event, payload, path_dirs=(), cwd=True, raw=None, stdin=None, **env):
         """The real hook entry in a child (HELPER: the script as __main__, with the stopped hook clock). PATH holds
         only `path_dirs`, so herdr and gh cannot run. Its input is `payload` as JSON, else the bytes `raw`, else the
-        file descriptor `stdin`; `timeout` real seconds at most. Returns (completed process with text output, git
-        limits asked, waits asked)."""
+        file descriptor `stdin`. Returns (completed process with text output, git limits asked, waits asked)."""
         limits, sleeps = self.root / "git-limits.jsonl", self.root / "sleeps.jsonl"
         for f in (limits, sleeps):
             f.unlink(missing_ok=True)
@@ -5238,7 +5238,7 @@ class OrchTests(FleetTestCase):
         given = {"stdin": stdin} if stdin is not None else \
             {"input": raw if raw is not None else json.dumps(payload).encode()}
         cp = subprocess.run([*HELPER, "hook", event], **given, cwd=self.repo if cwd is True else cwd,
-                            capture_output=True, timeout=timeout, env=helper_env(env))
+                            capture_output=True, timeout=CHILD_LIMIT, env=helper_env(env))
         cp.stdout, cp.stderr = cp.stdout.decode(), cp.stderr.decode()
         asked = [json.loads(line)["timeout"] for line in limits.read_text().splitlines()] if limits.exists() else []
         waits = [json.loads(line) for line in sleeps.read_text().splitlines()] if sleeps.exists() else []
@@ -5605,30 +5605,50 @@ class OrchTests(FleetTestCase):
         cp, asked, _ = self.hook_child("session-end", payload, [git_dir], PATIENT_GIT_TAKES="0.5")
         self.assertEqual(asked, [2, 1.5, 1])
 
+    def bounded_owner(self, path, fifo):
+        """fleet.event_lane_owner(path) in a thread, for at most CHILD_LIMIT seconds: a read that blocks on the FIFO
+        `fifo` fails the test instead of hanging the suite (a writer that opens and closes the FIFO then ends that
+        read)."""
+        result = []
+        thread = threading.Thread(target=lambda: result.append(fleet.event_lane_owner(path)), daemon=True)
+        thread.start()
+        thread.join(CHILD_LIMIT)
+        if thread.is_alive():
+            try:
+                os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))  # EOF for a reader that waits for a writer
+            except OSError:
+                pass
+            thread.join(CHILD_LIMIT)
+            self.fail(f"event_lane_owner blocked on {fifo} for {CHILD_LIMIT} s")
+        return result[0]
+
     def test_a_lane_json_that_is_no_regular_file_never_holds_the_hook(self):
-        """The session record reads the owner from lane.json without blocking: a FIFO there (no writer) gives no
-        owner, and the real entry of each hook ends within its budget (real seconds), SessionStart with its
-        re-brief. A FIFO that holds a valid record, and a file past LANE_FILE_MAX, give no owner either."""
+        """The owner read never blocks and takes only a small regular file: a FIFO as lane.json gives no owner,
+        with no writer or with a writer that holds a valid record (each read bounded by CHILD_LIMIT, so a read
+        that blocks fails the test); a file past LANE_FILE_MAX gives none; a regular file gives its owner from a
+        subdirectory too. With the FIFO in place, the real entry of each hook ends (CHILD_LIMIT, as every
+        hook_child) and SessionStart gives its re-brief; the hook's budget follows from its work, which the budget
+        tests count."""
         self.orch_setup()
         (self.repo / ".fleet").mkdir()
         fifo = self.repo / ".fleet" / "lane.json"
         os.mkfifo(fifo)
+        self.assertIsNone(self.bounded_owner(str(self.repo), fifo))  # no writer
+        writer = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+        try:
+            os.write(writer, b'{"orch": "billing"}')  # a writer that holds a valid record
+            self.assertIsNone(self.bounded_owner(str(self.repo), fifo))
+        finally:
+            os.close(writer)
         git_dir = Path(shutil.which("git")).parent
         payload = {"source": "compact", "cwd": str(self.repo), "session_id": "s-2"}
-        cp, _, _ = self.hook_child("session-start", payload, [git_dir], timeout=fleet.HOOK_BUDGET["session-start"])
+        cp, _, _ = self.hook_child("session-start", payload, [git_dir])
         self.assertIn("you orchestrate project app as orch default (pane w1:p1)",
                       json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
         self.assertEqual(self.events("session_start")[-1].get("orch"), None)
-        cp, _, _ = self.hook_child("session-end", payload, [git_dir], timeout=fleet.HOOK_BUDGET["session-end"])
+        cp, _, _ = self.hook_child("session-end", payload, [git_dir])
         self.assertEqual(cp.returncode, 0, cp.stderr)
         self.assertEqual(self.events("session_end")[-1].get("orch"), None)
-        # A writer holds the FIFO open and has written a valid record: still no regular file, so no owner.
-        writer = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
-        try:
-            os.write(writer, b'{"orch": "billing"}')
-            self.assertIsNone(fleet.event_lane_owner(str(self.repo)))
-        finally:
-            os.close(writer)
         fifo.unlink()
         fleet.write_json(fifo, {"orch": "billing"})
         self.assertEqual(fleet.event_lane_owner(str(self.repo / "src")), "billing")
