@@ -1576,6 +1576,109 @@ class LaneOwnerTests(FleetTestCase):
         with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1"}):
             self.assertEqual(fleet.adopt_on_spawn(str(lane), None), {"adopted": "default"})
 
+    @contextmanager
+    def git_under_lock(self):
+        """A list that gets each git command that the helper starts while it holds a project lock."""
+        held, calls = [], []
+        real_lock, real_run = fleet.project_lock, fleet.subprocess.run
+
+        @contextmanager
+        def lock(home, *args, **kwargs):
+            with real_lock(home, *args, **kwargs):
+                held.append(home)
+                try:
+                    yield
+                finally:
+                    held.pop()
+
+        def run(cmd, *args, **kwargs):
+            if held and os.path.basename(str(cmd[0])) == "git":
+                calls.append(" ".join(map(str, cmd[1:])))
+            return real_run(cmd, *args, **kwargs)
+        with mock.patch.object(fleet, "project_lock", lock), mock.patch.object(fleet.subprocess, "run", run):
+            yield calls
+
+    def test_no_git_under_the_owner_lock(self):
+        """The owner steps hold the project lock for files only (lane.json, orch.json, the log): adopt, the adoption
+        in spawn, and the mark and unmark of cleanup run their git before it, so no lock wait of another command
+        depends on how fast git answers."""
+        self.claim("w1:p1")
+        self.claim("w2:p1", "billing")
+        lanes = {}
+        for name in ("adopt", "spawn", "kept", "gone"):
+            lanes[name] = self.wt / "repo" / name
+            git("worktree", "add", "-q", "-b", f"feat/{name}", str(lanes[name]), cwd=self.repo)
+        with self.git_under_lock() as calls:
+            self.assertEqual(self.main("adopt", str(lanes["adopt"]))[0], 0)
+            with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1"}):
+                self.assertEqual(fleet.adopt_on_spawn(str(lanes["spawn"]), None), {"adopted": "default"})
+            self.assertEqual(self.owner(lanes["adopt"])["branch"], "feat/adopt")  # the branch, taken before
+            # The mark, then the unmark of a lane that stays (git refuses an untracked file), then a removal.
+            for name in ("kept", "gone"):
+                self.main("adopt", str(lanes[name]))
+            (lanes["kept"] / "draft.txt").write_text("new work\n")
+            with mock.patch.object(fleet, "dirty_count", return_value=0), \
+                    mock.patch.object(fleet, "close_lane_follow_ups", return_value={}):
+                kept = fleet.clean_lane(fleet.collect_lanes(targets=[str(lanes["kept"])])[0][0], 5)
+                gone = fleet.clean_lane(fleet.collect_lanes(targets=[str(lanes["gone"])])[0][0], 5)
+        self.assertEqual((kept["ok"], kept.get("removed"), gone["ok"]), (False, None, True), (kept, gone))
+        self.assertNotIn("removing", self.owner(lanes["kept"]))
+        self.assertFalse(lanes["gone"].exists())
+        self.assertEqual(calls, [])
+
+    def test_spawn_refuses_a_lane_being_removed(self):
+        """A lane that a live cleanup marked gets no new agent, owned or not: spawn refuses before any pane exists,
+        with the text that says how to clear a mark that no cleanup holds."""
+        self.claim("w1:p1")
+        for owned in (False, True):
+            lane = self.wt / "repo" / f"marked-{owned}"
+            git("worktree", "add", "-q", "-b", f"feat/marked-{owned}", str(lane), cwd=self.repo)
+            (lane / ".fleet").mkdir()
+            fleet.write_json(lane / ".fleet" / "lane.json", {**({"orch": "default"} if owned else {}),
+                                                             "removing": {"pid": os.getpid(), "since": "now"}})
+            with mock.patch.object(fleet, "create_pane") as create:
+                code, out = self.spawn(lane / "sub" if owned else lane, "--role", "researcher")
+            create.assert_not_called()
+            self.assertEqual((code, out["changed"]), (2, "nothing"), out)
+            self.assertEqual(out["reason"], fleet.removal_refusal(str(lane), os.getpid(), "start an agent in"))
+            self.assertIn("When no cleanup runs", out["reason"])
+            self.assertEqual(self.events("spawn"), [])
+        # A mark whose process is gone does not count.
+        gone = subprocess.Popen([sys.executable, "-c", ""])
+        gone.wait()
+        fleet.write_json(lane / ".fleet" / "lane.json", {"orch": "default", "removing": {"pid": gone.pid}})
+        self.assertEqual(self.spawn(lane, "--role", "researcher")[0], 0)
+
+    def test_a_failed_project_lookup_keeps_the_lane(self):
+        """Cleanup resolves the project of each lane once, before its guard: when git cannot tell it (an error or
+        a timeout), the lane stays, also with --other-orch; a clean_lane without a resolved project resolves it
+        first and keeps the lane when that fails. Only "no project" goes on without a lock."""
+        self.claim("w1:p1")
+        lane = self.worktree("feat/lookup")
+        failing = mock.patch.object(fleet, "project_lookup", return_value=(None, f"git cannot tell the project of "
+                                                                                 f"{self.repo}"))
+        for extra in ((), ("--other-orch",)):
+            with failing:
+                code, out = self.cleanup(str(lane), *extra)
+            self.assertEqual((code, out["changed"]), (2, "nothing"), out)
+            self.assertEqual(out["refused"][0]["reasons"],
+                             [f"git cannot tell the project of {self.repo}; the worktree stays"])
+        f = fleet.collect_lanes(targets=[str(lane)])[0][0]
+        with failing:
+            out = fleet.clean_lane(f, 5)
+        self.assertEqual((out["ok"], out.get("removed"), out["error"]),
+                         (False, None, f"git cannot tell the project of {self.repo}; the worktree stays"))
+        self.assertTrue(lane.is_dir())
+        self.assertEqual(self.owner(lane)["orch"], "default")
+        # The home that the guard resolved is the one that the mark locks: never looked up again.
+        with mock.patch.object(fleet, "project_for", side_effect=AssertionError("a second lookup")), \
+                mock.patch.object(fleet, "archive_lane_files", return_value=None), \
+                mock.patch.object(fleet, "record"), mock.patch.object(fleet, "close_lane_follow_ups", return_value={}):
+            f = fleet.collect_lanes(targets=[str(lane)])[0][0]
+            fleet.carry_lane_homes([f])
+            self.assertEqual(f["home"], str(self.project))
+            self.assertTrue(fleet.clean_lane(f, 5)["removed"])
+
     def test_a_lane_without_fleet_dir_is_removed(self):
         """The mark of cleanup goes into a .fleet/ that git excludes, also for a worktree that never had one (made
         by hand or by Herdr): the removal, which refuses an untracked file, still removes the lane."""
@@ -1627,6 +1730,7 @@ class OwnerRaceTests(FleetTestCase):
 
     def setUp(self):
         self.children = []
+        self.deadline = time.monotonic() + patient_fleet.RACE_WATCHDOG  # the test's one watchdog
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(os.path.realpath(self.tmp.name))
@@ -1650,11 +1754,12 @@ class OwnerRaceTests(FleetTestCase):
                                                    "panes": []}], "checkouts": [str(self.repo)]}))
         self.services = services
 
-    def child(self, name, argv, pane, pause=None, call=None):
+    def child(self, name, argv, pane, pause=None, call=None, notes="project_lock", **extra):
         """Start the helper in a child process as pane `pane`: `argv` for main(), or the function `call`
-        ([name, args]). With `pause`, it waits at that function (see PATIENT_PAUSE)."""
+        ([name, args]). With `pause`, it waits at that function (see PATIENT_PAUSE); `notes` are its PATIENT_NOTE,
+        `extra` more environment."""
         env = {**os.environ, **self.env, "HERDR_PANE_ID": pane, "PATIENT_SERVICES": str(self.services),
-               "PATIENT_SYNC": str(self.sync), "PATIENT_ID": name, "PATIENT_NOTE": "project_lock"}
+               "PATIENT_SYNC": str(self.sync), "PATIENT_ID": name, "PATIENT_NOTE": notes, **extra}
         env.pop("CLAUDE_CODE_SESSION_ID", None)
         if pause:
             env["PATIENT_PAUSE"] = pause
@@ -1676,16 +1781,21 @@ class OwnerRaceTests(FleetTestCase):
 
     def done(self, proc):
         self.children.remove(proc)
-        out, err = proc.communicate(timeout=CHILD_LIMIT)
+        try:
+            out, err = proc.communicate(timeout=max(0.0, self.deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            self.fail(f"the watchdog: a child ran past the test's {patient_fleet.RACE_WATCHDOG} s")
         return proc.returncode, (json.loads(out) if out.strip() else None), err
 
     def flag(self, name):
         return (self.sync / name).exists()
 
     def wait_until(self, cond, what):
-        """Wait until `cond`; fail at once when a child ended before it (it can no longer come true), and after
-        CHILD_LIMIT at the latest."""
-        end = time.monotonic() + CHILD_LIMIT
+        """Wait until `cond`; fail at once when a child ended before it (it can no longer come true), and at the
+        test's watchdog at the latest."""
+        end = self.deadline
         while not cond():
             ended = [p for p in self.children if p.poll() is not None]
             if ended and not cond():
@@ -1766,8 +1876,9 @@ class OwnerRaceTests(FleetTestCase):
         code, out, err = self.done(self.child("a", ["adopt", str(self.lane), "--orch", "default", "--other-orch"],
                                               "w2:p1"))
         self.assertEqual((code, out["changed"]), (2, "nothing"), err)
-        self.assertIn(f"lane {self.lane} is being removed by a cleanup (process {c.pid})",
-                      out["refused"][0]["reasons"][0])
+        self.assertIn(f"lane {self.lane} is being removed by a cleanup (process {c.pid}); adopt it after that "
+                      f"cleanup ends. When no cleanup runs (process {c.pid} is another program now), remove the "
+                      f"`removing` key from {self.lane / '.fleet' / 'lane.json'}", out["refused"][0]["reasons"][0])
         self.go("c")
         code, out, err = self.done(c)
         self.assertEqual((code, out["lanes"][0]["removed"]), (0, True), (out, err))
@@ -1780,6 +1891,37 @@ class OwnerRaceTests(FleetTestCase):
         self.assertIsNone(fleet.lane_removal(str(self.root)))
         fleet.write_json(self.root / ".fleet" / "lane.json", {"orch": "default", "removing": {"pid": os.getpid()}})
         self.assertEqual(fleet.lane_removal(str(self.root)), os.getpid())
+
+    def test_cleanup_against_adopt_when_git_fails_after_the_guard(self):
+        """The critic's cleanup-identity-failure schedule: an adopt of another orch holds the project lock, and from
+        the cleanup's mark on, every project lookup in the cleanup fails (git). The cleanup uses the home that its
+        guard resolved, so it waits for that lock, sees the new owner and keeps the lane; no failed lookup stands
+        in for "no project"."""
+        fleet.write_lane_owner(str(self.lane), self.project, "default", "w1:p1")
+        a = self.child("a", ["adopt", str(self.lane), "--other-orch"], "w2:p1", pause="write_lane_owner")
+        self.wait_until(lambda: self.flag("a.ready"), "the adopt under the project lock")
+        bin_dir, marker, failed = self.root / "bin", self.sync / "c.mark_lane_removal", self.root / "failed-git"
+        bin_dir.mkdir()
+        (bin_dir / "git").write_text(
+            f'#!/bin/sh\nif [ -e "{marker}" ]; then case " $* " in *" --git-common-dir --show-toplevel "*)\n'
+            f'  echo "$*" >> "{failed}"; echo "injected git failure" >&2; exit 1;; esac; fi\n'
+            f'exec "{shutil.which("git")}" "$@"\n')
+        (bin_dir / "git").chmod(0o755)
+        c = self.child("c", ["cleanup", str(self.lane), "--unmerged"], "w1:p1", notes="mark_lane_removal,project_lock",
+                       PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+        self.wait_until(lambda: self.flag("c.mark_lane_removal") and self.flag("c.project_lock"),
+                        "the cleanup at the lock of its mark")
+        self.go("a")
+        code, out, err = self.done(a)
+        self.assertEqual((code, out["lanes"][0]["orch"]), (0, "billing"), err)
+        code, out, err = self.done(c)
+        [lane] = out["lanes"]
+        self.assertEqual((code, lane.get("removed")), (2, None), (out, err))
+        self.assertIn("changed from default to billing since the check; the worktree stays", lane["error"])
+        self.assertTrue(self.lane.is_dir())
+        self.assertEqual(fleet.read_json(self.lane / ".fleet" / "lane.json")["orch"], "billing")
+        self.assertTrue(failed.exists())  # the injection fired (the cleanup event's own lookup, after the mark)
+
 
 def git_out(*args, cwd):
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
@@ -3362,6 +3504,15 @@ class DocsTests(FleetTestCase):
                      "marks the lane in `lane.json` while it removes it"):
             self.assertIn(text, readme)
         self.assertNotIn("neither `git worktree remove` nor", cleanup)
+        # Round 2: files only under the owner lock, the carried project, spawn and the mark, the design items.
+        for text in ("read and write files only", "when git cannot tell the project", "`spawn` starts no agent in it",
+                     "removing the `removing` key from it clears the mark", "it reaches B's digest, not A's",
+                     "The lanes of a released orch", "a release also drops the names"):
+            self.assertIn(text, readme)
+        self.assertIn("a running cleanup is removing, owned or not", skill)
+        for text in ("git cannot tell the project of <path>; the worktree stays", "Remove the `removing` key"):
+            self.assertIn(text, cleanup)
+        self.assertIn("remove the `removing` key from", fleet.removal_refusal("<path>", 1, "adopt"))
         # The rule for a checkout that several orchestrators share, in the README and the fleet skill's rules.
         rules = skill.split("## Rules", 1)[1]
         for doc in (readme, rules):
@@ -4405,7 +4556,10 @@ class OrchTests(FleetTestCase):
         with mock.patch.object(fleet, "project_lane_stubs", return_value=[]), mock.patch.object(fleet, "require_herdr"):
             self.assertEqual(self.main("orch", "rename", "billing", "money", pane="w2:p1")[0], 0)
         self.assertEqual(fleet.read_orchs(self.project)["money"]["former"], ["billing"])
-        self.assertEqual(self.texts(rest, "w2:p1"), ["b work", "cleanup"])  # the old name goes to money
+        data = json.loads(self.views(rest, "digest", "--json", pane="w2:p1")[1])
+        self.assertEqual([e.get("text") or e["event"] for e in data["events"]], ["b work", "cleanup"])  # money's now
+        # The removed lane's row and its phase go to money too (removed_records resolves the old name).
+        self.assertEqual([(c["path"], c["new"]) for c in data["changes"]], [(b, "removed")])
         self.assertEqual(self.texts(rest, "w1:p1"), ["orch_rename"])  # a project event: every orch sees it
 
     def test_a_former_name_stays_with_its_orch(self):
@@ -5025,10 +5179,11 @@ class OrchTests(FleetTestCase):
         text = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)}, env={"HERDR_PANE_ID": "w1:p1"})
         self.assertIn("you orchestrate project app", text)
 
-    def hook_child(self, event, payload, path_dirs=(), cwd=True, raw=None, stdin=None, **env):
+    def hook_child(self, event, payload, path_dirs=(), cwd=True, raw=None, stdin=None, timeout=CHILD_LIMIT, **env):
         """The real hook entry in a child (HELPER: the script as __main__, with the stopped hook clock). PATH holds
         only `path_dirs`, so herdr and gh cannot run. Its input is `payload` as JSON, else the bytes `raw`, else the
-        file descriptor `stdin`. Returns (completed process with text output, git limits asked, waits asked)."""
+        file descriptor `stdin`; `timeout` real seconds at most. Returns (completed process with text output, git
+        limits asked, waits asked)."""
         limits, sleeps = self.root / "git-limits.jsonl", self.root / "sleeps.jsonl"
         for f in (limits, sleeps):
             f.unlink(missing_ok=True)
@@ -5038,7 +5193,7 @@ class OrchTests(FleetTestCase):
         given = {"stdin": stdin} if stdin is not None else \
             {"input": raw if raw is not None else json.dumps(payload).encode()}
         cp = subprocess.run([*HELPER, "hook", event], **given, cwd=self.repo if cwd is True else cwd,
-                            capture_output=True, timeout=CHILD_LIMIT, env=helper_env(env))
+                            capture_output=True, timeout=timeout, env=helper_env(env))
         cp.stdout, cp.stderr = cp.stdout.decode(), cp.stderr.decode()
         asked = [json.loads(line)["timeout"] for line in limits.read_text().splitlines()] if limits.exists() else []
         waits = [json.loads(line) for line in sleeps.read_text().splitlines()] if sleeps.exists() else []
@@ -5404,6 +5559,36 @@ class OrchTests(FleetTestCase):
         self.assertNotIn("branch", self.events("session_start")[-1])
         cp, asked, _ = self.hook_child("session-end", payload, [git_dir], PATIENT_GIT_TAKES="0.5")
         self.assertEqual(asked, [2, 1.5, 1])
+
+    def test_a_lane_json_that_is_no_regular_file_never_holds_the_hook(self):
+        """The session record reads the owner from lane.json without blocking: a FIFO there (no writer) gives no
+        owner, and the real entry of each hook ends within its budget (real seconds), SessionStart with its
+        re-brief. A FIFO that holds a valid record, and a file past LANE_FILE_MAX, give no owner either."""
+        self.orch_setup()
+        (self.repo / ".fleet").mkdir()
+        fifo = self.repo / ".fleet" / "lane.json"
+        os.mkfifo(fifo)
+        git_dir = Path(shutil.which("git")).parent
+        payload = {"source": "compact", "cwd": str(self.repo), "session_id": "s-2"}
+        cp, _, _ = self.hook_child("session-start", payload, [git_dir], timeout=fleet.HOOK_BUDGET["session-start"])
+        self.assertIn("you orchestrate project app as orch default (pane w1:p1)",
+                      json.loads(cp.stdout)["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(self.events("session_start")[-1].get("orch"), None)
+        cp, _, _ = self.hook_child("session-end", payload, [git_dir], timeout=fleet.HOOK_BUDGET["session-end"])
+        self.assertEqual(cp.returncode, 0, cp.stderr)
+        self.assertEqual(self.events("session_end")[-1].get("orch"), None)
+        # A writer holds the FIFO open and has written a valid record: still no regular file, so no owner.
+        writer = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+        try:
+            os.write(writer, b'{"orch": "billing"}')
+            self.assertIsNone(fleet.event_lane_owner(str(self.repo)))
+        finally:
+            os.close(writer)
+        fifo.unlink()
+        fleet.write_json(fifo, {"orch": "billing"})
+        self.assertEqual(fleet.event_lane_owner(str(self.repo / "src")), "billing")
+        fifo.write_text(json.dumps({"orch": "billing", "pad": " " * fleet.LANE_FILE_MAX}))
+        self.assertIsNone(fleet.event_lane_owner(str(self.repo)))
 
     def test_the_record_waits_end_at_the_runs_end(self):
         """A held event log, and project names whose project.json never comes: the record's waits give up at the

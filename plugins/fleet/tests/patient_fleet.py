@@ -43,7 +43,10 @@ In a child, environment variables name files that get one JSON line for each eve
 
 A child can also stand in for a second fleet command that runs at the same time as another one (the races of the
 lane owner, test_fleet.OwnerRaceTests). Then the clock is the real one (a held project lock must make the other
-command wait for real), and Herdr, gh and the panes are stubs:
+command wait for real), and Herdr, gh and the panes are stubs. Every bound of such a child derives from
+GIT_TEST_LIMIT, the time that a git call may take here, so that no wait of a race expires because of a delay that the
+harness permits: a pause waits PAUSE_LIMIT, the project lock waits RACE_LOCK_WAIT (the script's LOCK_WAIT: a holder
+may pause and run git), and the test itself has one watchdog, RACE_WATCHDOG, that ends its children and fails it:
     PATIENT_SERVICES   a JSON file {"stubs": [...], "checkouts": [...], "pane_state": "dead"}: enumerate_lanes gives
                        stubs and checkouts, pane_state the state, pane_info {}, the pull request lookup none,
                        require_herdr passes, and herdr() raises (no Herdr at all);
@@ -81,7 +84,9 @@ import argparse, concurrent.futures, datetime, fcntl, glob, shlex, shutil, textw
 
 GIT_TEST_LIMIT = 300  # seconds
 NEVER_FIRED = 97  # the exit code of a child whose PATIENT_RAISE_IN never fired
-PAUSE_LIMIT = 60  # real seconds that a PATIENT_PAUSE waits for its go file
+PAUSE_LIMIT = GIT_TEST_LIMIT  # real seconds that a PATIENT_PAUSE waits for its go file
+RACE_LOCK_WAIT = PAUSE_LIMIT + GIT_TEST_LIMIT  # a PATIENT_SERVICES child's LOCK_WAIT: past a pause, and a git call
+RACE_WATCHDOG = 2 * RACE_LOCK_WAIT  # real seconds for a whole race test (test_fleet.OwnerRaceTests)
 MIN_GIT_LIMIT = 0.25  # seconds: the helper's smallest git limit, HOOK_GIT_MIN (a test checks that they agree)
 
 _real_run = subprocess.run  # taken before any patch, so that patient_run never calls itself
@@ -273,6 +278,7 @@ def _stub_services(g: dict) -> None:
     """PATIENT_SERVICES: Herdr, gh and the panes as stubs, in the script's own globals."""
     with open(os.environ["PATIENT_SERVICES"]) as fh:
         spec = json.load(fh)
+    g["LOCK_WAIT"] = RACE_LOCK_WAIT  # project_lock reads it at each call
     g["require_herdr"] = lambda: None
     g["enumerate_lanes"] = lambda: (spec.get("stubs", []), spec.get("checkouts", []))
     g["pane_state"] = lambda pane: spec.get("pane_state", "dead")

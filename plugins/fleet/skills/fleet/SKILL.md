@@ -59,7 +59,7 @@ Run every command as `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" <command> ..
 
 `spawn` options:
 - Placement: `--pane P` (an existing shell pane), `--worktree BRANCH --base REF`, `--tab`, `--new-workspace`, or a split (`--split auto|right|down`, `--from PANE`; default: split the calling pane). A split starts in the directory of the pane it splits unless you pass `--cwd`.
-- Owner: in a lane that no orch owns, `spawn` records your orch in `.fleet/lane.json` (`--orch N`: another). It never moves an owned lane; `adopt` does.
+- Owner: in a lane that no orch owns, `spawn` records your orch in `.fleet/lane.json` (`--orch N`: another). It never moves an owned lane; `adopt` does. It refuses (exit 2, `changed: nothing`) a lane that a running cleanup is removing, owned or not; start the agent elsewhere, or after that cleanup ends.
 - Agent: `--agent claude|codex`, `--model`, `--effort` (claude `--effort`; codex `model_reasoning_effort`), `--permission-mode` (claude), `--account` (remuda only), `--name LABEL`, `--role impl|critic|orchestrator|helper|planner|researcher`, `-- <more agent arguments>`.
 - Task file: `--task FILE` (needs `--role`) keeps the file's absolute path with the pane's role. After /clear or compaction, the SessionStart hook tells a researcher or helper to re-read it.
 - Task: `--prompt "<one line>"` (passed as an argument, so it is never pasted). Put longer tasks in a file and point at it.

@@ -47,6 +47,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import textwrap
@@ -669,14 +670,15 @@ def adopt_on_spawn(cwd: str, name: str | None) -> dict:
     home, owner = caller_orch(cwd, name)
     if not owner:
         return {}
+    prep = lane_owner_prep(cwd)  # git, before the lock
     # The check and the write are one step under the project lock: another spawn or an adopt may have taken the
-    # lane since the read above, and a cleanup may be removing it.
+    # lane since the read above, and a cleanup may be removing it. Under the lock only lane.json is read and written.
     # A busy project does not fail the spawn: the lane stays unowned, and `fleet adopt` takes it later.
     try:
         with project_lock(home):
             if lane_owner(cwd) or lane_removal(cwd):
                 return {}
-            write_lane_owner(cwd, home, owner, os.environ.get("HERDR_PANE_ID"))
+            write_lane_owner(cwd, home, owner, os.environ.get("HERDR_PANE_ID"), prep)
     except FleetError as e:
         return {"not_adopted": f"{e}; `fleet adopt` takes the lane later"}
     return {"adopted": owner}
@@ -719,6 +721,10 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     cwd = target_cwd(args, info)
     if args.orch and cwd:
         caller_orch(cwd, args.orch)  # an unknown --orch refuses before anything is created
+    top = checkout_top(os.path.abspath(cwd)) if cwd else None
+    removing = lane_removal(str(top)) if top else None
+    if removing:  # owned or not: no new agent in a lane that a cleanup is removing, before any pane exists
+        return refuse(reason=removal_refusal(str(top), removing, "start an agent in"), role=args.role, cwd=cwd)
     if args.role in GATED_ROLES:
         if args.pane and not cwd:
             return refuse(reason=f"herdr reports no directory for pane {args.pane}, so the plan gate cannot be "
@@ -1462,17 +1468,50 @@ def record(event: str, where: str | None, by: bool = True, home: Path | None = N
 
 def event_lane_owner(path) -> str | None:
     """The orch that owns the lane holding `path` now: the lane.json of the first directory at or above it that has
-    a `.git` (the top of its checkout). File reads only, no git, so record() and the hooks can afford it."""
+    a `.git` (the top of its checkout). No git, and a read that cannot block (read_small_json), so record() and the
+    hooks can afford it: anything but a small regular file gives no owner."""
+    top = checkout_top(path)
+    if top is None:
+        return None
+    return text_or_none(read_small_json(top / FLEET_DIR / LANE_FILE, LANE_FILE_MAX).get("orch"))
+
+
+def checkout_top(path) -> Path | None:
+    """The first directory at or above the absolute `path` that has a `.git` (the top of its checkout), by file
+    checks only; None when there is none."""
     if not isinstance(path, str) or not os.path.isabs(path):
         return None
     try:
         d = Path(path)
         for top in (d, *d.parents):
             if (top / ".git").exists():
-                return lane_owner(str(top))
+                return top
     except OSError:
         return None
     return None
+
+
+def read_small_json(path: Path, limit: int) -> dict:
+    """The JSON object in `path` when it is a regular file of at most `limit` bytes, else {}. The open does not
+    block (O_NONBLOCK: a FIFO without a writer would hold a plain open for ever), fstat must say a regular file
+    (a FIFO, a device or a directory gives {}), and the read takes at most `limit` + 1 bytes. No thread, no timer."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return {}
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            return {}
+        data = os.read(fd, limit + 1)
+        if len(data) > limit:
+            return {}
+        parsed = json.loads(data)
+    except Exception:
+        return {}
+    finally:
+        os.close(fd)
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def pane_lane_fields(info: dict) -> dict:
@@ -2596,6 +2635,11 @@ def clean_lane(f: dict, timeout: float) -> dict:
     owner = f["orch"] if "orch" in f else lane_owner(f["path"])  # the owner that the checks saw
     marked = None  # whether mark_lane_removal created .fleet/, once the lane is marked
     try:
+        if "home" not in f:  # a caller other than cmd_cleanup: resolve it now, before anything changes
+            refused = carry_lane_homes([f])
+            if refused:
+                out["error"] = refused[0]["reasons"][0]
+                return out
         for p in f["panes"]:
             if not p.get("agent"):
                 continue
@@ -2686,9 +2730,11 @@ def other_orch_refusals(lanes: list[dict], name: str | None, allowed: bool, verb
         owner = f["orch"] if "orch" in f else lane_owner(f["path"])
         if not owner:
             continue
+        if "home" not in f:
+            continue  # its project lookup failed: carry_lane_homes refused it
         root = os.path.realpath(f.get("main_root") or f["path"])
         if root not in mine:
-            home = project_for(f.get("main_root") or f["path"], create=False)
+            home = carried_home(f)
             if name and not home:
                 raise FleetError(f"--orch {name}: {f['path']} is in no fleet project")
             mine[root] = current_orch(home, name)[0] if home else None
@@ -2707,7 +2753,8 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     lanes, _, missing = collect_lanes(targets=args.targets, others=False)
     if missing:
         raise FleetError(f"not a lane: {', '.join(missing)}. `fleet sweep` lists the lanes")
-    refused = other_orch_refusals(lanes, args.orch, args.other_orch, "remove")
+    refused = carry_lane_homes(lanes)  # once, for the guard, the mark and the unmark
+    refused += other_orch_refusals(lanes, args.orch, args.other_orch, "remove")
     refused += [{"target": f["target"], "verdict": f["verdict"], "reasons": f["reasons"]}
                 for f in lanes if not (f["verdict"] == "ready" or (args.unmerged and not f["blockers"]))]
     if refused:
@@ -2775,10 +2822,10 @@ def cmd_adopt(args: argparse.Namespace) -> int:
         return out
     if refused:
         return refuse(refused=refused + owner_refusals())
-    branches = {s["path"]: git_branch(s["path"]) or None for s, _, _ in chosen}  # git, before the locks
+    preps = {s["path"]: lane_owner_prep(s["path"]) for s, _, _ in chosen}  # git, before the locks
     done = []
     # Every check and every write under the lock of each project, taken in one order: an adopt or a spawn that
-    # ran since the reads above is seen, and a refusal of one target still changes no target.
+    # ran since the reads above is seen, and a refusal of one target still changes no target. Files only under it.
     with ExitStack() as locks:
         for home in sorted({os.path.realpath(h) for _, h, _ in chosen}):
             locks.enter_context(project_lock(Path(home)))
@@ -2790,9 +2837,9 @@ def cmd_adopt(args: argparse.Namespace) -> int:
             if old == name:
                 done.append({"lane": s["path"], "orch": name, "changed": False})
                 continue
-            path = write_lane_owner(s["path"], home, name, me)
+            path = write_lane_owner(s["path"], home, name, me, preps[s["path"]])
             record("adopt", s["path"], home=home, lane=s["path"], workspace=s.get("workspace"),
-                   branch=branches[s["path"]], orch=name, old=old)
+                   branch=preps[s["path"]]["branch"], orch=name, old=old)
             done.append({"lane": s["path"], "orch": name, "old": old, "changed": True, "lane_json": path})
     print(json.dumps({"ok": True, "lanes": done}, indent=2, ensure_ascii=False))
     return 0
@@ -2827,6 +2874,7 @@ DEFAULT_ORCH = "default"
 # in case would share one folder, and so one ORCH.md, digest cursor and board.
 ORCH_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,39}")
 LANE_FILE = "lane.json"  # <lane>/.fleet/lane.json: the orch that owns the lane, by name
+LANE_FILE_MAX = 64 * 1024  # bytes of a lane.json that event_lane_owner reads at most
 LANE_REMOVING = "removing"  # lane.json key: a cleanup is removing the lane ({"pid", "since"}); see mark_lane_removal
 LOCK_FILE = ".lock"
 LOCK_WAIT = 30  # seconds to wait for the project lock
@@ -3692,12 +3740,14 @@ def removed_records(events: list[dict], since: float | None, on_board: set[str],
             continue
         if os.path.realpath(path) in on_board:
             continue
-        if view and view.get("filtered") and e.get("orch") not in (None, view.get("name")):
+        owner = text_or_none(e.get("orch"))
+        owner = (view.get("aliases") or {}).get(owner, owner) if view and owner else owner  # a renamed orch's old name
+        if view and view.get("filtered") and owner not in (None, view.get("name")):
             continue
         found[path] = {"lane": names.get(path) or e.get("branch") or os.path.basename(path), "path": path,
                        "branch": e.get("branch"), "workspace": e.get("workspace"), "panes": [], "pr": None,
                        "phase": "removed", "last_event": {"ts": e.get("ts"), "event": "cleanup"},
-                       "blocked": None, "next": None, "risk": None, "follow_ups": [], "orch": e.get("orch")}
+                       "blocked": None, "next": None, "risk": None, "follow_ups": [], "orch": owner}
     return list(found.values())
 
 
@@ -3730,15 +3780,46 @@ def lane_removal(path: str) -> int | None:
 
 
 def removal_refusal(path: str, pid: int, verb: str) -> str:
-    return f"lane {path} is being removed by a cleanup (process {pid}); {verb} it after that cleanup ends"
+    return (f"lane {path} is being removed by a cleanup (process {pid}); {verb} it after that cleanup ends. When no "
+            f"cleanup runs (process {pid} is another program now), remove the `{LANE_REMOVING}` key from "
+            f"{Path(path) / FLEET_DIR / LANE_FILE}")
+
+
+def carry_lane_homes(lanes: list[dict]) -> list[dict]:
+    """Resolve the project home of each lane once, for cleanup, and carry it in the lane: f["home"] is its path, or
+    None when the repository has no project (then no lock, as in 0.8.3). The guard, the mark and the unmark read
+    it; none looks it up again, so a later git failure cannot stand in for "no project". A lookup that fails (a git
+    error or a timeout) gives no "home" and a refusal: the lane stays. Returns the refusals."""
+    found: dict[str, tuple] = {}
+    refused = []
+    for f in lanes:
+        where = f.get("main_root") or f["path"]
+        key = os.path.realpath(where)
+        if key not in found:
+            found[key] = project_lookup(where)
+        home, error = found[key]
+        if error:
+            f.pop("home", None)
+            refused.append({"target": f.get("target") or f["path"], "reasons": [f"{error}; the worktree stays"]})
+            continue
+        f["home"] = str(home) if home else None
+    return refused
+
+
+def carried_home(f: dict) -> Path | None:
+    """The project home that carry_lane_homes resolved for the lane; FleetError when it was not resolved."""
+    if "home" not in f:
+        raise FleetError(f"the project of lane {f['path']} is not known; the worktree stays")
+    return Path(f["home"]) if f["home"] else None
 
 
 def mark_lane_removal(f: dict, owner: str | None) -> bool:
     """For cleanup, right before the removal: under the project lock, read the lane's owner again; when it is not
     `owner` (the owner that the checks saw), raise; else write the `removing` mark into its lane.json, so that no
     adopt or spawn moves the lane while it goes. Returns whether this created .fleet/ (unmark removes it again).
-    The lock is held only for the read and the write, never across the removal."""
-    home = project_for(f.get("main_root") or f["path"], create=False)
+    The lock is the one of the home carried from the guard (carried_home), held only for reading and writing
+    lane.json: no git under it, and never across the removal."""
+    home = carried_home(f)
     fleet_dir = Path(f["path"]) / FLEET_DIR
     created = not fleet_dir.is_dir()
     # Before the lock (git): .fleet/ exists and git excludes it, so the mark is no untracked file that would make
@@ -3761,7 +3842,7 @@ def unmark_lane_removal(f: dict, created: bool) -> None:
     """Remove the `removing` mark of a lane that stays (the removal did not happen), under the project lock. Best
     effort: a mark that stays is ignored once this process ends."""
     try:
-        home = project_for(f.get("main_root") or f["path"], create=False)
+        home = carried_home(f)
         with (project_lock(home) if home else nullcontext()):
             fleet_dir = Path(f["path"]) / FLEET_DIR
             path = fleet_dir / LANE_FILE
@@ -3779,13 +3860,20 @@ def unmark_lane_removal(f: dict, created: bool) -> None:
         pass
 
 
-def write_lane_owner(cwd: str, home: Path | None, name: str | None, pane: str | None) -> str:
+def lane_owner_prep(cwd: str) -> dict:
+    """The git part of write_lane_owner, run before the project lock: the lane's .fleet/ (made, and excluded from
+    git) and its branch."""
+    return {"fleet_dir": prep_dir(cwd)["fleet_dir"], "branch": git_branch(cwd) or None}
+
+
+def write_lane_owner(cwd: str, home: Path | None, name: str | None, pane: str | None, prep: dict | None = None) -> str:
     """Record the orch that owns the lane at `cwd` (by name, never by pane: panes change at every handoff) in its
-    .fleet/lane.json, atomically. Returns the file."""
-    fleet_dir = Path(prep_dir(cwd)["fleet_dir"])
-    path = fleet_dir / LANE_FILE
+    .fleet/lane.json, atomically. Returns the file. With `prep` (lane_owner_prep, taken before the lock) it only
+    writes the file: adopt and spawn call it so under the project lock, where no git may run."""
+    prep = prep or lane_owner_prep(cwd)
+    path = Path(prep["fleet_dir"]) / LANE_FILE
     write_json(path, {"orch": name, "project": home.name if home else None,
-                      "branch": git_branch(cwd) or None, "since": now_iso(), "by": pane})
+                      "branch": prep["branch"], "since": now_iso(), "by": pane})
     return str(path)
 
 
