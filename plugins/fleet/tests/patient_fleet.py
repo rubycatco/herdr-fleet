@@ -41,6 +41,21 @@ In a child, environment variables name files that get one JSON line for each eve
                        fired fails the child: when the script ends (SystemExit too), the launcher writes
                        "patient_fleet: PATIENT_RAISE_IN=... never fired" to stderr and exits NEVER_FIRED (97).
 
+A child can also stand in for a second fleet command that runs at the same time as another one (the races of the
+lane owner, test_fleet.OwnerRaceTests). Then the clock is the real one (a held project lock must make the other
+command wait for real), and Herdr, gh and the panes are stubs:
+    PATIENT_SERVICES   a JSON file {"stubs": [...], "checkouts": [...], "pane_state": "dead"}: enumerate_lanes gives
+                       stubs and checkouts, pane_state the state, pane_info {}, the pull request lookup none,
+                       require_herdr passes, and herdr() raises (no Herdr at all);
+    PATIENT_CALL       NAME: call the script's function NAME with the JSON list PATIENT_ARGS as its arguments and
+                       print its result as JSON, instead of main();
+    PATIENT_SYNC       a directory for the files below, and PATIENT_ID the child's name in it;
+    PATIENT_PAUSE      NAME or after:NAME: at the first call of the script's function NAME (or when it returns), the
+                       child creates <sync>/<id>.ready and waits until <sync>/<id>.go exists (at most PAUSE_LIMIT
+                       real seconds, then it fails: no test hangs);
+    PATIENT_NOTE       NAME: each call of the script's function NAME creates <sync>/<id>.<NAME> (it never waits).
+PATIENT_PAUSE and PATIENT_NOTE trace calls with sys.settrace, as PATIENT_RAISE_IN does: a child uses one or the other.
+
 A test's calendar goes to its child too (test_fleet.helper_env), so that both name and lock the same month's log;
 helper_env also gives the child the parent's TZ, so that the child turns these seconds back into the parent's
 calendar:
@@ -66,6 +81,7 @@ import argparse, concurrent.futures, datetime, fcntl, glob, shlex, shutil, textw
 
 GIT_TEST_LIMIT = 300  # seconds
 NEVER_FIRED = 97  # the exit code of a child whose PATIENT_RAISE_IN never fired
+PAUSE_LIMIT = 60  # real seconds that a PATIENT_PAUSE waits for its go file
 MIN_GIT_LIMIT = 0.25  # seconds: the helper's smallest git limit, HOOK_GIT_MIN (a test checks that they agree)
 
 _real_run = subprocess.run  # taken before any patch, so that patient_run never calls itself
@@ -238,13 +254,46 @@ def load(script):
     return module
 
 
+def _touch(name: str) -> None:
+    open(os.path.join(os.environ["PATIENT_SYNC"], f"{os.environ['PATIENT_ID']}.{name}"), "a").close()
+
+
+def _pause() -> None:
+    """PATIENT_PAUSE: say ready, then wait for the go file (real time, bounded)."""
+    _touch("ready")
+    go = os.path.join(os.environ["PATIENT_SYNC"], f"{os.environ['PATIENT_ID']}.go")
+    end = _real_monotonic() + PAUSE_LIMIT
+    while not os.path.exists(go):
+        if _real_monotonic() > end:
+            raise RuntimeError(f"patient_fleet: no {go} within {PAUSE_LIMIT} s")
+        _real_sleep(0.01)
+
+
+def _stub_services(g: dict) -> None:
+    """PATIENT_SERVICES: Herdr, gh and the panes as stubs, in the script's own globals."""
+    with open(os.environ["PATIENT_SERVICES"]) as fh:
+        spec = json.load(fh)
+    g["require_herdr"] = lambda: None
+    g["enumerate_lanes"] = lambda: (spec.get("stubs", []), spec.get("checkouts", []))
+    g["pane_state"] = lambda pane: spec.get("pane_state", "dead")
+    g["pane_info"] = lambda pane: {}
+    g["pr_for_branch"] = lambda *a, **k: (None, None)
+
+    def herdr(*args, **kwargs):
+        raise g["FleetError"](f"patient_fleet: no herdr here ({' '.join(map(str, args))})")
+    g["herdr"] = herdr
+
+
 if __name__ == "__main__":
     script = sys.argv[1]
     subprocess.run = patient_run  # in place: the script's `import subprocess` binds this module
-    # In place, before the script reads HOOK_STARTED. subprocess and threading keep their own monotonic (bound when
-    # they were imported); subprocess's sleeps stay real (FakeClock.sleep).
-    time.monotonic = HOOK_CLOCK.monotonic
-    time.sleep = HOOK_CLOCK.sleep
+    services = os.environ.get("PATIENT_SERVICES")
+    if not services:
+        # In place, before the script reads HOOK_STARTED. subprocess and threading keep their own monotonic (bound
+        # when they were imported); subprocess's sleeps stay real (FakeClock.sleep). With PATIENT_SERVICES the
+        # clock stays real: another child holds the project lock for real.
+        time.monotonic = HOOK_CLOCK.monotonic
+        time.sleep = HOOK_CLOCK.sleep
     if os.environ.get("PATIENT_GIT_TAKES"):
         _git_takes.append(float(os.environ["PATIENT_GIT_TAKES"]))
     if os.environ.get("PATIENT_CALENDAR"):
@@ -255,6 +304,30 @@ if __name__ == "__main__":
     if os.environ.get("PATIENT_TIME"):
         stopped = float(os.environ["PATIENT_TIME"])
         time.time = lambda: stopped
+    pause, notes = os.environ.get("PATIENT_PAUSE"), set(filter(None, os.environ.get("PATIENT_NOTE", "").split(",")))
+    if pause or notes:
+        when, _, paused_fn = pause.rpartition(":") if pause else ("", "", None)
+        script_file, paused = os.path.realpath(script), []
+
+        def _sync_trace(frame, event, arg):
+            if event != "call" or os.path.realpath(frame.f_code.co_filename) != script_file:
+                return None
+            name = frame.f_code.co_name
+            if name in notes:
+                _touch(name)
+            if name == paused_fn and not paused:
+                paused.append(name)
+                if when != "after":
+                    _pause()
+                    return None
+
+                def _on_return(frame, event, arg):
+                    if event == "return":
+                        _pause()
+                    return _on_return
+                return _on_return
+            return None
+        sys.settrace(_sync_trace)
     injection, fired = os.environ.get("PATIENT_RAISE_IN"), []
     if injection:
         target, _, kind = injection.partition(":")
@@ -270,6 +343,15 @@ if __name__ == "__main__":
             return None
         sys.settrace(_raise_in)
     sys.argv = [script, *sys.argv[2:]]
+    if services:
+        g = runpy.run_path(script, run_name="patient_fleet_script")["main"].__globals__  # the functions' own globals
+        _stub_services(g)
+        call = os.environ.get("PATIENT_CALL")
+        if call:
+            result = g[call](*json.loads(os.environ.get("PATIENT_ARGS", "[]")))
+            print(json.dumps(result))
+            sys.exit(0)
+        sys.exit(g["main"](sys.argv[1:]))
     try:
         runpy.run_path(script, run_name="__main__")  # the script's own `sys.exit(main())` ends the process
     finally:

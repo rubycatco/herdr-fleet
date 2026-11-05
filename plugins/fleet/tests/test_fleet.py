@@ -1564,6 +1564,31 @@ class LaneOwnerTests(FleetTestCase):
         self.assertIn("feat/mine", git_out("branch", "--list", "feat/mine", cwd=self.repo))
         self.assertEqual(self.events("cleanup")[-1]["by_hand"], lane["by_hand"])
 
+    def test_a_busy_project_does_not_fail_the_spawn(self):
+        self.claim("w1:p1")
+        lane = self.wt / "repo" / "feat-free"
+        git("worktree", "add", "-q", "-b", "feat/free", str(lane), cwd=self.repo)
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1"}), mock.patch.object(fleet, "LOCK_WAIT", 0.2), \
+                fleet.project_lock(self.project):
+            out = fleet.adopt_on_spawn(str(lane), None)
+        self.assertIn("is busy", out["not_adopted"])
+        self.assertIsNone(fleet.lane_owner(str(lane)))
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1"}):
+            self.assertEqual(fleet.adopt_on_spawn(str(lane), None), {"adopted": "default"})
+
+    def test_a_lane_without_fleet_dir_is_removed(self):
+        """The mark of cleanup goes into a .fleet/ that git excludes, also for a worktree that never had one (made
+        by hand or by Herdr): the removal, which refuses an untracked file, still removes the lane."""
+        self.claim("w1:p1")
+        bare = self.wt / "repo" / "feat-bare"
+        git("worktree", "add", "-q", "-b", "feat/bare", str(bare), cwd=self.repo)
+        exclude = self.repo / ".git" / "info" / "exclude"
+        self.assertNotIn("/.fleet/", exclude.read_text() if exclude.exists() else "")
+        self.assertFalse((bare / ".fleet").exists())
+        code, out = self.cleanup(str(bare))
+        self.assertEqual((code, out["lanes"][0].get("removed")), (0, True), out)
+        self.assertFalse(bare.exists())
+
     def test_git_refuses_an_untracked_file_whatever_the_config(self):
         """A lane without a workspace is removed by git, with `-c status.showUntrackedFiles=all`: an untracked file
         that appears after the last check makes git refuse, also when the repository hides untracked files."""
@@ -1593,6 +1618,148 @@ class LaneOwnerTests(FleetTestCase):
         code, out = self.cleanup(str(mine))
         self.assertEqual((code, out["lanes"][0]["removed"]), (0, True), out)
         self.assertFalse(mine.exists())
+
+
+class OwnerRaceTests(FleetTestCase):
+    """The owner of a lane under commands that run at the same time, each in its own process (patient_fleet.py with
+    PATIENT_SERVICES: Herdr and gh are stubs, the clock and the project lock are real). A child pauses at a named
+    function until the test lets it go, so the order is set by files, never by timing; every wait is bounded."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.repo, self.home, self.sync = self.root / "repo", self.root / "home", self.root / "sync"
+        self.sync.mkdir()
+        self.env = {"FLEET_HOME": str(self.home), "GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@example.com",
+                    "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@example.com"}
+        patch = mock.patch.dict(os.environ, self.env)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.repo.mkdir()
+        git("init", "-q", "-b", "main", cwd=self.repo)
+        git("commit", "-q", "--allow-empty", "-m", "init", cwd=self.repo)
+        self.project = fleet.project_for(str(self.repo))
+        fleet.write_orchs(self.project, {"default": {"pane": "w1:p1"}, "billing": {"pane": "w2:p1"}}, "default")
+        self.lane = self.root / "lane"
+        git("worktree", "add", "-q", "-b", "feat/x", str(self.lane), cwd=self.repo)
+        (self.lane / ".fleet").mkdir()
+        services = self.root / "services.json"
+        services.write_text(json.dumps({"stubs": [{"workspace": None, "label": None, "path": str(self.lane),
+                                                   "panes": []}], "checkouts": [str(self.repo)]}))
+        self.services = services
+
+    def child(self, name, argv, pane, pause=None, call=None):
+        """Start the helper in a child process as pane `pane`: `argv` for main(), or the function `call`
+        ([name, args]). With `pause`, it waits at that function (see PATIENT_PAUSE)."""
+        env = {**os.environ, **self.env, "HERDR_PANE_ID": pane, "PATIENT_SERVICES": str(self.services),
+               "PATIENT_SYNC": str(self.sync), "PATIENT_ID": name, "PATIENT_NOTE": "project_lock"}
+        env.pop("CLAUDE_CODE_SESSION_ID", None)
+        if pause:
+            env["PATIENT_PAUSE"] = pause
+        if call:
+            env["PATIENT_CALL"], env["PATIENT_ARGS"] = call[0], json.dumps(call[1])
+        return subprocess.Popen([*HELPER, *argv], cwd=self.repo, env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+
+    def done(self, proc):
+        out, err = proc.communicate(timeout=CHILD_LIMIT)
+        return proc.returncode, (json.loads(out) if out.strip() else None), err
+
+    def flag(self, name):
+        return (self.sync / name).exists()
+
+    def wait_until(self, cond, what):
+        end = time.monotonic() + CHILD_LIMIT
+        while not cond():
+            self.assertLess(time.monotonic(), end, f"waited for {what}")
+            time.sleep(0.01)
+
+    def go(self, *names):
+        for name in names:
+            (self.sync / f"{name}.go").touch()
+
+    def race(self, a, b):
+        """Let two children that pause in write_lane_owner run against each other: wait until both are paused (no
+        lock between them), or one is paused and the other waits for the project lock that it holds; then let both
+        go."""
+        self.wait_until(lambda: (self.flag(f"{a}.ready") and self.flag(f"{b}.ready")) or
+                        (self.flag(f"{a}.ready") and self.flag(f"{b}.project_lock")) or
+                        (self.flag(f"{b}.ready") and self.flag(f"{a}.project_lock")), "both children at the race")
+        self.go(a, b)
+
+    def test_two_adopts_at_once(self):
+        """Two orchs adopt the same unowned lane at once, without --other-orch: one wins, the other is refused
+        because the lane is the winner's now, and the winner's record stays."""
+        a = self.child("a", ["adopt", str(self.lane)], "w1:p1", pause="write_lane_owner")
+        b = self.child("b", ["adopt", str(self.lane)], "w2:p1", pause="write_lane_owner")
+        self.race("a", "b")
+        results = {"default": self.done(a), "billing": self.done(b)}
+        winners = [n for n, (code, _, _) in results.items() if code == 0]
+        self.assertEqual(len(winners), 1, results)
+        [winner], [loser] = winners, [n for n in results if n not in winners]
+        code, out, _ = results[loser]
+        self.assertEqual((code, out["changed"]), (2, "nothing"), results)
+        self.assertEqual(out["refused"][0]["reasons"],
+                         [f"lane {self.lane} belongs to orch {winner}; pass --other-orch to adopt it"])
+        self.assertEqual(fleet.lane_owner(str(self.lane)), winner)
+        self.assertEqual([e["orch"] for e in fleet.read_events([self.project]) if e["event"] == "adopt"], [winner])
+
+    def test_spawn_against_adopt(self):
+        """The adoption of a first spawn and an adopt of another orch at once: one of them owns the lane, the other
+        changes nothing."""
+        s = self.child("s", [], "w1:p1", pause="write_lane_owner", call=["adopt_on_spawn", [str(self.lane), None]])
+        a = self.child("a", ["adopt", str(self.lane)], "w2:p1", pause="write_lane_owner")
+        self.race("s", "a")
+        (s_code, s_out, s_err), (a_code, a_out, a_err) = self.done(s), self.done(a)
+        self.assertEqual(s_code, 0, s_err)
+        owner = fleet.lane_owner(str(self.lane))
+        if s_out == {"adopted": "default"}:
+            self.assertEqual((owner, a_code, a_out["changed"]), ("default", 2, "nothing"), (a_out, a_err))
+        else:
+            self.assertEqual((s_out, owner, a_code), ({}, "billing", 0), (a_out, a_err))
+
+    def test_cleanup_against_adopt(self):
+        """A cleanup that passed its checks reads the owner again under the lock before it removes the lane: an
+        adopt by another orch since then makes it refuse. Once it marked the lane, an adopt is refused until it
+        ends."""
+        fleet.write_lane_owner(str(self.lane), self.project, "default", "w1:p1")
+        c = self.child("c", ["cleanup", str(self.lane), "--unmerged"], "w1:p1", pause="mark_lane_removal")
+        self.wait_until(lambda: self.flag("c.ready"), "the cleanup at its last owner check")
+        code, out, err = self.done(self.child("a", ["adopt", str(self.lane), "--other-orch"], "w2:p1"))
+        self.assertEqual((code, out["lanes"][0]["orch"]), (0, "billing"), err)
+        self.go("c")
+        code, out, err = self.done(c)
+        [lane] = out["lanes"]
+        self.assertEqual((code, lane.get("removed")), (2, None), err)
+        self.assertIn("the orch of lane", lane["error"])
+        self.assertIn("changed from default to billing since the check; the worktree stays", lane["error"])
+        self.assertTrue(self.lane.is_dir())
+        self.assertEqual(fleet.read_json(self.lane / ".fleet" / "lane.json")["orch"], "billing")  # no mark left
+        self.assertNotIn("removing", fleet.read_json(self.lane / ".fleet" / "lane.json"))
+        # Marked: the adopt is refused while the cleanup removes the lane; then the lane is gone.
+        for f in self.sync.iterdir():
+            f.unlink()
+        c = self.child("c", ["cleanup", str(self.lane), "--unmerged", "--other-orch"], "w1:p1",
+                       pause="after:mark_lane_removal")
+        self.wait_until(lambda: self.flag("c.ready"), "the cleanup after its mark")
+        code, out, err = self.done(self.child("a", ["adopt", str(self.lane), "--orch", "default", "--other-orch"],
+                                              "w2:p1"))
+        self.assertEqual((code, out["changed"]), (2, "nothing"), err)
+        self.assertIn(f"lane {self.lane} is being removed by a cleanup (process {c.pid})",
+                      out["refused"][0]["reasons"][0])
+        self.go("c")
+        code, out, err = self.done(c)
+        self.assertEqual((code, out["lanes"][0]["removed"]), (0, True), (out, err))
+        self.assertFalse(self.lane.exists())
+        # A mark whose process is gone (a cleanup that crashed) does not count.
+        gone = subprocess.Popen([sys.executable, "-c", ""])
+        gone.wait()
+        (self.root / ".fleet").mkdir()
+        fleet.write_json(self.root / ".fleet" / "lane.json", {"orch": "default", "removing": {"pid": gone.pid}})
+        self.assertIsNone(fleet.lane_removal(str(self.root)))
+        fleet.write_json(self.root / ".fleet" / "lane.json", {"orch": "default", "removing": {"pid": os.getpid()}})
+        self.assertEqual(fleet.lane_removal(str(self.root)), os.getpid())
 
 def git_out(*args, cwd):
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
@@ -3127,8 +3294,7 @@ class DocsTests(FleetTestCase):
         cleanup = (skills / "cleanup" / "SKILL.md").read_text()
         self.assertIn("--other-orch", cleanup)
         self.assertIn("pass --other-orch to remove it", cleanup)  # the refusal text, as the helper prints it
-        self.assertIn('f"lane {f[\'path\']} belongs to orch {owner}; pass --other-orch to {verb} it"',
-                      SCRIPT.read_text())  # the helper's text, which the skills quote with placeholders
+        self.assertIn(fleet.other_orch_reason("<path>", "<name>", "remove"), cleanup)  # the helper's own text
         self.assertIn('"remove")', SCRIPT.read_text().split("def cmd_cleanup", 1)[1].split("\ndef ", 1)[0])
         self.assertIn("ORCH.md", (skills / "context" / "SKILL.md").read_text())
         self.assertIn("--replace", (skills / "handoff" / "SKILL.md").read_text())
@@ -6003,11 +6169,25 @@ class FollowUpTests(FleetTestCase):
         self.assertIn("not UTF-8", out["follow_up_error"])
         self.assertEqual(self.md.read_bytes(), b"## Follow-ups\n- [F1] caf\xe9 (lane: lane-a)\n")
         self.assertIn("follow-ups: ", fleet.describe_event(self.events("cleanup")[-1]))
-        # A lock that another command holds: the cleanup still succeeds.
+        # A lock that another command holds through the whole cleanup: the owner check before the removal needs
+        # it, so the lane stays.
         self.held()
-        f = self.facts(self.make_lane("lane-b"))
+        lane_b = self.make_lane("lane-b")
+        f = self.facts(lane_b)
         with mock.patch.object(fleet, "LOCK_WAIT", 0.2), fleet.project_lock(self.project):
             out = fleet.clean_lane(f, 5)
+        self.assertEqual((out["ok"], out.get("removed")), (False, None))
+        self.assertIn("is busy", out["error"])
+        self.assertTrue(lane_b.is_dir())
+        # Held only while the follow-ups are written: the cleanup still succeeds.
+        real = fleet.close_lane_follow_ups
+
+        def busy(f):
+            with fleet.project_lock(self.project):
+                return real(f)
+        with mock.patch.object(fleet, "LOCK_WAIT", 0.2), mock.patch.object(fleet, "close_lane_follow_ups",
+                                                                           side_effect=busy):
+            out = fleet.clean_lane(self.facts(lane_b), 5)
         self.assertEqual((out["ok"], out["removed"]), (True, True))
         self.assertIn("is busy", out["follow_up_error"])
         self.assertIn("(lane: lane-b)", self.text())
