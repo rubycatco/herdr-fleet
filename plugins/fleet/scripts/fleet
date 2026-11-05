@@ -1907,6 +1907,12 @@ def find_transcript(agent: str | None, session: str, homes: dict[str, list[str]]
 OWNING_EVENTS = ("worktree", "adopt", "cleanup")  # events whose `orch` names the owner of their lane
 
 
+def adopt_old_owner(e: dict) -> str | None:
+    """The orch that an `adopt` event took the lane from (its `old`); None for any other event. The adopt goes to
+    that orch too (view_shows, orch_events), so that it sees its lane leave; the lane is the new orch's after it."""
+    return text_or_none(e.get("old")) if e.get("event") == "adopt" else None
+
+
 def owning_event(e: dict) -> bool:
     """An event that sets the owner of its lane: worktree, adopt, cleanup, and a spawn that adopted the lane."""
     return e.get("event") in OWNING_EVENTS or (e.get("event") == "spawn" and bool(e.get("adopted")))
@@ -1918,7 +1924,8 @@ def orch_events(events: list[dict], name: str, aliases: dict[str, dict[str, str]
     of each lane comes from it, before any other filter. An event that names its orch goes to that orch (through
     `aliases`, by project: a rename's old name goes to the orch that has it now). An event without one goes to the
     orch that owned its lane (by path, else by branch) at the time of the event, by the owning events before it.
-    Reads the log only."""
+    An `adopt` also goes to the orch that it took the lane from (adopt_old_owner); the owners do not change for
+    that: after the adopt, the lane is the new orch's. Reads the log only."""
     aliases = aliases or {}
     owners: dict[tuple, str] = {}  # (project, "path" or "branch", value) -> owner, as the log goes
     keep: set[int] = set()
@@ -1931,7 +1938,8 @@ def orch_events(events: list[dict], name: str, aliases: dict[str, dict[str, str]
             hits = [o for (proj, kind, v), o in owners.items() if proj == e.get("project") and kind == "path"
                     and isinstance(where, str) and inside(where, v)]
             owner = hits[-1] if hits else owners.get((e.get("project"), "branch", e.get("branch")))
-        if owner == name:
+        old = adopt_old_owner(e)
+        if owner == name or (old and names.get(old, old) == name):
             keep.add(id(e))
         if owning_event(e) and text_or_none(e.get("orch")):
             if isinstance(where, str):
@@ -4557,15 +4565,17 @@ def view_shows(e: dict, view: dict | None) -> bool:
     """Whether an event belongs on the view of an orch (`view`: {name, lanes, branches}, None: every event). A
     project-level event (PROJECT_EVENTS) goes to every orch. An event that names its orch (`orch`: the lane's owner
     when it was recorded, or the orch of a claim, adopt, cleanup ...) goes to that orch, through its former names
-    too. An event without one (an unowned lane, a log of 0.8.x) of a lane (its `lane` or `cwd` inside a lane of the
-    project, else its `branch` a lane's) shows when that lane is the orch's own or unowned now; any other shows."""
+    too. An `adopt` also goes to the orch that lost the lane (its `old`, through the former names too). An event
+    without one (an unowned lane, a log of 0.8.x) of a lane (its `lane` or `cwd` inside a lane of the project, else
+    its `branch` a lane's) shows when that lane is the orch's own or unowned now; any other shows."""
     if not view or e.get("event") in PROJECT_EVENTS:
         return True
     owner = text_or_none(e.get("orch"))
     if owner:
         # The owner at the time of the event (record() puts it there; a rename's old name goes to the orch that has
-        # it now): the event goes to that orch only, wherever the lane went since.
-        return (view.get("aliases") or {}).get(owner, owner) == view.get("name")
+        # it now): the event goes to that orch, wherever the lane went since; an adopt also to the old owner.
+        names = view.get("aliases") or {}
+        return view.get("name") in [names.get(n, n) for n in (owner, adopt_old_owner(e)) if n]
     mine = (None, view.get("name"))
     for path in (e.get("lane"), e.get("cwd")):
         hit, owner = under_lane(path, view.get("lanes") or {})

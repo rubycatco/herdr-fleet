@@ -3506,11 +3506,17 @@ class DocsTests(FleetTestCase):
         self.assertNotIn("neither `git worktree remove` nor", cleanup)
         # Round 2: files only under the owner lock, the carried project, spawn and the mark, the design items.
         for text in ("read and write files only", "when git cannot tell the project", "`spawn` starts no agent in it",
-                     "removing the `removing` key from it clears the mark", "the adopt event does not reach A's digest",
+                     "removing the `removing` key from it clears the mark",
                      "the released orch's lanes and their events go to none of them", "when one orch remains",
                      "A release also drops the names"):
             self.assertIn(text, readme)
         self.assertIn("a running cleanup is removing, owned or not", skill)
+        # Ruling 7, D1: the adopt reaches the old owner too.
+        for doc in (readme, skill):
+            self.assertIn("an `adopt` also goes to the orch that lost the lane" if doc is skill else
+                          "goes to both: to B (its `orch`) and to A (its `old`)", doc)
+        self.assertNotIn("the adopt event does not reach A's digest", readme)
+        self.assertIn("an `adopt` that took a lane from it", readme)
         for text in ("git cannot tell the project of <path>; the worktree stays", "Remove the `removing` key"):
             self.assertIn(text, cleanup)
         self.assertIn("remove the `removing` key from", fleet.removal_refusal("<path>", 1, "adopt"))
@@ -4531,7 +4537,7 @@ class OrchTests(FleetTestCase):
         # Billing consumes first; then the lane moves to billing; then default consumes.
         self.assertNotIn("one", self.texts(lanes.values(), "w2:p1"))
         self.adopt(lanes.values(), a, "--other-orch", pane="w2:p1")
-        self.assertEqual(self.texts(lanes.values(), "w1:p1"), ["one"])  # not lost
+        self.assertEqual(self.texts(lanes.values(), "w1:p1"), ["one", "adopt"])  # not lost; and the adopt (D1)
         self.assertEqual(self.texts(lanes.values(), "w2:p1"), [])
         # The other order: billing (the owner now) consumes first, the lane moves back, default consumes.
         fleet.record("send", a, pane="w5:p1", cwd=a, branch="feat/a", text="two")
@@ -4541,6 +4547,44 @@ class OrchTests(FleetTestCase):
         self.assertNotIn("two", self.texts(lanes.values(), "w1:p1"))  # not twice
         self.assertEqual([(e["orch"], e["old"]) for e in self.events("adopt")], [("billing", "default"),
                                                                                   ("default", "billing")])
+
+    def test_the_old_owner_sees_the_adopt(self):
+        """Ruling 7, D1: an adopt goes to the orch in its `orch` field and to the one in its `old` field, through the
+        aliases, in the digest (not to the pane that ran it) and in `log --orch`; the lane is the new orch's after
+        it."""
+        self.old_owner_sees_the_adopt(rename=False)
+
+    def test_the_old_owner_sees_the_adopt_after_its_rename(self):
+        """D1 again, with the old owner renamed after the adopt and before its digest: the event reaches it under its
+        new name."""
+        self.old_owner_sees_the_adopt(rename=True)
+
+    def old_owner_sees_the_adopt(self, rename):
+        lanes = self.two_orchs()
+        a = str(lanes["a"])
+        for pane in ("w1:p1", "w2:p1"):
+            self.texts(lanes.values(), pane)
+        self.adopt(lanes.values(), a, "--other-orch", pane="w2:p1")
+        [adopt] = self.events("adopt")
+        self.assertEqual((adopt["orch"], adopt["old"]), ("billing", "default"))
+        if rename:
+            with mock.patch.object(fleet, "project_lane_stubs", return_value=[]), \
+                    mock.patch.object(fleet, "require_herdr"):
+                self.assertEqual(self.main("orch", "rename", "default", "alpha", pane="w1:p1")[0], 0)
+        old = "alpha" if rename else "default"
+        shown = self.texts(lanes.values(), "w1:p1")
+        self.assertEqual(shown.count("adopt"), 1, shown)  # once, to the orch that lost the lane
+        self.assertEqual(self.texts(lanes.values(), "w1:p1"), [])  # and not again
+        self.assertNotIn("adopt", self.texts(lanes.values(), "w2:p1"))  # B's own pane ran it
+        for name in (old, "billing"):
+            logged = json.loads(self.main("log", "--orch", name, "--event", "adopt", "--json")[1])
+            self.assertEqual([(e["orch"], e["old"]) for e in logged], [("billing", "default")], name)
+        # The lane is billing's after the adopt: a later event of it goes to billing only.
+        fleet.record("send", a, pane="w5:p1", cwd=a, branch="feat/a", text="after")
+        self.assertEqual(self.texts(lanes.values(), "w1:p1"), [])
+        self.assertEqual(self.texts(lanes.values(), "w2:p1"), ["after"])
+        logged = json.loads(self.main("log", "--orch", old, "--event", "send", "--json")[1])
+        self.assertNotIn("after", [e.get("text") for e in logged])
 
     def test_a_removed_and_renamed_lane_keeps_its_events(self):
         """The events of a lane that cleanup removed stay with its orch (the critic's removed-lane-filter), also
