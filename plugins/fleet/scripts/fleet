@@ -1429,6 +1429,10 @@ def record(event: str, where: str | None, by: bool = True, home: Path | None = N
         if home:
             entry["project"] = home.name
         entry.update((k, v) for k, v in fields.items() if v is not None and v != [])
+        if "orch" not in fields:
+            owner = event_lane_owner(fields.get("lane") or fields.get("cwd") or where)
+            if owner:
+                entry["orch"] = owner  # the owner at the time of the event: digest and log route by it
         if by and caller():
             entry["by"] = caller()
         d = (home or fleet_home()) / EVENTS_DIR
@@ -1454,6 +1458,21 @@ def record(event: str, where: str | None, by: bool = True, home: Path | None = N
         return str(path)
     except Exception:
         return None
+
+
+def event_lane_owner(path) -> str | None:
+    """The orch that owns the lane holding `path` now: the lane.json of the first directory at or above it that has
+    a `.git` (the top of its checkout). File reads only, no git, so record() and the hooks can afford it."""
+    if not isinstance(path, str) or not os.path.isabs(path):
+        return None
+    try:
+        d = Path(path)
+        for top in (d, *d.parents):
+            if (top / ".git").exists():
+                return lane_owner(str(top))
+    except OSError:
+        return None
+    return None
 
 
 def pane_lane_fields(info: dict) -> dict:
@@ -1849,14 +1868,38 @@ def find_transcript(agent: str | None, session: str, homes: dict[str, list[str]]
 OWNING_EVENTS = ("worktree", "adopt", "cleanup")  # events whose `orch` names the owner of their lane
 
 
-def orch_events(events: list[dict], name: str) -> list[dict]:
-    """The events that name orch `name`, and the events of its lanes: the lanes and branches of its worktree, adopt
-    and cleanup events. Reads the log only."""
-    paths = {e["lane"] for e in events if e.get("orch") == name and e.get("event") in OWNING_EVENTS and e.get("lane")}
-    branches = {e["branch"] for e in events
-                if e.get("orch") == name and e.get("event") in OWNING_EVENTS and e.get("branch")}
-    return [e for e in events if e.get("orch") == name or (
-        e.get("orch") is None and (e.get("branch") in branches or any(lane_matches(e, p) for p in paths)))]
+def owning_event(e: dict) -> bool:
+    """An event that sets the owner of its lane: worktree, adopt, cleanup, and a spawn that adopted the lane."""
+    return e.get("event") in OWNING_EVENTS or (e.get("event") == "spawn" and bool(e.get("adopted")))
+
+
+def orch_events(events: list[dict], name: str, aliases: dict[str, dict[str, str]] | None = None,
+                shown: list[dict] | None = None) -> list[dict]:
+    """Of `shown` (default: `events`), the events of orch `name`. `events` is the whole log, oldest first: the owner
+    of each lane comes from it, before any other filter. An event that names its orch goes to that orch (through
+    `aliases`, by project: a rename's old name goes to the orch that has it now). An event without one goes to the
+    orch that owned its lane (by path, else by branch) at the time of the event, by the owning events before it.
+    Reads the log only."""
+    aliases = aliases or {}
+    owners: dict[tuple, str] = {}  # (project, "path" or "branch", value) -> owner, as the log goes
+    keep: set[int] = set()
+    for e in events:
+        names = aliases.get(e.get("project"), {})
+        owner = text_or_none(e.get("orch"))
+        owner = names.get(owner, owner) if owner else None
+        where = e.get("lane") or e.get("cwd")
+        if owner is None:
+            hits = [o for (proj, kind, v), o in owners.items() if proj == e.get("project") and kind == "path"
+                    and isinstance(where, str) and inside(where, v)]
+            owner = hits[-1] if hits else owners.get((e.get("project"), "branch", e.get("branch")))
+        if owner == name:
+            keep.add(id(e))
+        if owning_event(e) and text_or_none(e.get("orch")):
+            if isinstance(where, str):
+                owners[(e.get("project"), "path", where)] = owner
+            if e.get("branch"):
+                owners[(e.get("project"), "branch", e["branch"])] = owner
+    return [e for e in (events if shown is None else shown) if id(e) in keep]
 
 
 def log_dirs(args: argparse.Namespace) -> list[Path]:
@@ -1875,7 +1918,8 @@ def log_dirs(args: argparse.Namespace) -> list[Path]:
 
 
 def cmd_log(args: argparse.Namespace) -> int:
-    events = read_events(log_dirs(args))
+    dirs = log_dirs(args)
+    events = whole = read_events(dirs)
     if args.since:
         since = parse_since(args.since)
         events = [e for e in events if event_time(e) >= since]
@@ -1884,8 +1928,9 @@ def cmd_log(args: argparse.Namespace) -> int:
         events = [e for e in events if e.get("event") in kinds]
     if args.lane:
         events = lane_events(events, args.lane)
-    if args.orch:
-        events = orch_events(events, args.orch)
+    if args.orch:  # the owners come from the whole log, before --since, --event and --lane cut it
+        aliases = {d.name: orch_aliases(read_orchs(d)) for d in dirs if (d / ORCH_FILE).exists()}
+        events = orch_events(whole, args.orch, aliases, shown=events)
     if args.pane:
         events = [e for e in events if pane_matches(e, args.pane)]
     if args.sessions:
@@ -3781,7 +3826,7 @@ def orch_view(home: Path, name: str | None = None, all_lanes: bool = False) -> d
     orchs, is2 = orch_registry(home)
     name, rec = current_orch(home, name, orchs)
     several = len(orchs) > 1
-    return {"name": name, "record": rec, "orchs": orchs, "is2": is2, "several": several,
+    return {"name": name, "record": rec, "orchs": orchs, "is2": is2, "several": several, "aliases": orch_aliases(orchs),
             "filtered": several and name is not None and not all_lanes,
             "all": all_lanes or (several and name is None), "files": orch_files(home, name, is2)}
 
@@ -4097,6 +4142,30 @@ def orch_title(home: Path, name: str, is2: bool = True) -> str:
     return f"orch {name} of project {home.name}" if is2 else f"the orch of project {home.name}"
 
 
+def as_list(value) -> list:
+    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+
+def orch_aliases(orchs: dict[str, dict]) -> dict[str, str]:
+    """Each name that an event can carry in its `orch` field, to the orch that has it now: every orch's own name,
+    and the names it had before a rename (its record's `former`). A current name wins over a former one."""
+    aliases = {old: n for n, r in orchs.items() for old in as_list(r.get("former"))}
+    aliases.update({n: n for n in orchs})
+    return aliases
+
+
+def former_owner(orchs: dict[str, dict], name: str) -> str | None:
+    """The orch that had `name` before a rename, if any (and does not have it now)."""
+    if name in orchs:
+        return None
+    return next((n for n, r in sorted(orchs.items()) if name in as_list(r.get("former"))), None)
+
+
+def former_refusal(home: Path, owner: str, name: str) -> str:
+    return (f"orch {owner} of project {home.name} was called {name} before, and its events name it so: pick another "
+            f"name, or `fleet orch rename {owner} {name}`")
+
+
 def orch_out(home: Path, name: str | None = None, is2: bool | None = None) -> dict:
     files = orch_files(home, name, is2)
     out = {"project": home.name, "home": str(home), "project_md": str(home / PROJECT_MD), "board": str(files["board"])}
@@ -4238,6 +4307,9 @@ def cmd_orch(args: argparse.Namespace) -> int:
                 return refuse(orch=orchs[held], refused=f"pane {pane} is already {orch_title(home, held)}; a pane is "
                                                         "the orch of one theme: `fleet orch release` first, or "
                                                         f"`fleet orch rename {held} {name}`")
+            former = former_owner(orchs, name)
+            if former:
+                return refuse(refused=former_refusal(home, former, name))
             current = orchs.get(name, {})
             old = current.get("pane") if isinstance(current.get("pane"), str) else None
             handoff = bool(args.replace and me and me == old)
@@ -4258,6 +4330,8 @@ def cmd_orch(args: argparse.Namespace) -> int:
                    "session": os.environ.get("CLAUDE_CODE_SESSION_ID") if pane == me else None,
                    "claimed_at": now_iso()}
             rec = {k: v for k, v in rec.items() if v}
+            if current.get("former"):
+                rec["former"] = current["former"]  # the names that the orch had before: its old events use them
             root_owner = DEFAULT_ORCH if DEFAULT_ORCH in orchs else name
             switched = write_orchs(home, {**orchs, name: rec}, root_owner)
             project_md = home / PROJECT_MD
@@ -4286,12 +4360,18 @@ def cmd_orch(args: argparse.Namespace) -> int:
                 return refuse(refused=f"no orch {old_name!r} in project {home.name}")
             if new_name in orchs:
                 return refuse(refused=f"project {home.name} already has an orch {new_name!r}")
+            former = former_owner(orchs, new_name)
+            if former and former != old_name:
+                return refuse(refused=former_refusal(home, former, new_name))
             folder = home / ORCHS_DIR / new_name
             if folder.exists():
                 return refuse(refused=f"{folder} exists (the files of an orch that was released); pick another name")
             if is2 and (home / ORCHS_DIR / old_name).exists():
                 os.replace(home / ORCHS_DIR / old_name, folder)
-            renamed = {(new_name if n == old_name else n): r for n, r in orchs.items()}
+            # The orch keeps its old names, so that the events that name one go to it (orch_aliases).
+            names = [n for n in [*as_list(orchs[old_name].get("former")), old_name] if n != new_name]
+            renamed = {(new_name if n == old_name else n): ({**r, "former": names} if n == old_name else r)
+                       for n, r in orchs.items()}
             switched = write_orchs(home, renamed, root_owner=new_name)
             lanes = []
             for s in stubs:
@@ -4387,11 +4467,17 @@ def under_lane(path, lanes: dict[str, str | None]) -> tuple[bool, str | None]:
 
 def view_shows(e: dict, view: dict | None) -> bool:
     """Whether an event belongs on the view of an orch (`view`: {name, lanes, branches}, None: every event). A
-    project-level event (PROJECT_EVENTS) goes to every orch. An event of a lane (its `lane` or `cwd` inside a lane
-    of the project, else its `branch` a lane's) shows when that lane is the orch's own or unowned; any other event
-    shows unless it names another orch."""
+    project-level event (PROJECT_EVENTS) goes to every orch. An event that names its orch (`orch`: the lane's owner
+    when it was recorded, or the orch of a claim, adopt, cleanup ...) goes to that orch, through its former names
+    too. An event without one (an unowned lane, a log of 0.8.x) of a lane (its `lane` or `cwd` inside a lane of the
+    project, else its `branch` a lane's) shows when that lane is the orch's own or unowned now; any other shows."""
     if not view or e.get("event") in PROJECT_EVENTS:
         return True
+    owner = text_or_none(e.get("orch"))
+    if owner:
+        # The owner at the time of the event (record() puts it there; a rename's old name goes to the orch that has
+        # it now): the event goes to that orch only, wherever the lane went since.
+        return (view.get("aliases") or {}).get(owner, owner) == view.get("name")
     mine = (None, view.get("name"))
     for path in (e.get("lane"), e.get("cwd")):
         hit, owner = under_lane(path, view.get("lanes") or {})
@@ -4446,6 +4532,19 @@ def event_line(e: dict) -> str:
     return clip(f"{clock(e)}  {e.get('event')}  {e.get('pane') or '-'}  {where}  {describe_event(e)}", 180)
 
 
+def view_changed(home: Path, view: dict) -> str | None:
+    """Why the board that `board` collected for `view` no longer fits the project, under the project lock before
+    it saves: the orchs or the shape of orch.json changed (a claim, a rename, a release: its file may have moved),
+    or a lane of the view has another owner now. None when it still fits. Reads files only."""
+    orchs, is2 = orch_registry(home)
+    if is2 != view["is2"] or sorted(orchs) != sorted(view["orchs"]):
+        return "the orchs of the project changed while the board was made; run `fleet board` again"
+    for path, owner in (view.get("lanes") or {}).items():
+        if lane_owner(path) != owner:
+            return f"the owner of lane {path} changed while the board was made; run `fleet board` again"
+    return None
+
+
 def board_head(home: Path, view: dict, records: list) -> str:
     who = (" (every orch's lanes)" if view["all"] and view["several"] else " (every lane)" if view["all"]
            else f", orch {view['name']}" if view["several"] else "")
@@ -4459,17 +4558,22 @@ def cmd_board(args: argparse.Namespace) -> int:
     made = precise_now()
     cursor, base, _ = digest_base(files["digest"])
     records = make_board(home, cursor, {p: b.get("lane") for p, b in base.items() if b.get("lane")}, view)
-    saved = False
+    saved, stale = False, None
     if not view["all"]:
         with project_lock(home):
-            saved = save_board(home, records, made, files["board"])
+            stale = view_changed(home, view)
+            if not stale:
+                saved = save_board(home, records, made, files["board"])
     research = open_research(home)
     if args.json:
         print(json.dumps({"project": home.name, "orch": view["name"], "all": view["all"],
                           "board": str(files["board"]) if not view["all"] else None, "saved": saved,
+                          **({"stale": stale} if stale else {}),
                           "lanes": records, "research": research}, indent=2, ensure_ascii=False))
         return 0
-    print(board_head(home, view, records) + ("" if saved or view["all"] else " (board.json holds a newer board)"))
+    print(board_head(home, view, records) + ("" if saved or view["all"] else
+                                             f" (not saved: {stale})" if stale else
+                                             " (board.json holds a newer board)"))
     print("\n".join(board_lines(records, owners=view["several"], column=view["all"])))
     if research:
         print(f"\nOpen research ({len(research)}, no RESEARCH DONE line yet):")

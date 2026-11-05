@@ -1873,6 +1873,15 @@ class ProjectLogTests(FleetTestCase):
         self.assertEqual((e["event"], e["pane"], e["role"], e["session"], e["transcript"], e["source"], e["branch"]),
                          ("session_start", "w2:p1", "impl", "s-1", "/t/s-1.jsonl", "startup", "main"))
         self.assertNotIn("by", e)
+        self.assertNotIn("orch", e)  # no lane.json: no owner
+        # A lane's owner at the time goes into the record (a file read: no git, within the hook's time).
+        fleet.write_json(self.repo / ".fleet" / "lane.json", {"orch": "billing"})
+        with patient_fleet.record_git_limits() as calls:
+            sub = str(self.repo / "sub")
+            os.makedirs(sub, exist_ok=True)
+            e = self.last_event(fleet.hook_session_event("session_start", {**data, "cwd": sub}, env))
+        self.assertEqual(e["orch"], "billing")
+        self.assertEqual(len(calls), 3)  # the identity (2) and the branch (1), as before: none for the owner
         # The hook command: SessionEnd prints nothing; SessionStart after startup prints no context.
         for event, payload in (("session-end", {"session_id": "s-1", "reason": "prompt_input_exit"}),
                                ("session-start", {"session_id": "s-2", "source": "startup"})):
@@ -1884,6 +1893,7 @@ class ProjectLogTests(FleetTestCase):
         self.assertEqual([(e["event"], e["session"]) for e in events[-2:]],
                          [("session_end", "s-1"), ("session_start", "s-2")])
         self.assertEqual(events[-2]["reason"], "prompt_input_exit")
+        self.assertEqual([e.get("orch") for e in events[-2:]], ["billing", "billing"])
         # Fields of the wrong type are not recorded.
         bad = {"session_id": {"a": 1}, "source": ["x"], "cwd": str(self.repo), "transcript_path": 7, "model": {"id": "m"}}
         e = self.last_event(fleet.hook_session_event("session_start", bad, env))
@@ -3323,6 +3333,14 @@ class DocsTests(FleetTestCase):
         for text in ("git removed the worktree", "only when you open a second orch", "the same on disk"):
             self.assertNotIn(text, readme)
         self.assertIn("by_hand", cleanup)
+        # Round 1: events go to the owner at their time; former names; the board's check; the owner lock.
+        for doc in (readme, skill):
+            self.assertIn("owned the lane when the event was recorded" if doc is skill else
+                          "owned its lane when it was recorded", doc)
+            self.assertIn("keeps the old name", doc)
+        for text in ("A board is saved only when", "one step under the project lock",
+                     "marks the lane in `lane.json` while it removes it"):
+            self.assertIn(text, readme)
         self.assertNotIn("neither `git worktree remove` nor", cleanup)
         # The rule for a checkout that several orchestrators share, in the README and the fleet skill's rules.
         rules = skill.split("## Rules", 1)[1]
@@ -4314,6 +4332,134 @@ class OrchTests(FleetTestCase):
                          [("orch_claim", None), ("worktree", None), ("send", "to a"), ("follow_up_taken", "x")])
         self.assertEqual([e["event"] for e in json.loads(self.main("log", "--orch", "billing", "--json")[1])],
                          ["orch_claim", "worktree", "send"])
+
+    def adopt(self, lanes, *argv, pane):
+        """`fleet adopt` with herdr's lanes stubbed (`lanes`, open workspaces)."""
+        stubs = [{"workspace": f"w{i}", "label": None, "path": str(p), "panes": []} for i, p in enumerate(lanes, 5)]
+        with mock.patch.object(fleet, "enumerate_lanes", return_value=(stubs, [])), \
+                mock.patch.object(fleet, "require_herdr"):
+            code, out = self.main("adopt", *argv, pane=pane)
+        self.assertEqual(code, 0, out)
+
+    def texts(self, lanes, pane):
+        """The texts of the events of a consuming digest from `pane` (one entry per event shown)."""
+        data = json.loads(self.views(lanes, "digest", "--json", pane=pane)[1])
+        return [e.get("text") or e["event"] for e in data["events"]]
+
+    def test_an_event_goes_to_the_owner_of_its_time(self):
+        """A lane event names the lane's owner when it is recorded; the digest gives it to that orch only, once,
+        whichever orch consumes first and wherever the lane goes since (the critic's transfer-lost and
+        transfer-duplicated sequences)."""
+        lanes = self.two_orchs()
+        a = str(lanes["a"])
+        for pane in ("w1:p1", "w2:p1"):
+            self.texts(lanes.values(), pane)  # both cursors after the setup
+        fleet.record("send", a, pane="w5:p1", cwd=a, branch="feat/a", text="one")
+        self.assertEqual(self.events("send")[-1]["orch"], "default")
+        # Billing consumes first; then the lane moves to billing; then default consumes.
+        self.assertNotIn("one", self.texts(lanes.values(), "w2:p1"))
+        self.adopt(lanes.values(), a, "--other-orch", pane="w2:p1")
+        self.assertEqual(self.texts(lanes.values(), "w1:p1"), ["one"])  # not lost
+        self.assertEqual(self.texts(lanes.values(), "w2:p1"), [])
+        # The other order: billing (the owner now) consumes first, the lane moves back, default consumes.
+        fleet.record("send", a, pane="w5:p1", cwd=a, branch="feat/a", text="two")
+        self.assertEqual(self.events("send")[-1]["orch"], "billing")
+        self.assertEqual(self.texts(lanes.values(), "w2:p1"), ["two"])
+        self.adopt(lanes.values(), a, "--other-orch", pane="w1:p1")
+        self.assertNotIn("two", self.texts(lanes.values(), "w1:p1"))  # not twice
+        self.assertEqual([(e["orch"], e["old"]) for e in self.events("adopt")], [("billing", "default"),
+                                                                                  ("default", "billing")])
+
+    def test_a_removed_and_renamed_lane_keeps_its_events(self):
+        """The events of a lane that cleanup removed stay with its orch (the critic's removed-lane-filter), also
+        after that orch is renamed before it consumes them (rename-pending-cleanup)."""
+        lanes = self.two_orchs()
+        for pane in ("w1:p1", "w2:p1"):
+            self.texts(lanes.values(), pane)
+        b = str(lanes["b"])
+        fleet.record("send", b, pane="w6:p1", cwd=b, branch="feat/b", text="b work")
+        git("worktree", "remove", "--force", b, cwd=self.repo)
+        fleet.record("cleanup", str(self.repo), lane=b, branch="feat/b", orch="billing", removed=True, ok=True)
+        rest = [lanes["a"], lanes["c"]]
+        self.assertEqual(self.texts(rest, "w1:p1"), [])  # default never sees billing's removed lane
+        with mock.patch.object(fleet, "project_lane_stubs", return_value=[]), mock.patch.object(fleet, "require_herdr"):
+            self.assertEqual(self.main("orch", "rename", "billing", "money", pane="w2:p1")[0], 0)
+        self.assertEqual(fleet.read_orchs(self.project)["money"]["former"], ["billing"])
+        self.assertEqual(self.texts(rest, "w2:p1"), ["b work", "cleanup"])  # the old name goes to money
+        self.assertEqual(self.texts(rest, "w1:p1"), ["orch_rename"])  # a project event: every orch sees it
+
+    def test_a_former_name_stays_with_its_orch(self):
+        """A rename keeps the old name in the record (and through a re-claim or a handoff): another orch cannot
+        claim it, nor be renamed to it; the orch itself can take it back."""
+        self.main("orch", "claim", pane="w1:p1")
+        with mock.patch.object(fleet, "project_lane_stubs", return_value=[]), mock.patch.object(fleet, "require_herdr"):
+            rename = lambda *names, pane="w1:p1": self.main("orch", "rename", *names, pane=pane)
+            self.assertEqual(rename("default", "money")[0], 0)
+            self.main("orch", "claim", "--name", "docs", pane="w2:p1")
+            out = json.loads(self.main("orch", "claim", "--name", "default", pane="w3:p1")[1])
+            self.assertEqual(out["refused"], "orch money of project app was called default before, and its events "
+                                             "name it so: pick another name, or `fleet orch rename money default`")
+            self.assertIn("was called default before", json.loads(rename("docs", "default")[1])["refused"])
+            self.main("orch", "claim", pane="w1:p1", CLAUDE_CODE_SESSION_ID="s2")  # a re-claim keeps the names
+            self.assertEqual(fleet.read_orchs(self.project)["money"]["former"], ["default"])
+            self.assertEqual(rename("money", "cash")[0], 0)
+            self.assertEqual(fleet.read_orchs(self.project)["cash"]["former"], ["default", "money"])
+            self.assertEqual(fleet.orch_aliases(fleet.read_orchs(self.project)),
+                             {"default": "cash", "money": "cash", "cash": "cash", "docs": "docs"})
+            self.assertEqual(rename("cash", "default")[0], 0)  # its own old name
+            self.assertEqual(fleet.read_orchs(self.project)["default"]["former"], ["money", "cash"])
+
+    def test_log_by_orch_takes_the_owners_from_the_whole_log(self):
+        """`log --orch` finds the owner of each lane from the whole log, before --event and --since cut it, at the
+        time of each event; a first spawn that adopted counts (the critic's log-kind-filter and log-spawn-owner).
+        The events here carry no `orch`, as a log of 0.8.x or an unowned lane's."""
+        self.two_orchs()
+        one, two = str(self.root / "one"), str(self.root / "two")
+        raw = [("2021-01-01", {"event": "worktree", "lane": one, "branch": "feat/one", "orch": "default"}),
+               ("2021-01-02", {"event": "send", "cwd": one, "text": "one, default's"}),
+               ("2021-01-03", {"event": "spawn", "cwd": two, "orch": "billing", "adopted": "billing"}),
+               ("2021-01-04", {"event": "send", "cwd": two, "text": "two, billing's"}),
+               ("2021-01-05", {"event": "adopt", "lane": one, "orch": "billing", "old": "default"}),
+               ("2021-01-06", {"event": "send", "cwd": one, "text": "one, billing's"})]
+        with open(self.log_file(), "a") as fh:
+            for day, e in raw:
+                fh.write(json.dumps({"ts": f"{day}T00:00:00+00:00", "project": "app", **e}) + "\n")
+        log = lambda *argv: [e.get("text") for e in json.loads(self.main("log", *argv, "--json")[1])]
+        self.assertEqual(log("--orch", "default", "--event", "send"), ["one, default's"])
+        self.assertEqual(log("--orch", "billing", "--event", "send"), ["two, billing's", "one, billing's"])
+        self.assertEqual(log("--orch", "billing", "--event", "send", "--since", "2021-01-05"), ["one, billing's"])
+        self.assertEqual(log("--orch", "default", "--since", "2021-01-02", "--event", "send"), ["one, default's"])
+
+    def test_a_board_of_a_view_that_changed_is_not_saved(self):
+        """`board` checks under the lock, before it saves, that the registry and the owners of its lanes are still
+        the ones it collected for (the critic's board-switch-race): a switch to format 2, or a lane that changed
+        hands, while it collected, saves nothing."""
+        self.main("orch", "claim", pane="w1:p1")
+        real = fleet.make_board
+
+        def then(change):
+            def make_board(*args, **kwargs):
+                records = real(*args, **kwargs)
+                change()
+                return records
+            return mock.patch.object(fleet, "make_board", side_effect=make_board)
+        second = lambda: self.main("orch", "claim", "--name", "billing", pane="w2:p1")
+        with then(second):
+            code, out, _ = self.views([], "board", "--json", pane="w1:p1")
+        data = json.loads(out)
+        self.assertEqual((code, data["saved"], data["stale"]), (0, False, "the orchs of the project changed while the "
+                                                                          "board was made; run `fleet board` again"))
+        self.assertFalse((self.project / "board.json").exists())  # no root board recreated after the switch
+        self.assertFalse((self.project / "orchs" / "default" / "board.json").exists())
+        lanes = {n: self.add_lane(n) for n in "ab"}
+        fleet.write_json(lanes["a"] / ".fleet" / "lane.json", {"orch": "default"})
+        moved = lambda: fleet.write_json(lanes["a"] / ".fleet" / "lane.json", {"orch": "billing"})
+        with then(moved):
+            code, out, _ = self.views(lanes.values(), "board", pane="w1:p1")
+        self.assertIn(f"(not saved: the owner of lane {lanes['a']} changed while the board was made", out)
+        self.assertFalse((self.project / "orchs" / "default" / "board.json").exists())
+        code, out, _ = self.views(lanes.values(), "board", "--json", pane="w1:p1")
+        self.assertTrue(json.loads(out)["saved"])
 
     def test_rebrief_count_follows_the_view(self):
         """The re-brief of an orch of a project with two orchs reads its own files and counts the events of its view,
