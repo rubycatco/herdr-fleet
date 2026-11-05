@@ -1626,6 +1626,7 @@ class OwnerRaceTests(FleetTestCase):
     function until the test lets it go, so the order is set by files, never by timing; every wait is bounded."""
 
     def setUp(self):
+        self.children = []
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(os.path.realpath(self.tmp.name))
@@ -1659,10 +1660,22 @@ class OwnerRaceTests(FleetTestCase):
             env["PATIENT_PAUSE"] = pause
         if call:
             env["PATIENT_CALL"], env["PATIENT_ARGS"] = call[0], json.dumps(call[1])
-        return subprocess.Popen([*HELPER, *argv], cwd=self.repo, env=env, stdout=subprocess.PIPE,
+        proc = subprocess.Popen([*HELPER, *argv], cwd=self.repo, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True)
+        self.children.append(proc)
+        self.addCleanup(self.end_child, proc)
+        return proc
+
+    def end_child(self, proc):
+        """After the test: a child that still runs (a failed test left it paused) is killed, not left behind."""
+        if proc in self.children:
+            self.children.remove(proc)
+            if proc.poll() is None:
+                proc.kill()
+            proc.communicate()
 
     def done(self, proc):
+        self.children.remove(proc)
         out, err = proc.communicate(timeout=CHILD_LIMIT)
         return proc.returncode, (json.loads(out) if out.strip() else None), err
 
@@ -1670,8 +1683,15 @@ class OwnerRaceTests(FleetTestCase):
         return (self.sync / name).exists()
 
     def wait_until(self, cond, what):
+        """Wait until `cond`; fail at once when a child ended before it (it can no longer come true), and after
+        CHILD_LIMIT at the latest."""
         end = time.monotonic() + CHILD_LIMIT
         while not cond():
+            ended = [p for p in self.children if p.poll() is not None]
+            if ended and not cond():
+                self.children.remove(ended[0])
+                out, err = ended[0].communicate()
+                self.fail(f"a child ended before {what}: exit {ended[0].returncode}: {out.strip()} {err.strip()}")
             self.assertLess(time.monotonic(), end, f"waited for {what}")
             time.sleep(0.01)
 
