@@ -3506,8 +3506,9 @@ class DocsTests(FleetTestCase):
         self.assertNotIn("neither `git worktree remove` nor", cleanup)
         # Round 2: files only under the owner lock, the carried project, spawn and the mark, the design items.
         for text in ("read and write files only", "when git cannot tell the project", "`spawn` starts no agent in it",
-                     "removing the `removing` key from it clears the mark", "it reaches B's digest, not A's",
-                     "The lanes of a released orch", "a release also drops the names"):
+                     "removing the `removing` key from it clears the mark", "the adopt event does not reach A's digest",
+                     "the released orch's lanes and their events go to none of them", "when one orch remains",
+                     "A release also drops the names"):
             self.assertIn(text, readme)
         self.assertIn("a running cleanup is removing, owned or not", skill)
         for text in ("git cannot tell the project of <path>; the worktree stays", "Remove the `removing` key"):
