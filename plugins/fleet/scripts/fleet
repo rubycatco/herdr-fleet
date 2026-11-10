@@ -45,6 +45,7 @@ import itertools
 import json
 import os
 import re
+import selectors
 import shlex
 import shutil
 import stat
@@ -5834,6 +5835,198 @@ def project_hooks_report(cwd: str, homes: list[dict]) -> dict | None:
     return {"cwd": cwd, "files": [str(f["file"]) for f in files], "homes": rows}
 
 
+# `doctor --codex-hooks` asks the installed Codex which project hooks need its hooks review, through its app server
+# (JSON-RPC, one JSON object per line on stdio; the contract of Codex 0.164.0): `initialize` with a clientInfo, the
+# `initialized` notification, then `hooks/list` with the checkout as its one cwd. The answer lists each hook of every
+# layer that Codex loads there, `.codex/config.toml` hooks included, with its `source` and its `trustStatus`
+# (managed, untrusted, trusted or modified: edited since it was trusted). No login, no thread, no model request, and
+# no write to config.toml; `-c features.plugins=false` (an override on the command line, which an older Codex
+# ignores) skips the start-up plugin sync. The server ends when its stdin closes. A panic inside hooks/list comes back
+# as an error answer (-32603); a crash, a timeout or another shape gives "unknown" too.
+CODEX_HOOKS_TIMEOUT = 15  # seconds per Codex home: the hard limit of the whole exchange
+CODEX_HOOKS_EXIT_WAIT = 3  # seconds for the server to end after its stdin closed; then it is killed
+CODEX_HOOKS_OUTPUT_MAX = 8 * 1024 * 1024  # bytes of output that fleet reads at most
+CODEX_REVIEW_STATUSES = ("untrusted", "modified")  # the trust states that open Codex's hooks review
+
+
+def wait_readable(selector: selectors.BaseSelector, timeout: float) -> list:
+    """selector.select(timeout): the one wait of codex_hooks_list. The tests replace it to expire a wait."""
+    return selector.select(timeout)
+
+
+def codex_rpc_lines(codex: str, env: dict, cwd: str, requests: list, answer_id: int,
+                    timeout: float = CODEX_HOOKS_TIMEOUT) -> tuple:
+    """(the answer with id `answer_id`, the notifications before it, why there is none) of a `codex app-server` in
+    `cwd` with `env`, after the `requests` (JSON objects) on its stdin. Bounded: one deadline of `timeout` seconds
+    for the whole exchange, at most CODEX_HOOKS_OUTPUT_MAX bytes read. The process never outlives the call: stdin is
+    closed, and a server that has not ended CODEX_HOOKS_EXIT_WAIT seconds later is killed."""
+    cmd = [codex, "app-server", "-c", "features.plugins=false"]
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                                cwd=cwd)
+    except (OSError, ValueError) as e:
+        return None, [], f"codex could not start: {getattr(e, 'strerror', None) or e}"
+    notes: list = []
+    out, err, size = b"", b"", 0
+    selector = selectors.DefaultSelector()
+    try:
+        proc.stdin.write(b"".join(json.dumps(r).encode() + b"\n" for r in requests))
+        proc.stdin.flush()
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        selector.register(proc.stderr, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout
+        while True:
+            while b"\n" in out:
+                line, out = out.split(b"\n", 1)
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    return None, notes, f"codex app-server answered in another shape: {text_head(line.decode('utf-8', 'replace'), 80)!r}"
+                if not isinstance(msg, dict):
+                    return None, notes, "codex app-server answered in another shape: not a JSON object"
+                if msg.get("id") == answer_id:
+                    return msg, notes, None
+                if "id" in msg and "error" in msg:
+                    return None, notes, f"codex app-server refused request {msg.get('id')}: {text_head(json.dumps(msg['error']), 200)}"
+                if "method" in msg and "id" not in msg:
+                    notes.append(msg)
+            if not selector.get_map():
+                code = proc.wait(timeout=CODEX_HOOKS_EXIT_WAIT)
+                tail = text_head(err.decode("utf-8", "replace").strip()[-400:], 400)
+                return None, notes, f"codex app-server exited (code {code}) before it answered" + (
+                    f": {tail}" if tail else "")
+            left = deadline - time.monotonic()
+            events = wait_readable(selector, left) if left > 0 else []
+            if not events:
+                return None, notes, f"no answer within {timeout:g}s"
+            for key, _ in events:
+                chunk = os.read(key.fd, 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                size += len(chunk)
+                if size > CODEX_HOOKS_OUTPUT_MAX:
+                    return None, notes, f"codex app-server wrote more than {CODEX_HOOKS_OUTPUT_MAX} bytes"
+                if key.fileobj is proc.stdout:
+                    out += chunk
+                else:
+                    err = (err + chunk)[-8192:]
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        return None, notes, f"the exchange with codex app-server failed: {getattr(e, 'strerror', None) or e}"
+    finally:
+        selector.close()
+        for f in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                f.close()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=CODEX_HOOKS_EXIT_WAIT)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+def codex_listed_hook(h) -> bool:
+    """Whether a hooks/list hook has the fields that doctor reads, of the types of Codex 0.164.0."""
+    return (isinstance(h, dict) and all(isinstance(h.get(k), str) for k in ("key", "source", "trustStatus", "eventName"))
+            and json_opt_str(h.get("command")) and json_opt_str(h.get("sourcePath"))
+            and (h.get("enabled") is None or isinstance(h.get("enabled"), bool)))
+
+
+def codex_hooks_list(codex: str | None, env: dict, cwd: str) -> dict:
+    """What the installed Codex lists for the project hooks of `cwd` with `env` (its CODEX_HOME): {"status", "ok",
+    "review", "trusted", "listed", "warnings", "note", "unknown"}. status: "review" (hooks whose trustStatus is
+    untrusted or modified, in `review`), "ok" (every project hook trusted or managed), "none" (no project hook here),
+    "not_loaded" (Codex lists none although the checkout has a project hooks file, or Codex warned that project
+    hooks are disabled until the project is trusted: never "all trusted"), "unknown" (with the reason)."""
+    out = {"status": "unknown", "ok": None, "review": [], "trusted": 0, "listed": 0, "warnings": [], "note": None,
+           "unknown": None}
+    if not codex:
+        return {**out, "unknown": "codex is not installed"}
+    requests = [{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "fleet", "version": VERSION}}},
+                {"method": "initialized"},
+                {"id": 2, "method": "hooks/list", "params": {"cwds": [cwd]}}]
+    msg, notes, why = codex_rpc_lines(codex, env, cwd, requests, 2)
+    if why:
+        return {**out, "unknown": why}
+    if "error" in msg:
+        error = msg["error"]
+        text = error.get("message") if isinstance(error, dict) else None
+        return {**out, "unknown": f"codex answered hooks/list with an error: "
+                                  f"{text_head(text if isinstance(text, str) else json.dumps(error), 300)}"}
+    result = msg.get("result")
+    data = result.get("data") if isinstance(result, dict) else None
+    entries = [e for e in data if isinstance(e, dict)] if isinstance(data, list) else []
+    if not isinstance(data, list) or len(entries) != len(data) or len(entries) != 1:
+        return {**out, "unknown": "codex answered hooks/list in another shape"}
+    entry = entries[0]
+    hooks, errors, warnings = entry.get("hooks"), entry.get("errors"), entry.get("warnings")
+    if (not isinstance(hooks, list) or not isinstance(errors, list) or not isinstance(warnings, list)
+            or not all(codex_listed_hook(h) for h in hooks)):
+        return {**out, "unknown": "codex answered hooks/list in another shape"}
+    if errors:
+        said = "; ".join(f"{e.get('path')}: {e.get('message')}" if isinstance(e, dict) else str(e) for e in errors)
+        return {**out, "unknown": f"codex could not read the hooks here: {text_head(said, 300)}"}
+    project = [h for h in hooks if h["source"] == "project"]
+    review = [{"key": h["key"], "status": h["trustStatus"], "event": h["eventName"],
+               "command": h.get("command") or "", "file": h.get("sourcePath") or h["key"].rsplit(":", 3)[0],
+               "enabled": h.get("enabled")}
+              for h in project if h["trustStatus"] in CODEX_REVIEW_STATUSES]
+    out.update(review=review, listed=len(project), warnings=[text_head(str(w), 300) for w in warnings],
+               trusted=sum(1 for h in project if h["trustStatus"] in ("trusted", "managed")))
+    if review:
+        return {**out, "status": "review", "ok": False}
+    if project:
+        return {**out, "status": "ok", "ok": True}
+    config_warnings = [n.get("params", {}).get("summary") for n in notes
+                       if n.get("method") == "configWarning" and isinstance(n.get("params"), dict)]
+    config_warnings = [first_line(w) for w in config_warnings if isinstance(w, str) and w.strip()]
+    files = [str(f["file"]) for f in project_hook_files(cwd)]
+    if config_warnings or files:
+        note = ("Codex lists no project hook here" + (f" although the checkout has {', '.join(files)}" if files else "")
+                + (f"; it warned: {text_head(config_warnings[0], 300)}" if config_warnings else
+                   ": the project is probably not trusted in this home, and Codex loads no project hooks until it is"))
+        return {**out, "status": "not_loaded", "note": note}
+    return {**out, "status": "none", "ok": True}
+
+
+def codex_hooks_report(cwd: str, homes: list, env: dict) -> dict:
+    """doctor --codex-hooks: codex_hooks_list per Codex home that a lane can use, in place of fleet's own reading
+    (project_hooks_report). Starts one `codex app-server` per home, each bounded by CODEX_HOOKS_TIMEOUT."""
+    codex = shutil.which("codex")
+    try:
+        here = os.path.realpath(cwd)
+    except (OSError, ValueError):
+        here = cwd
+    rows = []
+    codex_homes = [h for h in homes if h["agent"] == "codex"] or [
+        {"agent": "codex", "account": None, "home": env.get("CODEX_HOME") or "default"}]  # plain mode, no codex
+    for h in codex_homes:
+        row = {**h, **codex_hooks_list(codex, config_env("codex", h["home"], env), here)}
+        files = sorted({r["file"] for r in row["review"]})
+        row["fix"] = (hook_trust_fix([{"checkout": str(Path(f).parent.parent)} for f in files], h.get("account"),
+                                     h["home"]) if row["review"] else None)
+        rows.append(row)
+    return {"cwd": here, "codex": codex, "homes": rows}
+
+
+def codex_hooks_line(row: dict) -> str:
+    """The doctor text of one codex_hooks_report row."""
+    status = row["status"]
+    if status == "unknown":
+        return f"unknown: {row['unknown']}"
+    if status == "not_loaded":
+        return f"no project hooks loaded: {row['note']}"
+    if status == "none":
+        return "no project hooks"
+    if status == "ok":
+        return f"all {row['listed']} project hook(s) trusted"
+    names = ", ".join(f"{h['event']} {text_head(h['command'], 40)!r} in {h['file']} ({h['status']})"
+                      for h in row["review"])
+    return f"{len(row['review'])} need review: {names}  fix: {row['fix']}"
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     herdr_bin = shutil.which("herdr")
     remuda = remuda_path()
@@ -5871,7 +6064,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                   **agent_defaults("codex", codex_home),
                   "models": codex_models(codex_home) if installed["codex"] else []},
         "hooks": hook_report(herdr_bin, homes, env) if herdr_bin else [],
-        "project_hooks": project_hooks_report(os.getcwd(), homes),
+        **({"codex_hooks": codex_hooks_report(os.getcwd(), homes, env)} if args.codex_hooks else
+           {"project_hooks": project_hooks_report(os.getcwd(), homes)}),
         "git": shutil.which("git"),
         "conventions": {"path": str(conv), "exists": conv.is_file()},
         "home": {"path": str(fleet_home()), "projects": [p.name for p in project_dirs()]},
@@ -5901,7 +6095,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         who = h["account"] or f"{h['agent']} ({h['home']})"
         state = h["status"] or "unknown"
         show("herdr hooks" if i == 0 else "", f"{who:<16} {state}" + ("" if h["ok"] else f"  fix: {h['fix']}"))
-    project = report["project_hooks"]
+    asked = report.get("codex_hooks")
+    if asked is not None:
+        show("codex hooks", f"as the installed Codex lists them for {asked['cwd']} (doctor --codex-hooks)")
+        for h in asked["homes"]:
+            who = h["account"] or f"codex ({h['home']})"
+            show("", f"{who:<16} {codex_hooks_line(h)}")
+    project = report.get("project_hooks")
     if project:
         show("codex hooks", f"{', '.join(project['files'])} (this checkout's Codex project hooks)")
         for h in project["homes"]:
@@ -6893,6 +7093,12 @@ def build_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("doctor", help="check the environment; in a checkout, the Codex project hooks that each Codex "
                                       "account has not trusted")
     d.add_argument("--json", action="store_true")
+    d.add_argument("--codex-hooks", action="store_true",
+                   help="ask the installed Codex (codex app-server, hooks/list; one process per Codex home, at most "
+                        f"{CODEX_HOOKS_TIMEOUT}s each) which project hooks of this checkout are untrusted or modified, "
+                        ".codex/config.toml hooks included, in place of fleet's own reading (JSON: codex_hooks "
+                        "instead of project_hooks). It writes no config.toml, answers no dialog and starts no "
+                        "thread; a missing codex, a timeout, a crash or an answer of another shape gives unknown")
     d.set_defaults(func=cmd_doctor)
 
     c = sub.add_parser("conventions", help="print the user's fleet conventions (or the plugin defaults)")

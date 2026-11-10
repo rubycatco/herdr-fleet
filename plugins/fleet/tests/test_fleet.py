@@ -913,6 +913,186 @@ class ProjectHookTrustTests(ProjectHookCase):
         self.assertNotIn("press t", self.doctor())
 
 
+# A stand-in for `codex app-server` (the JSON-RPC lines of Codex 0.164.0 on stdio): FAKE_CODEX_MODE picks the answer
+# to hooks/list, FAKE_CODEX_ANSWER names a JSON file with its result, and FAKE_CODEX_LOG gets one JSON line per start
+# (arguments, directory, CODEX_HOME). It reads stdin to its end, as the real server does, so it never outlives fleet.
+FAKE_CODEX = r'''
+import json, os, sys
+mode = os.environ.get("FAKE_CODEX_MODE", "answer")
+with open(os.environ["FAKE_CODEX_LOG"], "a") as log:
+    log.write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(), "home": os.environ.get("CODEX_HOME")}) + "\n")
+def send(msg):
+    sys.stdout.write(json.dumps(msg) + "\n")
+    sys.stdout.flush()
+if mode == "crash":
+    sys.stderr.write("thread 'main' panicked at hooks/src/engine/discovery.rs:888:9:\ninternal error\n")
+    sys.exit(101)
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("id") == 1:
+        send({"id": 1, "result": {"userAgent": "fake", "codexHome": os.environ.get("CODEX_HOME")}})
+        send({"method": "remoteControl/status/changed", "params": {"status": "disabled"}})
+        if os.environ.get("FAKE_CODEX_WARNING"):
+            send({"method": "configWarning", "params": {"summary": os.environ["FAKE_CODEX_WARNING"], "details": None}})
+    elif msg.get("id") == 2:
+        if mode == "answer":
+            with open(os.environ["FAKE_CODEX_ANSWER"]) as f:
+                send({"id": 2, "result": json.load(f)})
+        elif mode == "error":
+            send({"id": 2, "error": {"code": -32603, "message": "hook discovery task failed: task 296 panicked with "
+                                     "message \"internal error: entered unreachable code\""}})
+        elif mode == "shape":
+            send({"id": 2, "result": {"data": "not a list"}})
+        elif mode == "garbage":
+            sys.stdout.write("this is not json\n")
+            sys.stdout.flush()
+            sys.exit(0)
+        # "silent": no answer; the stdin loop ends when fleet closes it
+'''
+
+
+class CodexHooksDoctorTests(ProjectHookCase):
+    """doctor --codex-hooks asks a Codex (here a stand-in script) which project hooks need review, per Codex home;
+    every failure gives unknown with the reason. Without the flag, doctor starts no Codex process."""
+
+    def setUp(self):
+        super().setUp()
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.codex = self.bin / "codex"
+        self.codex.write_text(f"#!{sys.executable}\n{FAKE_CODEX}")
+        self.codex.chmod(0o755)
+        self.log = self.root / "codex-starts.jsonl"
+        self.answer = self.root / "answer.json"
+        self.config = 'model = "model-x"\n'
+        (self.home / "config.toml").write_text(self.config)
+
+    def hook(self, suffix, status, source="project", hooks_file=None, command="./hook.sh"):
+        key = self.key(suffix, hooks_file)
+        return {"key": key, "eventName": "sessionStart", "handlerType": "command", "command": command,
+                "async": False, "matcher": None, "timeoutSec": 600, "statusMessage": None,
+                "sourcePath": key.rsplit(":", 3)[0], "source": source, "pluginId": None, "displayOrder": 0,
+                "enabled": True, "isManaged": False, "currentHash": "sha256:x", "trustStatus": status}
+
+    def answer_with(self, hooks, errors=(), warnings=()):
+        self.answer.write_text(json.dumps({"data": [{"cwd": str(self.wt), "hooks": hooks, "errors": list(errors),
+                                                     "warnings": list(warnings)}]}))
+
+    def doctor(self, *argv, mode="answer", which=None, warning=None):
+        buf = io.StringIO()
+        env = {"FLEET_NO_REMUDA": "1", "CODEX_HOME": str(self.home), "FAKE_CODEX_MODE": mode,
+               "FAKE_CODEX_LOG": str(self.log), "FAKE_CODEX_ANSWER": str(self.answer)}
+        if warning:
+            env["FAKE_CODEX_WARNING"] = warning
+        paths = {"codex": str(self.codex)} if which is None else which
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(fleet.shutil, "which", side_effect=lambda name: paths.get(name)), \
+                mock.patch.object(fleet, "tool_version", return_value="codex-cli 0.0.0"), \
+                chdir(self.wt), redirect_stdout(buf):
+            self.assertEqual(fleet.main(["doctor", *argv]), 0)
+        return buf.getvalue()
+
+    def starts(self):
+        return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def row(self, *argv, **kw):
+        report = json.loads(self.doctor("--json", "--codex-hooks", *argv, **kw))
+        self.assertNotIn("project_hooks", report)  # in place of fleet's own reading
+        [row] = report["codex_hooks"]["homes"]
+        return row
+
+    def test_doctor_without_the_flag_starts_no_codex(self):
+        self.answer_with([])
+        with mock.patch.object(fleet.subprocess, "Popen", side_effect=AssertionError("a Codex process started")):
+            report = json.loads(self.doctor("--json"))
+            self.doctor()
+        self.assertEqual(self.starts(), [])
+        self.assertNotIn("codex_hooks", report)
+        self.assertIsNotNone(report["project_hooks"])  # fleet's own reading, unchanged
+
+    def test_codex_names_untrusted_and_modified_project_hooks(self):
+        nested = self.main / "sub" / ".codex" / "config.toml"
+        self.answer_with([self.hook("session_start:0:0", "trusted"), self.hook("stop:1:0", "modified"),
+                          self.hook("post_tool_use:0:1", "untrusted"),
+                          self.hook("pre_tool_use:0:0", "untrusted", hooks_file=nested),
+                          self.hook("session_start:0:0", "untrusted", source="user",
+                                    hooks_file=self.home / "hooks.json")])
+        row = self.row()
+        self.assertEqual((row["agent"], row["home"], row["status"], row["ok"], row["unknown"]),
+                         ("codex", str(self.home), "review", False, None))
+        self.assertEqual([(h["key"], h["status"]) for h in row["review"]],
+                         [(self.key("stop:1:0"), "modified"), (self.key("post_tool_use:0:1"), "untrusted"),
+                          (self.key("pre_tool_use:0:0", nested), "untrusted")])
+        self.assertEqual(row["trusted"], 1)
+        [start] = self.starts()
+        self.assertEqual((start["argv"][0], start["cwd"], start["home"]), ("app-server", str(self.wt), str(self.home)))
+        self.assertIn("features.plugins=false", start["argv"])
+        self.assertEqual((self.home / "config.toml").read_text(), self.config)  # nothing written
+        text = self.doctor("--codex-hooks")
+        self.assertIn("modified", text)
+        self.assertIn(str(nested), text)
+        self.assertIn("press t", text)
+        self.assertNotIn("this checkout's Codex project hooks)", text)  # fleet's own reading is not printed
+        # Every project hook trusted.
+        self.answer_with([self.hook("session_start:0:0", "trusted")])
+        row = self.row()
+        self.assertEqual((row["status"], row["ok"], row["review"], row["fix"]), ("ok", True, [], None))
+
+    def test_no_listed_project_hooks_is_never_all_trusted(self):
+        summary = ("Project-local config, hooks, and exec policies are disabled in the following folders until the "
+                   "project is trusted, but skills still load.\n    1. /x/.codex\n")
+        self.answer_with([])
+        row = self.row(warning=summary)
+        self.assertEqual((row["status"], row["ok"]), ("not_loaded", None))
+        self.assertIn("until the project is trusted", row["note"])
+        row = self.row()  # no warning, but the checkout has a project hooks file
+        self.assertEqual((row["status"], row["ok"]), ("not_loaded", None))
+        self.assertIn(str(self.hooks_file), row["note"])
+        self.assertNotIn("all trusted", self.doctor("--codex-hooks"))
+
+    def test_every_failure_is_unknown_with_the_reason(self):
+        self.answer_with([self.hook("stop:1:0", "untrusted")])
+        cases = {"error": "panicked", "crash": "exited", "shape": "another shape", "garbage": "another shape"}
+        for mode, why in cases.items():
+            row = self.row(mode=mode)
+            self.assertEqual((row["status"], row["ok"]), ("unknown", None), mode)
+            self.assertIn(why, row["unknown"], mode)
+            self.assertIn("unknown", self.doctor("--codex-hooks", mode=mode), mode)
+        self.assertIn("panicked at", self.row(mode="crash")["unknown"])  # the end of stderr
+        # The cwd's own errors.
+        self.answer_with([], errors=[{"path": str(self.hooks_file), "message": "invalid hooks.json"}])
+        row = self.row()
+        self.assertEqual(row["status"], "unknown")
+        self.assertIn("invalid hooks.json", row["unknown"])
+        # A missing binary.
+        row = self.row(which={})
+        self.assertEqual(row["status"], "unknown")
+        self.assertIn("not installed", row["unknown"])
+        # A timeout: the wait for output expires (injected; no real waiting).
+        self.answer_with([])
+        with mock.patch.object(fleet, "wait_readable", return_value=[]):
+            row = self.row(mode="silent")
+        self.assertEqual(row["status"], "unknown")
+        self.assertIn(f"no answer within {fleet.CODEX_HOOKS_TIMEOUT}s", row["unknown"])
+        # A binary that cannot start.
+        self.codex.chmod(0o644)
+        row = self.row()
+        self.assertEqual(row["status"], "unknown")
+        self.assertIn("could not start", row["unknown"])
+
+    def test_docs_and_help_name_codex_hooks(self):
+        parser = fleet.build_parser()
+        doctor = parser._subparsers._group_actions[0].choices["doctor"]
+        help_text = " ".join(doctor.format_help().split())
+        for text in ("--codex-hooks", "app-server", "hooks/list"):
+            self.assertIn(text, help_text)
+        readme = (SCRIPT.parent.parent.parent.parent / "README.md").read_text()
+        for text in ("doctor --codex-hooks", "`codex_hooks`", "modified"):
+            self.assertIn(text, readme)
+        skill = (SCRIPT.parent.parent / "skills" / "fleet" / "SKILL.md").read_text()
+        self.assertIn("--codex-hooks", skill)
+
+
 class SpawnFrictionTests(ProjectHookCase):
     """spawn warns before the agent starts, and names the cause when the start ends on the hooks review."""
 
