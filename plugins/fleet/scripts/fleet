@@ -6,9 +6,9 @@ lane uses the agent's own login (the caller's CLAUDE_CONFIG_DIR / CODEX_HOME
 when set) and there is no account switching.
 
 Commands:
-  fleet doctor [--json]                   check the environment (onboarding)
+  fleet doctor [--json]                   check the environment (onboarding), and this checkout's Codex hooks
   fleet conventions [--path]              the user's fleet conventions (or the plugin defaults)
-  fleet accounts [--live]                 remuda accounts and usage (cached unless --live)
+  fleet accounts [--live] [--json]        remuda accounts and usage (cached unless --live; stale at 24 h)
   fleet prep [DIR] [--handoff]            create <git top>/.fleet and keep it out of git
   fleet worktree BRANCH [--base REF]      herdr worktree + workspace for a lane, .fleet/ ready
   fleet spawn [options] [-- ARGS...]      open a pane and start an agent in it (an implementer waits for an
@@ -62,7 +62,7 @@ from pathlib import Path
 # interpreter and the compiling of this file come before it; HOOK_BEFORE_CLOCK allows for them.
 HOOK_STARTED = time.monotonic()
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 FLEET_DIR = ".fleet"
 LANE_FILES = ("BRIEF.md", "STATUS.md", "HANDOFF.md", "PLAN.md")
@@ -92,6 +92,9 @@ MENU_SELECTED = re.compile(r"^\s*[❯›>]\s*\d+\.\s+\S.*$", re.M)
 FULLSCREEN_PROMPT = re.compile(r"fullscreen renderer", re.I)
 CODEX_UPDATE_MENU = re.compile(r"Update now", re.I)
 CODEX_UPDATE_SKIP = re.compile(r"^\s*(?:[❯›>]\s*)?(?:\d+\.\s*)?Skip\b", re.I)
+# Codex's hooks review at the start ("Hooks need review"): new or changed hooks wait for the user's trust. Its
+# first option is `1. Review hooks`; a sentence that mentions the dialog is no menu line. fleet never answers it.
+HOOKS_REVIEW = re.compile(r"^\s*(?:[❯›>]\s*)?\d+\.\s+Review hooks\s*$", re.M)
 
 
 class FleetError(Exception):
@@ -260,6 +263,69 @@ def remuda_accounts(remuda: str) -> list[dict]:
     if cp.returncode != 0:
         raise FleetError(f"remuda list failed: {(cp.stderr or cp.stdout).strip()[:300]}")
     return parse_remuda_list(cp.stdout)
+
+
+# `remuda usage` prints a block per account: a header `<account>  cached <age> ago (<time>)`, `<account>  live ...`,
+# `<account>  cached (time unknown)` or `<account>  no cached usage (...)`, then indented rows. remuda floors the
+# age to whole seconds, minutes, hours or days, so `23h ago` is under a day and `1d ago` a day or more.
+USAGE_STALE_HOURS = 24  # a cached usage of this age or older is stale: an account choice by usage needs fresh numbers
+USAGE_TIMEOUT = 10  # seconds for spawn's read of one account's cached usage
+USAGE_HEADER = re.compile(r"^([A-Za-z0-9_.-]+:\S+)\s{2,}(.*)$")
+USAGE_AGE = re.compile(r"^cached (\d+)([smhd]) ago(?:\s+\((.*)\))?")
+AGE_UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def usage_stale(age_seconds: int | None) -> bool | None:
+    """Whether a cache of this age is stale: at USAGE_STALE_HOURS or older. None when the age is unknown."""
+    return None if age_seconds is None else age_seconds >= USAGE_STALE_HOURS * 3600
+
+
+def age_text(seconds: int) -> str:
+    for unit in ("d", "h", "m"):
+        if seconds >= AGE_UNIT[unit]:
+            return f"{seconds // AGE_UNIT[unit]}{unit}"
+    return f"{seconds}s"
+
+
+def parse_remuda_usage(text: str) -> dict:
+    """{account: {"source": "cached" | "live" | "none", "age_seconds", "at", "stale", "header", "rows"}} from the
+    output of `remuda usage`. `age_seconds` is remuda's floored age; `stale` is None when the age is unknown."""
+    usage: dict[str, dict] = {}
+    current = None
+    for line in (text or "").splitlines():
+        m = USAGE_HEADER.match(line.rstrip())
+        if m and not line[:1].isspace():
+            account, rest = m.group(1), m.group(2).strip()
+            age = USAGE_AGE.match(rest)
+            source = "live" if rest.startswith("live") else "cached" if rest.startswith("cached") else "none"
+            seconds = int(age.group(1)) * AGE_UNIT[age.group(2)] if age else None
+            current = usage[account] = {"source": source, "age_seconds": seconds,
+                                        "at": age.group(3) if age else None,
+                                        "stale": False if source == "live" else usage_stale(seconds),
+                                        "header": rest, "rows": []}
+        elif current is not None and line.strip():
+            current["rows"].append(line.strip())
+    return usage
+
+
+def usage_warning(remuda: str, account: str) -> str | None:
+    """A warning when the cached usage of `account` is stale or missing; None when it is fresh or remuda cannot
+    tell (an error never stops a spawn). Reads the cache only: a live query starts the agent (several seconds)."""
+    try:
+        cp = run([remuda, "usage", account], timeout=USAGE_TIMEOUT)
+    except FleetError:
+        return None
+    row = parse_remuda_usage(cp.stdout).get(account) if cp.returncode == 0 else None
+    if not row:
+        return None
+    refresh = f"`fleet accounts --live` (or `remuda usage --live {account}`) refreshes it"
+    if row["stale"]:
+        return (f"the cached usage of {account} is stale: {age_text(row['age_seconds'])} old (stale at "
+                f"{USAGE_STALE_HOURS}h). A choice of this account by remaining usage used old numbers; {refresh}")
+    if row["stale"] is None:
+        what = "no cached usage" if row["source"] == "none" else "cached usage of unknown age"
+        return f"{account} has {what}: a choice by remaining usage had no numbers to go by; {refresh}"
+    return None
 
 
 def resolve_account(account: str, agent: str | None, accounts: list[dict]) -> dict:
@@ -608,6 +674,10 @@ def wait_for_start(pane: str, agent: str, prompt: str | None, accept_trust: bool
             continue
         lines = pane_lines(pane, info.get("scroll", {}).get("viewport_rows"))
         tail = "\n".join(lines[-30:])
+        if agent == "codex" and status in ("blocked", "idle", "done") and HOOKS_REVIEW.search("\n".join(lines[-15:])):
+            # Trust in hooks is the user's decision: no key goes to this dialog, also with --accept-trust.
+            return {"ok": False, "status": "blocked", "dialog": "hooks_review", "notes": notes,
+                    "reason": hooks_review_reason(None, None, None)}
         # One answer only: after it, stale dialog text must never send keys
         # into a live composer.
         if (not trust_answered and status in ("blocked", "idle")
@@ -684,6 +754,17 @@ def adopt_on_spawn(cwd: str, name: str | None) -> dict:
     return {"adopted": owner}
 
 
+def untrusted_hooks_for(launch: dict, cwd: str | None) -> list[dict]:
+    """The project hooks that the Codex home of `launch` has not trusted for a session in `cwd`; [] when there is no
+    cwd or the check fails (it never stops a spawn)."""
+    if not cwd:
+        return []
+    try:
+        return codex_untrusted_project_hooks(cwd, launch["home"])
+    except Exception:
+        return []
+
+
 def cmd_spawn(args: argparse.Namespace) -> int:
     prompt = args.prompt
     if prompt and (len(prompt) > PROMPT_MAX or "\n" in prompt):
@@ -744,6 +825,12 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         target["registry"] = register_pane(target["cwd"], pane, entry)
     if target.get("cwd") and not args.worktree:
         target.update(adopt_on_spawn(target["cwd"], args.orch))
+    # Both checks read only, end in bounded time and never stop the spawn. They run before the launch: a started
+    # agent refreshes its own usage cache.
+    untrusted = untrusted_hooks_for(launch, target.get("cwd")) if agent == "codex" else []
+    warnings = [project_hooks_warning(untrusted, launch["account"], launch["home"])] if untrusted else []
+    usage_note = usage_warning(remuda, launch["account"]) if remuda and launch["account"] else None
+    warnings += [usage_note] if usage_note else []
     run(["herdr", "pane", "run", pane, launch["command"]])
     # Record the launch now: the wait can take minutes, and the caller can stop the command during it.
     cwd = target.get("cwd")
@@ -753,7 +840,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     record("spawn", cwd, **where, orch=owner, adopted=target.get("adopted"), placement=target.get("placement"),
            account=launch["account"], model=args.model,
            effort=args.effort, permission_mode=args.permission_mode, label=args.name, prompt=prompt,
-           resume=args.resume, task=task)
+           resume=args.resume, task=task, warnings=warnings)
     if args.no_wait:
         result = {"ok": True, "status": "launched", "notes": ["did not wait for the agent"]}
     else:
@@ -762,7 +849,10 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         except FleetError as e:
             record("spawn_result", cwd, **where, ok=False, reason=str(e))
             raise
-    out = {**result, **target, **launch, "label": args.name, "role": args.role, **({"task": task} if task else {})}
+    if result.get("dialog") == "hooks_review":
+        result["reason"] = hooks_review_reason(untrusted, launch["account"], launch["home"])
+    out = {**result, **target, **launch, "label": args.name, "role": args.role, **({"task": task} if task else {}),
+           "warnings": warnings}
     try:
         session = session_id_of(pane_info(pane)) if result["ok"] else None
     except FleetError:
@@ -1207,7 +1297,8 @@ HOOK_WAIT_STEP = 0.05  # seconds of each wait in ensure_project and record
 # line cannot break it. Add each new field that is not text here.
 EVENT_FIELD_TYPES = {"ok": bool, "closed": bool, "removed": bool, "replace": bool, "force": bool, "by": dict,
                      "exited": list, "reasons": list, "round": int, "files": int, "high_risk": list, "matches": list,
-                     "follow_ups_closed": list, "follow_ups_released": list, "switched": bool, "lanes": list}
+                     "follow_ups_closed": list, "follow_ups_released": list, "switched": bool, "lanes": list,
+                     "warnings": list}
 # `orch` (text) names the orch that an event concerns: the claim's, or the owner of the event's lane.
 DICT_LIST_FIELDS = ("exited", "high_risk", "matches")  # lists of objects with text fields; other lists hold text
 
@@ -1491,26 +1582,35 @@ def checkout_top(path) -> Path | None:
     return None
 
 
-def read_small_json(path: Path, limit: int) -> dict:
-    """The JSON object in `path` when it is a regular file of at most `limit` bytes, else {}. The open does not
-    block (O_NONBLOCK: a FIFO without a writer would hold a plain open for ever), fstat must say a regular file
-    (a FIFO, a device or a directory gives {}), and the read takes at most `limit` + 1 bytes. No thread, no timer."""
+def read_small_bytes(path, limit: int) -> bytes | None:
+    """The bytes of `path` when it is a regular file of at most `limit` bytes, else None. The open does not block
+    (O_NONBLOCK: a FIFO without a writer would hold a plain open for ever), fstat must say a regular file (a FIFO,
+    a device or a directory gives None), and the read takes at most `limit` + 1 bytes. No thread, no timer."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
     except OSError:
-        return {}
+        return None
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
-            return {}
+            return None
         data = os.read(fd, limit + 1)
-        if len(data) > limit:
-            return {}
+        return None if len(data) > limit else data
+    except Exception:
+        return None
+    finally:
+        os.close(fd)
+
+
+def read_small_json(path: Path, limit: int) -> dict:
+    """The JSON object in `path` when it is a regular file of at most `limit` bytes, else {} (read_small_bytes)."""
+    data = read_small_bytes(path, limit)
+    if data is None:
+        return {}
+    try:
         parsed = json.loads(data)
     except Exception:
         return {}
-    finally:
-        os.close(fd)
     return parsed if isinstance(parsed, dict) else {}
 
 
@@ -5148,29 +5248,227 @@ def parse_integration_status(text: str) -> dict:
     return found
 
 
-def codex_hook_trusted(home: str) -> bool | None:
-    """Whether Codex runs Herdr's SessionStart hook in this home (None: no such hook found).
+# Codex hooks. Codex runs a hook of a hooks.json only after the user trusts it once in its hooks review; the trust
+# is a `[hooks.state."<hooks.json path>:<event>:<group>:<handler>"]` table with a `trusted_hash` in the
+# config.toml of CODEX_HOME (the user layer: no other layer holds hook state). The event is the snake case of the
+# hooks.json key, and group and handler are positions in the file, also when a handler is skipped. A hook without
+# a trusted hash opens the review dialog ("Hooks need review", `› 1. Review hooks`) at the start. A hook whose
+# trusted hash differs from its current one (a changed hook) opens it too: that hash is Codex's own, so fleet
+# does not see a changed hook. fleet only reads; trust is the user's decision.
+CODEX_HOOK_EVENTS = {"PreToolUse": "pre_tool_use", "PermissionRequest": "permission_request",
+                     "PostToolUse": "post_tool_use", "PreCompact": "pre_compact", "PostCompact": "post_compact",
+                     "SessionStart": "session_start", "UserPromptSubmit": "user_prompt_submit", "Stop": "stop"}
+HOOKS_FILE_MAX = 1024 * 1024  # bytes of a hooks.json that fleet reads at most (a project's file is the repo's)
+CODEX_CONFIG_MAX = 4 * 1024 * 1024  # bytes of a CODEX_HOME config.toml that fleet reads at most
+GIT_FILE_MAX = 4096  # bytes of a linked worktree's .git file
+TOML_KEY_PART = re.compile(r"""\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)'|([A-Za-z0-9_-]+))\s*""")
+TOML_VALUE = re.compile(r"""\s*("(?:[^"\\]|\\.)*"|'[^']*'|true|false)""")
+TOML_STATE_FIELD = re.compile(r"""\b(trusted_hash|enabled)\s*=\s*("(?:[^"\\]|\\.)*"|'[^']*'|true|false)""")
 
-    Codex runs a hook from hooks.json only after the user trusts it once; the trust
-    is a `[hooks.state."<hooks.json>:session_start:<group>:<index>"]` table in config.toml.
-    """
-    base = Path(os.path.expanduser(home))
-    hooks_file = base / "hooks.json"
+
+def toml_basic(text: str) -> str:
     try:
-        groups = (json.loads(hooks_file.read_text()).get("hooks") or {}).get("SessionStart") or []
-        config = (base / "config.toml").read_text(errors="replace")
-    except (OSError, ValueError, AttributeError):
+        return json.loads('"' + text + '"')
+    except ValueError:
+        return text
+
+
+def toml_key_path(text: str) -> tuple[list[str] | None, str]:
+    """(the parts of the dotted TOML key at the start of `text`, the rest of `text`); None when it starts with none."""
+    parts: list[str] = []
+    pos = 0
+    while True:
+        m = TOML_KEY_PART.match(text, pos)
+        if not m or m.end() == pos:
+            return None, text
+        basic, literal, bare = m.groups()
+        parts.append(toml_basic(basic) if basic is not None else literal if literal is not None else bare)
+        pos = m.end()
+        if text.startswith(".", pos):
+            pos += 1
+            continue
+        return parts, text[pos:]
+
+
+def toml_scalar(text: str):
+    m = TOML_VALUE.match(text)
+    if not m:
         return None
-    for i, group in enumerate(groups if isinstance(groups, list) else []):
-        for j, hook in enumerate((group or {}).get("hooks") or []):
-            if "herdr-agent-state" not in str((hook or {}).get("command", "")):
+    v = m.group(1)
+    if v in ("true", "false"):
+        return v == "true"
+    return toml_basic(v[1:-1]) if v.startswith('"') else v[1:-1]
+
+
+def codex_hook_states(home: str) -> dict | None:
+    """The hook states in the config.toml of a Codex home: {key: {"trusted_hash", "enabled"}} (a field that the file
+    does not set is missing). None when the file cannot be read. Reads `[hooks.state."<key>"]` tables, inline tables
+    under `[hooks.state]` and dotted keys; the rest of the file is not parsed (Python 3.8 has no TOML parser)."""
+    data = read_small_bytes(Path(os.path.expanduser(home)) / "config.toml", CODEX_CONFIG_MAX)
+    if data is None:
+        return None
+    states: dict[str, dict] = {}
+    table: list[str] | None = []
+    for line in data.decode("utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[["):
+            table = None  # an array of tables: no hook state in it
+            continue
+        if stripped.startswith("["):
+            path, rest = toml_key_path(stripped[1:])
+            table = path if path is not None and rest.lstrip().startswith("]") else None
+            continue
+        if table is None or not stripped or stripped.startswith("#"):
+            continue
+        path, rest = toml_key_path(stripped)
+        if path is None or not rest.lstrip().startswith("="):
+            continue
+        full, value = table + path, rest.lstrip()[1:]
+        if len(full) < 3 or full[:2] != ["hooks", "state"]:
+            continue
+        key = full[2].strip()
+        if not key:
+            continue
+        state = states.setdefault(key, {})
+        if len(full) == 3 and value.lstrip().startswith("{"):
+            for m in TOML_STATE_FIELD.finditer(value):
+                state[m.group(1)] = toml_scalar(m.group(2))
+        elif len(full) == 4 and full[3] in ("trusted_hash", "enabled"):
+            state[full[3]] = toml_scalar(value)
+    return states
+
+
+def codex_hook_entries(hooks_file: Path) -> list[dict]:
+    """The hooks that Codex takes from one hooks.json, each with its state key: {"key", "event", "group", "index",
+    "command"}. Only command handlers that are not async and have a command; the positions count every handler. A
+    file that is missing, not regular, larger than HOOKS_FILE_MAX or not JSON gives none."""
+    hooks = read_small_json(hooks_file, HOOKS_FILE_MAX).get("hooks")
+    entries: list[dict] = []
+    if not isinstance(hooks, dict):
+        return entries
+    for name, event in CODEX_HOOK_EVENTS.items():
+        groups = hooks.get(name)
+        for g, group in enumerate(groups if isinstance(groups, list) else []):
+            handlers = group.get("hooks") if isinstance(group, dict) else None
+            for i, handler in enumerate(handlers if isinstance(handlers, list) else []):
+                if not isinstance(handler, dict) or handler.get("type") != "command" or handler.get("async") is True:
+                    continue
+                command = handler.get("command")
+                if isinstance(command, str) and command.strip():
+                    entries.append({"key": f"{hooks_file}:{event}:{g}:{i}", "event": event, "group": g, "index": i,
+                                    "command": command})
+    return entries
+
+
+def hook_trusted(state: dict | None) -> bool:
+    """Whether a hook state lets Codex start without the hooks review: it has a trusted hash."""
+    return bool(state and state.get("trusted_hash"))
+
+
+def codex_hook_trusted(home: str) -> bool | None:
+    """Whether Codex runs Herdr's SessionStart hook in this home: trusted and not disabled (None: no such hook
+    found, or no config.toml)."""
+    base = Path(os.path.expanduser(home))
+    herdr_hooks = [e for e in codex_hook_entries(base / "hooks.json")
+                   if e["event"] == "session_start" and "herdr-agent-state" in e["command"]]
+    states = codex_hook_states(str(base)) if herdr_hooks else None
+    if states is None:
+        return None
+    state = states.get(herdr_hooks[0]["key"])
+    return hook_trusted(state) and state.get("enabled") is not False
+
+
+def project_hook_files(cwd: str) -> list[dict]:
+    """The project hooks.json files that Codex loads for a session started in `cwd`: {"file", "checkout"}, outermost
+    first. Each directory from the checkout top (the first one up that has `.git`) down to `cwd` that has a `.codex`
+    directory is a project layer. In a linked worktree Codex takes that layer's hooks from the main checkout (the
+    parent of the common git dir named in the worktree's `.git` file), at the same relative place, and keys them
+    by that path. File checks only, no git: bounded. Codex takes its cwd from the system, a real path."""
+    try:
+        start = Path(os.path.realpath(cwd))
+    except (OSError, ValueError):
+        return []
+    top = checkout_top(str(start))
+    if not top:
+        return []
+    main = top
+    try:
+        if (top / ".git").is_file():
+            m = re.match(r"gitdir:\s*(.+)", (read_small_bytes(top / ".git", GIT_FILE_MAX) or b"").decode(
+                "utf-8", errors="replace").strip())
+            if m:
+                gitdir = Path(m.group(1).strip())
+                gitdir = gitdir if gitdir.is_absolute() else top / gitdir
+                if gitdir.parent.name == "worktrees":
+                    main = gitdir.parent.parent.parent
+        found = []
+        rel_dirs = [start.relative_to(top), *start.relative_to(top).parents]
+        for rel in reversed(rel_dirs):
+            if not (top / rel / ".codex").is_dir():
                 continue
-            parts = config.split(f'[hooks.state."{hooks_file}:session_start:{i}:{j}"]', 1)
-            if len(parts) < 2:
-                return False
-            table = parts[1].split("\n[", 1)[0]
-            return "trusted_hash" in table and not re.search(r"^\s*enabled\s*=\s*false", table, re.M)
-    return None
+            checkout = main / rel if str(rel) != "." else main
+            hooks_file = checkout / ".codex" / "hooks.json"
+            if hooks_file.is_file():
+                found.append({"file": hooks_file, "checkout": checkout})
+        return found
+    except (OSError, ValueError):
+        return []
+
+
+def codex_untrusted_project_hooks(cwd: str, home: str) -> list[dict]:
+    """The entries of the project hooks files for `cwd` (project_hook_files) that the Codex home `home` has no
+    trusted state for: Codex opens its hooks review for them. Each entry also names its "checkout"."""
+    base = os.path.expanduser(home)
+    states = codex_hook_states(base) or {}
+    found = []
+    for f in project_hook_files(cwd):
+        try:
+            if os.path.realpath(f["file"].parent) == os.path.realpath(base):
+                continue  # Codex skips a project .codex that is the home itself
+        except (OSError, ValueError):
+            continue
+        for e in codex_hook_entries(f["file"]):
+            if not hook_trusted(states.get(e["key"])):
+                found.append({**e, "file": str(f["file"]), "checkout": str(f["checkout"])})
+    return found
+
+
+def codex_launch_hint(account: str | None, home: str | None) -> str:
+    """How the user starts Codex on this account by hand."""
+    if account:
+        return f"remuda run {account}"
+    if home and home != "default" and os.path.expanduser(home) != os.path.expanduser(DEFAULT_HOME["codex"]):
+        return f"CODEX_HOME={shlex.quote(os.path.expanduser(home))} codex"
+    return "codex"
+
+
+def hook_trust_fix(untrusted: list[dict], account: str | None, home: str | None) -> str:
+    checkouts = sorted({e["checkout"] for e in untrusted})
+    return (f"open Codex on this account in {' and '.join(checkouts)} or a worktree of it "
+            f"(`{codex_launch_hint(account, home)}`) and press t (trust all) in its hooks review; fleet never trusts "
+            "hooks for you")
+
+
+def hook_entry_names(untrusted: list[dict]) -> str:
+    return ", ".join(f"{e['event']}:{e['group']}:{e['index']} ({text_head(e['command'], 40)})" for e in untrusted)
+
+
+def project_hooks_warning(untrusted: list[dict], account: str | None, home: str | None) -> str:
+    files = sorted({e["file"] for e in untrusted})
+    who = account or os.path.expanduser(home or DEFAULT_HOME["codex"])
+    return (f"{len(untrusted)} project hook(s) in {', '.join(files)} have no trusted state for {who}: "
+            f"{hook_entry_names(untrusted)}. Codex opens its hooks review dialog at the start, and the spawn ends "
+            f"blocked on it. Fix: {hook_trust_fix(untrusted, account, home)}")
+
+
+def hooks_review_reason(untrusted: list[dict] | None, account: str | None, home: str | None) -> str:
+    if untrusted:
+        return (f"the Codex hooks review dialog is open in the pane: no trusted state for "
+                f"{hook_entry_names(untrusted)} in {', '.join(sorted({e['file'] for e in untrusted}))}. Fix: "
+                f"{hook_trust_fix(untrusted, account, home)}, then start the agent again (or answer the dialog in "
+                "the pane yourself)")
+    return ("the Codex hooks review dialog is open in the pane (a hook is new or changed: a changed hook, or one in "
+            "CODEX_HOME, which fleet does not check); read the pane and decide: trust is yours to give")
 
 
 def hook_install_command(agent: str, home: str | None) -> str:
@@ -5202,6 +5500,23 @@ def hook_report(herdr_bin: str, homes: list[dict], env: dict) -> list[dict]:
             fix = "start Codex on this account and trust the Herdr hook in its hooks review (t: trust all)"
         report.append({**h, "status": status, "path": found.get("path"), "ok": ok, "fix": fix})
     return report
+
+
+def project_hooks_report(cwd: str, homes: list[dict]) -> dict | None:
+    """For a checkout whose Codex project hooks (project_hook_files) exist: per Codex home that a lane can use, the
+    entries that it has not trusted, and the fix. None when `cwd` has no project hooks file. Reads files only."""
+    files = project_hook_files(cwd)
+    if not files:
+        return None
+    rows = []
+    for h in homes:
+        if h["agent"] != "codex":
+            continue
+        home = account_home("codex", {"home": h["home"]})
+        untrusted = codex_untrusted_project_hooks(cwd, home)
+        rows.append({**h, "untrusted": untrusted, "ok": not untrusted,
+                     "fix": hook_trust_fix(untrusted, h.get("account"), h["home"]) if untrusted else None})
+    return {"cwd": cwd, "files": [str(f["file"]) for f in files], "homes": rows}
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -5241,6 +5556,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                   **agent_defaults("codex", codex_home),
                   "models": codex_models(codex_home) if installed["codex"] else []},
         "hooks": hook_report(herdr_bin, homes, env) if herdr_bin else [],
+        "project_hooks": project_hooks_report(os.getcwd(), homes),
         "git": shutil.which("git"),
         "conventions": {"path": str(conv), "exists": conv.is_file()},
         "home": {"path": str(fleet_home()), "projects": [p.name for p in project_dirs()]},
@@ -5270,6 +5586,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         who = h["account"] or f"{h['agent']} ({h['home']})"
         state = h["status"] or "unknown"
         show("herdr hooks" if i == 0 else "", f"{who:<16} {state}" + ("" if h["ok"] else f"  fix: {h['fix']}"))
+    project = report["project_hooks"]
+    if project:
+        show("codex hooks", f"{', '.join(project['files'])} (this checkout's Codex project hooks)")
+        for h in project["homes"]:
+            who = h["account"] or f"codex ({h['home']})"
+            state = "all trusted" if h["ok"] else (f"{len(h['untrusted'])} not trusted: "
+                                                   f"{hook_entry_names(h['untrusted'])}  fix: {h['fix']}")
+            show("", f"{who:<16} {state}")
     show("conventions", f"{conv}" + ("" if conv.is_file() else "  (missing: run /fleet:onboard)"))
     projects = report["home"]["projects"]
     show("home", short_path(str(fleet_home())) + (f"  projects: {', '.join(projects)}" if projects else
@@ -5298,19 +5622,52 @@ def cmd_conventions(args: argparse.Namespace) -> int:
     return 0
 
 
+def usage_mark(row: dict | None) -> str:
+    """What `fleet accounts` appends to an account's usage header."""
+    if not row or row["source"] == "live":
+        return ""
+    if row["stale"]:
+        return f"  STALE (>= {USAGE_STALE_HOURS}h)"
+    return "" if row["stale"] is False else "  (age unknown)"
+
+
 def cmd_accounts(args: argparse.Namespace) -> int:
     remuda = remuda_path()
     if not remuda:
+        if args.json:
+            print(json.dumps({"mode": "plain", "accounts": [], "stale_after_hours": USAGE_STALE_HOURS}, indent=2))
+            return 0
         print("plain mode: remuda is not installed (or FLEET_NO_REMUDA=1).")
         print("Every lane uses the agent's own login. There is no account switching.")
         return 0
+    outputs = []
     for cmd in ([remuda, "list"], [remuda, "usage", *(["--live"] if args.live else [])]):
         cp = run(cmd, timeout=60)
-        sys.stdout.write(cp.stdout)
         if cp.returncode != 0:
-            sys.stderr.write(cp.stderr)
+            sys.stdout.write("".join(outputs) if not args.json else "")
+            sys.stderr.write(cp.stderr or cp.stdout)
             return cp.returncode
-        print()
+        outputs.append(cp.stdout)
+    usage = parse_remuda_usage(outputs[1])
+    if args.json:
+        rows = [{**a, "usage": usage.get(a["account"])} for a in parse_remuda_list(outputs[0])]
+        print(json.dumps({"mode": "remuda", "live": bool(args.live), "stale_after_hours": USAGE_STALE_HOURS,
+                          "accounts": rows}, indent=2, ensure_ascii=False))
+        return 0
+    sys.stdout.write(outputs[0])
+    print()
+    stale = []
+    for line in outputs[1].splitlines():
+        m = USAGE_HEADER.match(line.rstrip())
+        row = usage.get(m.group(1)) if m and not line[:1].isspace() else None
+        if row and row["stale"] is not False and row["source"] != "live":
+            stale.append(m.group(1))
+        print(line.rstrip() + usage_mark(row) if row else line)
+    print()
+    if stale:
+        print(f"Old or missing numbers for {', '.join(stale)} (stale at {USAGE_STALE_HOURS}h): do not choose by "
+              "remaining usage on them. `fleet accounts --live` refreshes every account (it starts each agent "
+              "briefly, seconds per account); `remuda usage --live <account>` refreshes one.")
     return 0
 
 
@@ -6059,7 +6416,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"fleet {VERSION}")
     sub = p.add_subparsers(dest="command", required=True)
 
-    d = sub.add_parser("doctor", help="check the environment")
+    d = sub.add_parser("doctor", help="check the environment; in a checkout, the Codex project hooks that each Codex "
+                                      "account has not trusted")
     d.add_argument("--json", action="store_true")
     d.set_defaults(func=cmd_doctor)
 
@@ -6067,8 +6425,11 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--path", action="store_true", help="print only the conventions file path")
     c.set_defaults(func=cmd_conventions)
 
-    a = sub.add_parser("accounts", help="remuda accounts and usage")
-    a.add_argument("--live", action="store_true", help="query usage live instead of the cache")
+    a = sub.add_parser("accounts", help=f"remuda accounts and usage; marks a cache of {USAGE_STALE_HOURS}h or older STALE")
+    a.add_argument("--live", action="store_true",
+                   help="query usage live instead of the cache (starts each agent briefly: seconds per account)")
+    a.add_argument("--json", action="store_true",
+                   help=f"accounts with their parsed usage; a cache {USAGE_STALE_HOURS}h old or older has stale: true")
     a.set_defaults(func=cmd_accounts)
 
     pr = sub.add_parser("prep", help="create <git top>/.fleet and keep it out of git")
@@ -6106,7 +6467,10 @@ def build_parser() -> argparse.ArgumentParser:
     rs.add_argument("--timeout", type=float, default=600, help="seconds to wait for the agent (default 600)")
     rs.set_defaults(func=cmd_reset)
 
-    s = sub.add_parser("spawn", help="open a pane and start an agent in it")
+    s = sub.add_parser("spawn", help="open a pane and start an agent in it",
+                       description="Before the launch, spawn warns (result: warnings) about Codex project hooks that "
+                                   "the account has not trusted (codex) and about a stale or missing usage cache of "
+                                   "--account. It never answers Codex's hooks review, also not with --accept-trust.")
     s.add_argument("--agent", choices=AGENTS, help="default: claude, or the account's provider")
     s.add_argument("--account", help="remuda account (name or provider:name); needs remuda")
     s.add_argument("--model")
@@ -6135,7 +6499,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--orch", help="the orch that owns a new or unowned lane (default: the caller's orch)")
     s.add_argument("--cwd", help="working directory for split/tab/workspace "
                                  "(default: the split pane's directory, else the current one)")
-    s.add_argument("--accept-trust", action="store_true", help="accept the agent's folder trust dialog")
+    s.add_argument("--accept-trust", action="store_true", help="accept the agent's folder trust dialog (never Codex's hooks review)")
     s.add_argument("--no-wait", action="store_true", help="return right after launching")
     s.add_argument("--timeout", type=float, default=120, help="seconds to wait for the agent (default 120)")
     s.add_argument("--dry-run", action="store_true", help="print the launch command only")

@@ -636,6 +636,351 @@ class DoctorTests(FleetTestCase):
         self.assertIsNone(fleet.codex_hook_trusted(str(self.home)))
 
 
+# A project hooks file with three entries. The async handler and the prompt handler are no entries, but they keep
+# their positions: the key of an entry is its event and its place in the file.
+PROJECT_HOOKS = {"hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "tool-a session-start"}]}],
+    "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "tool-b log", "async": True},
+                                               {"type": "command", "command": "tool-b post"}]}],
+    "Stop": [{"hooks": [{"type": "prompt"}]}, {"hooks": [{"type": "command", "command": "tool-c stop"}]}],
+}}
+ENTRY_SUFFIXES = ["post_tool_use:0:1", "session_start:0:0", "stop:1:0"]  # in Codex's order of events
+
+HOOKS_REVIEW_SCREEN = """\
+  >_ OpenAI Codex (v0.164.0)
+  Hooks need review
+  1 hook is new or changed.
+  Hooks can run outside the sandbox after you trust them.
+› 1. Review hooks
+  2. Trust all and continue
+  3. Continue without trusting (hooks won't run)
+  Press enter to confirm or esc to go back
+"""
+
+# `remuda usage` as remuda prints it (synthetic accounts and numbers). The age is floored: `23h ago` is under a day,
+# `1d ago` is a day or more.
+REMUDA_USAGE = """\
+claude:default  no cached usage (no /home/u/.claude.json)
+
+claude:max  cached 23h ago (Nov 9 18:41)
+  Week (all models)  11%     resets Nov 13 12:59
+
+claude:team  cached 1d ago (Nov 4 14:19)
+  5h                 0%
+  Week (all models)  6%     resets Nov 10 12:00
+
+codex:default  cached 19s ago (Nov 10 11:35)
+  Week (all models)  69%     resets Nov 14 03:43
+
+codex:v0  cached (time unknown)
+  Week (all models)  50%     resets Nov 11 14:39
+"""
+
+
+class ProjectHookCase(FleetTestCase):
+    """A repository that commits .codex/hooks.json with three entries, a linked worktree of it, and a CODEX_HOME
+    whose config.toml trusts some of them. Real paths: Codex keys a hook by the real path of the main checkout."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.main = self.root / "repo"
+        self.main.mkdir()
+        git("init", "-q", "-b", "main", cwd=self.main)
+        (self.main / ".codex").mkdir()
+        (self.main / ".codex" / "hooks.json").write_text(json.dumps(PROJECT_HOOKS))
+        (self.main / "src").mkdir()
+        (self.main / "src" / "a.txt").write_text("a\n")
+        git("add", ".", cwd=self.main)
+        git("-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "init", cwd=self.main)
+        self.wt = self.root / "wt"
+        git("worktree", "add", "-q", str(self.wt), "-b", "feat/x", cwd=self.main)
+        self.home = self.root / "codex-home"
+        self.home.mkdir()
+        self.hooks_file = self.main / ".codex" / "hooks.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def key(self, suffix, hooks_file=None):
+        return f"{hooks_file or self.hooks_file}:{suffix}"
+
+    def trust(self, *suffixes):
+        """config.toml with a trusted state table for each suffix: the first as a table of its own, the others as
+        inline tables under [hooks.state]. A table for the worktree's own path never counts."""
+        first, rest = (suffixes[0], suffixes[1:]) if suffixes else (None, ())
+        text = 'model = "model-x"\n\n'
+        text += f'[hooks.state."{self.key("post_tool_use:0:1", self.wt / ".codex" / "hooks.json")}"]\n'
+        text += 'trusted_hash = "sha256:wt"\n\n[hooks.state]\n'
+        for s in rest:
+            text += f'"{self.key(s)}" = {{ trusted_hash = "sha256:{s}" }}\n'
+        if first:
+            text += f'\n[hooks.state."{self.key(first)}"]\nenabled = true\ntrusted_hash = "sha256:x"\n'
+        text += "\n[projects.\"/elsewhere\"]\ntrust_level = \"trusted\"\n"
+        (self.home / "config.toml").write_text(text)
+
+    def untrusted(self, cwd):
+        return [e["key"] for e in fleet.codex_untrusted_project_hooks(str(cwd), str(self.home))]
+
+
+class ProjectHookTrustTests(ProjectHookCase):
+    def test_entries_follow_codex_keys_and_the_main_checkout(self):
+        self.assertEqual([e["key"] for e in fleet.codex_hook_entries(self.hooks_file)],
+                         [self.key(s) for s in ENTRY_SUFFIXES])
+        self.trust("session_start:0:0", "stop:1:0")
+        # In the main checkout, in the linked worktree, and below its top: the file and the key of the main
+        # checkout. The worktree's own path has a table, and it does not count.
+        for cwd in (self.main, self.wt, self.wt / "src"):
+            self.assertEqual(self.untrusted(cwd), [self.key("post_tool_use:0:1")], cwd)
+        self.trust("session_start:0:0", "stop:1:0", "post_tool_use:0:1")
+        for cwd in (self.main, self.wt):
+            self.assertEqual(self.untrusted(cwd), [], cwd)
+        # No table at all, or no config.toml: every entry needs review.
+        (self.home / "config.toml").unlink()
+        self.assertEqual(self.untrusted(self.wt), [self.key(s) for s in ENTRY_SUFFIXES])
+
+    def test_what_codex_does_not_load_is_not_reported(self):
+        self.trust()
+        # A disabled entry with a trusted hash does not open the review.
+        (self.home / "config.toml").write_text(
+            "".join(f'[hooks.state."{self.key(s)}"]\nenabled = false\ntrusted_hash = "sha256:x"\n\n'
+                    for s in ENTRY_SUFFIXES))
+        self.assertEqual(self.untrusted(self.wt), [])
+        self.trust()
+        # Codex loads a project layer only where the worktree itself has a .codex directory.
+        shutil.rmtree(self.wt / ".codex")
+        self.assertEqual(self.untrusted(self.wt), [])
+        # Outside a checkout, and with a hooks file that is too large, not regular or not JSON: nothing.
+        self.assertEqual(self.untrusted(self.root), [])
+        for content in ("x" * (fleet.HOOKS_FILE_MAX + 1), "not json"):
+            self.hooks_file.write_text(content)
+            self.assertEqual(self.untrusted(self.main), [])
+        self.hooks_file.unlink()
+        os.mkfifo(self.hooks_file)
+        self.assertEqual(self.untrusted(self.main), [])
+
+    def doctor(self, *argv):
+        buf = io.StringIO()
+        which = {"codex": "/opt/bin/codex"}
+        with mock.patch.dict(os.environ, {"FLEET_NO_REMUDA": "1", "CODEX_HOME": str(self.home)}), \
+                mock.patch.object(fleet.shutil, "which", side_effect=lambda name: which.get(name)), \
+                mock.patch.object(fleet, "tool_version", return_value="codex-cli 0.0.0"), \
+                chdir(self.wt), redirect_stdout(buf):
+            self.assertEqual(fleet.main(["doctor", *argv]), 0)
+        return buf.getvalue()
+
+    def test_doctor_names_untrusted_entries_per_codex_home(self):
+        self.trust("session_start:0:0", "stop:1:0")
+        report = json.loads(self.doctor("--json"))
+        [row] = report["project_hooks"]["homes"]
+        self.assertEqual((row["agent"], row["home"], row["ok"]), ("codex", str(self.home), False))
+        self.assertEqual([e["key"] for e in row["untrusted"]], [self.key("post_tool_use:0:1")])
+        self.assertIn("press t", row["fix"])
+        self.assertEqual(report["project_hooks"]["files"], [str(self.hooks_file)])
+        text = self.doctor()
+        self.assertIn("post_tool_use:0:1", text)
+        self.assertIn("press t", text)
+        self.assertIn(str(self.main), text)  # where to open Codex: the checkout that holds the hooks file
+        self.trust("session_start:0:0", "stop:1:0", "post_tool_use:0:1")
+        [row] = json.loads(self.doctor("--json"))["project_hooks"]["homes"]
+        self.assertEqual((row["ok"], row["untrusted"], row["fix"]), (True, [], None))
+        self.assertNotIn("post_tool_use", self.doctor())
+        self.assertNotIn("press t", self.doctor())
+
+
+class SpawnFrictionTests(ProjectHookCase):
+    """spawn warns before the agent starts, and names the cause when the start ends on the hooks review."""
+
+    def setUp(self):
+        super().setUp()
+        self.env = mock.patch.dict(os.environ, {"FLEET_HOME": str(self.root / "fleet-home"), "FLEET_NO_REMUDA": "1",
+                                                "HERDR_PANE_ID": "w1:p1", "CODEX_HOME": str(self.home)})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.remuda_calls = []
+
+    def spawn(self, *argv, wait=None, remuda=None, usage=REMUDA_USAGE):
+        """Run spawn with herdr stubbed (and remuda, when `remuda` names its path); `wait`: what wait_for_start
+        returns, None for --no-wait. Returns (exit code, JSON out)."""
+        launched = []
+
+        def create(args, cwd=None, info=None):
+            return {"pane_id": "w1:p9", "workspace_id": "w1", "cwd": cwd, "placement": "split"}
+
+        def run(cmd, *a, **k):
+            if cmd[0] == "herdr":
+                if cmd[1:3] == ["pane", "run"]:
+                    launched.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0, "{}", "")
+            if remuda and cmd[0] == remuda:
+                self.remuda_calls.append((cmd[1:], bool(launched)))
+                out = REMUDA_LIST if cmd[1] == "list" else usage
+                return subprocess.CompletedProcess(cmd, 0, out, "")
+            return _guarded_run(cmd, *a, **k)
+        patches = [mock.patch.object(fleet, "require_herdr"), mock.patch.object(fleet, "run", run),
+                   mock.patch.object(fleet, "create_pane", side_effect=create),
+                   mock.patch.object(fleet, "pane_info", return_value={}),
+                   mock.patch.object(fleet, "herdr_ok", return_value=True)]
+        if wait is not None:
+            patches.append(mock.patch.object(fleet, "wait_for_start", return_value=dict(wait)))
+        if remuda:
+            patches.append(mock.patch.object(fleet, "remuda_path", return_value=remuda))
+        buf = io.StringIO()
+        with ExitStackCompat(patches), chdir(self.root), redirect_stdout(buf):
+            code = fleet.main(["spawn", *([] if wait is not None else ["--no-wait"]), *argv])
+        return code, json.loads(buf.getvalue())
+
+    HOOKS_BLOCKED = {"ok": False, "status": "blocked", "dialog": "hooks_review",
+                     "reason": "the Codex hooks review dialog is open in the pane", "notes": []}
+
+    def test_untrusted_project_hooks_warn_and_name_the_blocked_reason(self):
+        self.trust("session_start:0:0", "stop:1:0")
+        code, out = self.spawn("--agent", "codex", "--cwd", str(self.wt))
+        self.assertEqual((code, out["ok"]), (0, True))
+        [warning] = out["warnings"]
+        self.assertIn("post_tool_use:0:1", warning)
+        self.assertNotIn("session_start:0:0", warning)
+        self.assertIn("press t", warning)
+        code, out = self.spawn("--agent", "codex", "--cwd", str(self.wt), wait=self.HOOKS_BLOCKED)
+        self.assertEqual((code, out["ok"], out["status"]), (2, False, "blocked"))
+        self.assertIn("post_tool_use:0:1", out["reason"])
+        self.assertIn("press t", out["reason"])
+        self.assertIn(str(self.main), out["reason"])
+        # The event log keeps the warning and the named reason.
+        events = fleet.read_events([fleet.project_for(str(self.wt))])
+        [spawn, result] = [e for e in events if e["event"] in ("spawn", "spawn_result")][-2:]
+        self.assertIn("post_tool_use:0:1", " ".join(spawn.get("warnings") or []))
+        self.assertIn("post_tool_use:0:1", result["reason"])
+
+    def test_trusted_hooks_and_claude_spawns_carry_no_hook_warning(self):
+        self.trust("session_start:0:0", "stop:1:0", "post_tool_use:0:1")
+        code, out = self.spawn("--agent", "codex", "--cwd", str(self.wt))
+        self.assertEqual((code, out["warnings"]), (0, []))
+        # The dialog shows although every entry is trusted (a changed hook, or one in CODEX_HOME): the reason
+        # says which dialog it is and names no entry.
+        code, out = self.spawn("--agent", "codex", "--cwd", str(self.wt), wait=self.HOOKS_BLOCKED)
+        self.assertIn("hooks review", out["reason"])
+        self.assertNotIn("post_tool_use", out["reason"])
+        self.trust()
+        code, out = self.spawn("--agent", "claude", "--cwd", str(self.wt))
+        self.assertEqual(out["warnings"], [])
+
+    def test_a_stale_usage_cache_of_the_chosen_account_warns_before_the_launch(self):
+        remuda = "/opt/bin/remuda"
+        env = mock.patch.dict(os.environ, {"FLEET_NO_REMUDA": ""})
+        env.start()
+        self.addCleanup(env.stop)
+        code, out = self.spawn("--agent", "claude", "--account", "team", "--cwd", str(self.root), remuda=remuda)
+        self.assertEqual(code, 0)
+        [warning] = out["warnings"]
+        self.assertIn("claude:team", warning)
+        self.assertIn("stale", warning)
+        self.assertIn("1d", warning)
+        # The cache is read before the agent starts (the agent refreshes its own cache), for that account only.
+        self.assertIn((["usage", "claude:team"], False), self.remuda_calls)
+        self.assertNotIn(True, [after for argv, after in self.remuda_calls if argv[0] == "usage"])
+        code, out = self.spawn("--agent", "claude", "--account", "max", "--cwd", str(self.root), remuda=remuda)
+        self.assertEqual(out["warnings"], [])  # 23 h: not stale
+        for account in ("default", "codex:v0"):  # no cache, or a cache of unknown age: warn
+            code, out = self.spawn("--account", account, "--agent", "claude" if account == "default" else "codex",
+                                   "--cwd", str(self.root), remuda=remuda)
+            self.assertEqual(len(out["warnings"]), 1, account)
+            self.assertIn("usage", out["warnings"][0])
+        # remuda failing does not fail the spawn and gives no usage warning.
+        code, out = self.spawn("--agent", "claude", "--account", "team", "--cwd", str(self.root), remuda=remuda,
+                               usage="")
+        self.assertEqual((code, out["warnings"]), (0, []))
+
+
+class HooksReviewScreenTests(FleetTestCase):
+    def start(self, status, accept_trust):
+        keys = []
+        lines = fleet.clean_lines(HOOKS_REVIEW_SCREEN)
+        with mock.patch.object(fleet, "pane_info", return_value={"agent": "codex", "agent_status": status}), \
+                mock.patch.object(fleet, "pane_lines", return_value=lines), \
+                mock.patch.object(fleet, "send_keys", side_effect=lambda *a: keys.append(a)), \
+                mock.patch.object(fleet, "choose_option", side_effect=lambda *a: keys.append(a) or True):
+            out = fleet.wait_for_start("w1:p9", "codex", "Read .fleet/REVIEW-REQUEST-1.md", accept_trust, 2)
+        return out, keys
+
+    def test_the_hooks_review_ends_the_start_and_is_never_answered(self):
+        for status in ("idle", "blocked", "done"):
+            for accept_trust in (True, False):
+                out, keys = self.start(status, accept_trust)
+                self.assertEqual((out["ok"], out["status"], out.get("dialog")), (False, "blocked", "hooks_review"),
+                                 (status, out))
+                self.assertIn("hooks review", out["reason"])
+                self.assertEqual(keys, [], (status, accept_trust))
+
+    def test_only_the_menu_counts(self):
+        self.assertTrue(fleet.HOOKS_REVIEW.search("\n".join(fleet.clean_lines(HOOKS_REVIEW_SCREEN))))
+        for screen in (CODEX_SCREEN, CODEX_TRUST_SCREEN, CLAUDE_SCREEN,
+                       "• The dialog Hooks need review opens; pick 1. Review hooks there.\n› Ask Codex to do anything"):
+            self.assertIsNone(fleet.HOOKS_REVIEW.search("\n".join(fleet.clean_lines(screen))), screen)
+
+
+class UsageCacheTests(FleetTestCase):
+    def test_stale_at_the_limit_and_not_below(self):
+        limit = fleet.USAGE_STALE_HOURS * 3600
+        self.assertEqual(fleet.USAGE_STALE_HOURS, 24)
+        self.assertIs(fleet.usage_stale(limit), True)
+        self.assertIs(fleet.usage_stale(limit - 1), False)
+        self.assertIsNone(fleet.usage_stale(None))
+        usage = fleet.parse_remuda_usage(REMUDA_USAGE)
+        self.assertEqual({a: (u["source"], u["age_seconds"], u["stale"]) for a, u in usage.items()}, {
+            "claude:default": ("none", None, None),
+            "claude:max": ("cached", 23 * 3600, False),
+            "claude:team": ("cached", 86400, True),
+            "codex:default": ("cached", 19, False),
+            "codex:v0": ("cached", None, None),
+        })
+        self.assertEqual(usage["claude:team"]["rows"], ["5h                 0%",
+                                                        "Week (all models)  6%     resets Nov 10 12:00"])
+        live = fleet.parse_remuda_usage("codex:v0  live  logged in (pro)\n  Week (all models)  50%\n")
+        self.assertEqual((live["codex:v0"]["source"], live["codex:v0"]["stale"]), ("live", False))
+
+    def accounts(self, *argv):
+        def run(cmd, *a, **k):
+            out = REMUDA_LIST if cmd[1] == "list" else REMUDA_USAGE
+            return subprocess.CompletedProcess(cmd, 0, out, "")
+        buf = io.StringIO()
+        with mock.patch.object(fleet, "remuda_path", return_value="/opt/bin/remuda"), \
+                mock.patch.object(fleet, "run", side_effect=run) as stub, redirect_stdout(buf):
+            self.assertEqual(fleet.main(["accounts", *argv]), 0)
+        return buf.getvalue(), [c[0][0] for c in stub.call_args_list]
+
+    def test_accounts_marks_stale_caches_in_text_and_json(self):
+        text, calls = self.accounts()
+        lines = {line.split()[0]: line for line in text.splitlines() if line[:1].isalpha() and "  " in line}
+        self.assertIn("STALE", lines["claude:team"].split("(Nov 4 14:19)", 1)[1])
+        for account in ("claude:max", "codex:default"):
+            self.assertNotIn("STALE", lines[account])
+        self.assertIn("age unknown", lines["codex:v0"])
+        self.assertIn("--live", text)  # how to refresh
+        self.assertNotIn("--live", calls[-1])
+        out, _ = self.accounts("--json")
+        data = json.loads(out)
+        self.assertEqual((data["mode"], data["stale_after_hours"]), ("remuda", 24))
+        by_name = {a["account"]: a for a in data["accounts"]}
+        self.assertEqual(list(by_name), ["claude:default", "claude:max", "claude:team", "codex:default", "codex:v0"])
+        self.assertEqual({a: r["usage"]["stale"] for a, r in by_name.items()},
+                         {"claude:default": None, "claude:max": False, "claude:team": True,
+                          "codex:default": False, "codex:v0": None})
+        self.assertEqual(by_name["claude:team"]["usage"]["age_seconds"], 86400)
+        with mock.patch.object(fleet, "remuda_path", return_value=None), redirect_stdout(io.StringIO()) as buf:
+            self.assertEqual(fleet.main(["accounts", "--json"]), 0)
+        self.assertEqual(json.loads(buf.getvalue()), {"mode": "plain", "accounts": [], "stale_after_hours": 24})
+
+
+@contextmanager
+def ExitStackCompat(patches):
+    from contextlib import ExitStack
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        yield
+
+
 class SweepTests(FleetTestCase):
     def lane(self, **kw):
         f = {"exists": True, "git": True, "linked": True, "self": False, "locked": False, "branch": "fix/x",
@@ -3604,7 +3949,7 @@ class DocsTests(FleetTestCase):
             for text in ("default branch", "git fetch", "fast-forward", "git merge --ff-only", "in lanes",
                          "each worktree has its own", "its own clone"):
                 self.assertIn(text, doc)
-        self.assertEqual(fleet.VERSION, "0.9.0")
+        self.assertEqual(fleet.VERSION, "0.9.1")
 
 class OrchTests(FleetTestCase):
     """orch, board, digest and the orch re-brief, in a temporary FLEET_HOME. herdr and gh never run."""

@@ -25,6 +25,7 @@ Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" doctor --json`. Tell the user
   - `remuda`: remuda is installed, so lanes can run on different accounts. Each row of `remuda.accounts` carries the model and effort that the account's own configuration sets. Point out an account that sets none, or a different one: a lane on that account gets other settings unless the conventions name the model and effort.
   - `plain`: no remuda. Every lane uses the agent's own login, and nothing in the plugin switches accounts. `FLEET_NO_REMUDA=1` forces plain mode.
 - **Herdr hooks**: `hooks` has one row for each configuration directory that a lane can use: each remuda account, or the caller's directories in plain mode. Herdr reads an agent's state (working, idle, blocked) from this hook, and `fleet watch` depends on that state. For each row with `ok: false`, show its `fix` and offer to run it. Run a fix only after the user agrees. Codex also runs a new hook only after one approval inside Codex: start Codex on that account, open its hooks review and press `t` (trust all). Run doctor again afterwards.
+- **Codex project hooks**: `project_hooks` is set when doctor runs in a checkout with `.codex/hooks.json`. Each row with `ok: false` lists the hooks that this Codex account has not trusted; Codex lanes on it stop at the hooks review until the user trusts them. Show its `fix`. Never trust them for the user.
 - **Existing file**: if `conventions.exists` is true, read the file first. Ask only about what the user wants to change.
 
 ## 2. Ask

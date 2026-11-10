@@ -25,7 +25,7 @@ The task comes from the arguments. If there are none, ask the user what the lane
 2. With `--from <ID>`: run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" follow-up list --json` and find the ID. Its `text` (and `detail`, when present) is the task. When it has a `lane`, another lane holds it, and one lane holds a follow-up. Ask the user, with two choices: release it first (`follow-up release <ID>`, when that lane was dropped), or open the lane without `--from` (a separate task: no take, no link, and cleanup does not close the follow-up). An unknown ID: tell the user and stop.
 3. Learn enough to write the brief: read the issue, plan or code that the task names. Settle the scope with the user when the goal is unclear or another lane could touch the same files.
 4. Names: a short lane label (for example `fix-login-redirect`) and a branch (the project's naming, else the label). Base: the remote default branch after `git fetch`, unless the user names one.
-5. Account: in remuda mode, choose by the conventions. When the rules depend on usage, run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" accounts`. In plain mode there is no account.
+5. Account: in remuda mode, choose by the conventions. When the rules depend on usage, run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" accounts`; an account marked `STALE` has old numbers, so refresh with `accounts --live` (or ask) before you choose by them. In plain mode there is no account.
 
 ## 2. Create the worktree
 

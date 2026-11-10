@@ -35,8 +35,8 @@ Run every command as `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" <command> ..
 | Command | Does |
 |---|---|
 | `conventions` | The user's rules (text). |
-| `doctor` | Tools, mode, accounts, conventions path (text; `--json`). |
-| `accounts` | remuda accounts and cached usage (text). Pass `--live` only when the user asks. |
+| `doctor` | Tools, mode, accounts, conventions path; in a checkout with `.codex/hooks.json`, the hooks that each Codex account has not trusted (text; `--json`). |
+| `accounts` | remuda accounts and cached usage (text; `--json`). A cache 24 h old or older is marked `STALE`: do not choose an account by remaining usage on those numbers. Pass `--live` only when the user asks (it starts each agent briefly). |
 | `status [--workspace W]` | Each agent pane: status, role, account, branch, lane files (text; `--json`). |
 | `worktree BRANCH --base REF --name LABEL [--orch NAME]` | A Herdr worktree in its own workspace, with a shell pane and `.fleet/` ready. `.fleet/lane.json` records your orch as the lane's owner (`--orch`: another). |
 | `spawn ...` | Start an agent in a pane and confirm that it works. See below. With `--role impl`, or no `--role`, it refuses (exit 2, `changed: nothing`) while the lane has a `.fleet/PLAN.md` whose newest `PLAN READY: <n>` round has no `PLAN APPROVED: <n>` line, also when no round is ready yet, and when git fails in a directory with a PLAN.md at or above it. There is no flag around it: approve the plan, or remove PLAN.md on purpose. |
@@ -64,7 +64,8 @@ Run every command as `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" <command> ..
 - Task file: `--task FILE` (needs `--role`) keeps the file's absolute path with the pane's role. After /clear or compaction, the SessionStart hook tells a researcher or helper to re-read it.
 - Task: `--prompt "<one line>"` (passed as an argument, so it is never pasted). Put longer tasks in a file and point at it.
 - `--resume SESSION_ID` (claude): fork that session in the new pane, for example on another account. It refuses when the target account cannot see the transcript.
-- `--accept-trust`: answer the folder trust dialog. Use it only for a worktree you just created.
+- `--accept-trust`: answer the folder trust dialog. Use it only for a worktree you just created. It never answers Codex's hooks review.
+- `warnings` in the result: start-up checks that did not stop the spawn. Codex project hooks without a trusted state on that account (Codex opens its hooks review and the start ends blocked), or a stale or missing usage cache of the chosen account. Tell the user. Never trust hooks for the user: the fix is theirs (open Codex on that account in the checkout and press `t` in the hooks review).
 - Exit code 2: the agent did not confirm. Read its pane: `herdr pane read <pane> --source recent-unwrapped --lines 300`.
 
 `watch` exit codes: 0 marker found, 4 blocked on a dialog, 5 agent exited or pane gone, 6 stopped without the marker, 7 timeout. It prints the end of the screen for 4, 6, and for 5 when the agent exited.
