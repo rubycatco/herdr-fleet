@@ -58,6 +58,11 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
 
+try:
+    import tomllib  # Python 3.11 or later: the Codex hook trust check reads config.toml with it
+except ImportError:  # pragma: no cover - the check then reports the trust as unknown
+    tomllib = None
+
 # The hooks count their git deadline from here, the first moment the script can read a clock. The start of the
 # interpreter and the compiling of this file come before it; HOOK_BEFORE_CLOCK allows for them.
 HOOK_STARTED = time.monotonic()
@@ -760,7 +765,7 @@ def untrusted_hooks_for(launch: dict, cwd: str | None) -> list[dict]:
     if not cwd:
         return []
     try:
-        return codex_untrusted_project_hooks(cwd, launch["home"])
+        return codex_untrusted_project_hooks(cwd, launch["home"])[0] or []
     except Exception:
         return []
 
@@ -5257,135 +5262,191 @@ def parse_integration_status(text: str) -> dict:
 # a trusted hash opens the review dialog ("Hooks need review", `› 1. Review hooks`) at the start. A hook whose
 # trusted hash differs from its current one (a changed hook) opens it too: that hash is Codex's own, so fleet
 # does not see a changed hook. fleet only reads; trust is the user's decision.
-CODEX_HOOK_EVENTS = {"PreToolUse": "pre_tool_use", "PermissionRequest": "permission_request",
+# The events, handler types and file rules below are what the installed Codex (0.164.0) lists in `hooks/list`, in
+# its order. It reads a hooks.json as a whole: a value of a wrong type, a handler without a known type, or a
+# top-level key other than `description` and `hooks`, and it takes no hook from the file. It skips unknown events
+# and unknown fields below the top level, prompt and agent handlers, a command handler whose command is blank and
+# an MCP handler whose server or tool is blank; it keeps async command handlers.
+CODEX_HOOK_EVENTS = {"PreModelRequest": "pre_model_request", "PostModelRequest": "post_model_request",
+                     "PreToolUse": "pre_tool_use", "PermissionRequest": "permission_request",
                      "PostToolUse": "post_tool_use", "PreCompact": "pre_compact", "PostCompact": "post_compact",
-                     "SessionStart": "session_start", "UserPromptSubmit": "user_prompt_submit", "Stop": "stop"}
+                     "SessionStart": "session_start", "SessionEnd": "session_end",
+                     "UserPromptSubmit": "user_prompt_submit", "SubagentStart": "subagent_start",
+                     "SubagentStop": "subagent_stop", "Stop": "stop", "Interrupt": "interrupt"}
+HOOK_HANDLER_TYPES = ("command", "mcp_tool", "prompt", "agent")
 HOOKS_FILE_MAX = 1024 * 1024  # bytes of a hooks.json that fleet reads at most (a project's file is the repo's)
 CODEX_CONFIG_MAX = 4 * 1024 * 1024  # bytes of a CODEX_HOME config.toml that fleet reads at most
 GIT_FILE_MAX = 4096  # bytes of a linked worktree's .git file
-TOML_KEY_PART = re.compile(r"""\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)'|([A-Za-z0-9_-]+))\s*""")
-TOML_VALUE = re.compile(r"""\s*("(?:[^"\\]|\\.)*"|'[^']*'|true|false)""")
-TOML_STATE_FIELD = re.compile(r"""\b(trusted_hash|enabled)\s*=\s*("(?:[^"\\]|\\.)*"|'[^']*'|true|false)""")
+TOML_NEEDED = "the Codex hook trust check needs Python 3.11 or later (tomllib)"
 
 
-def toml_basic(text: str) -> str:
-    try:
-        return json.loads('"' + text + '"')
-    except ValueError:
-        return text
-
-
-def toml_key_path(text: str) -> tuple[list[str] | None, str]:
-    """(the parts of the dotted TOML key at the start of `text`, the rest of `text`); None when it starts with none."""
-    parts: list[str] = []
-    pos = 0
-    while True:
-        m = TOML_KEY_PART.match(text, pos)
-        if not m or m.end() == pos:
-            return None, text
-        basic, literal, bare = m.groups()
-        parts.append(toml_basic(basic) if basic is not None else literal if literal is not None else bare)
-        pos = m.end()
-        if text.startswith(".", pos):
-            pos += 1
-            continue
-        return parts, text[pos:]
-
-
-def toml_scalar(text: str):
-    m = TOML_VALUE.match(text)
-    if not m:
-        return None
-    v = m.group(1)
-    if v in ("true", "false"):
-        return v == "true"
-    return toml_basic(v[1:-1]) if v.startswith('"') else v[1:-1]
-
-
-def codex_hook_states(home: str) -> dict | None:
-    """The hook states in the config.toml of a Codex home: {key: {"trusted_hash", "enabled"}} (a field that the file
-    does not set is missing). None when the file cannot be read. Reads `[hooks.state."<key>"]` tables, inline tables
-    under `[hooks.state]` and dotted keys; the rest of the file is not parsed (Python 3.8 has no TOML parser)."""
-    data = read_small_bytes(Path(os.path.expanduser(home)) / "config.toml", CODEX_CONFIG_MAX)
+def codex_hook_states(home: str) -> tuple[dict | None, str | None]:
+    """(the hook states in the config.toml of a Codex home, why they are unknown). States: {key: {"trusted_hash",
+    "enabled"}}, a field that the file does not set left out; {} when there is no config.toml. Unknown (None) on
+    Python before 3.11 (no tomllib), and for a file that cannot be read or that tomllib rejects. A state whose
+    fields have the wrong types counts as no state, as in Codex."""
+    if tomllib is None:
+        return None, TOML_NEEDED
+    path = Path(os.path.expanduser(home)) / "config.toml"
+    if not os.path.lexists(path):
+        return {}, None
+    data = read_small_bytes(path, CODEX_CONFIG_MAX)
     if data is None:
-        return None
+        return None, f"{path} cannot be read (not a regular file, or larger than {CODEX_CONFIG_MAX} bytes)"
+    try:
+        config = tomllib.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        return None, f"{path} is not valid TOML: {e}"
+    hooks = config.get("hooks")
+    table = hooks.get("state") if isinstance(hooks, dict) else None
     states: dict[str, dict] = {}
-    table: list[str] | None = []
-    for line in data.decode("utf-8", errors="replace").splitlines():
-        stripped = line.strip()
-        if stripped.startswith("[["):
-            table = None  # an array of tables: no hook state in it
+    for key, value in (table.items() if isinstance(table, dict) else ()):
+        if not isinstance(value, dict) or not key.strip():
             continue
-        if stripped.startswith("["):
-            path, rest = toml_key_path(stripped[1:])
-            table = path if path is not None and rest.lstrip().startswith("]") else None
+        enabled, trusted = value.get("enabled"), value.get("trusted_hash")
+        if (enabled is not None and not isinstance(enabled, bool)) or (trusted is not None
+                                                                         and not isinstance(trusted, str)):
             continue
-        if table is None or not stripped or stripped.startswith("#"):
+        state = states.setdefault(key.strip(), {})
+        if enabled is not None:
+            state["enabled"] = enabled
+        if trusted is not None:
+            state["trusted_hash"] = trusted
+    return states, None
+
+
+def json_u64(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 2 ** 64
+
+
+def json_opt_str(value) -> bool:
+    return value is None or isinstance(value, str)
+
+
+def hook_entries_of(doc, source: str) -> list[dict]:
+    """The hooks that Codex takes from the parsed hooks.json `doc` at path `source`, each with its state key:
+    {"key", "event", "group", "index", "handler", "command"} ("command": the command, or `mcp <server>/<tool>`).
+    [] when Codex would take none from the file (see the comment above CODEX_HOOK_EVENTS)."""
+    if not isinstance(doc, dict) or set(doc) - {"description", "hooks"} or not json_opt_str(doc.get("description")):
+        return []
+    hooks = doc.get("hooks", {})
+    if not isinstance(hooks, dict):
+        return []
+    entries: list[dict] = []
+    for name, event in CODEX_HOOK_EVENTS.items():
+        if name not in hooks:
             continue
-        path, rest = toml_key_path(stripped)
-        if path is None or not rest.lstrip().startswith("="):
-            continue
-        full, value = table + path, rest.lstrip()[1:]
-        if len(full) < 3 or full[:2] != ["hooks", "state"]:
-            continue
-        key = full[2].strip()
-        if not key:
-            continue
-        state = states.setdefault(key, {})
-        if len(full) == 3 and value.lstrip().startswith("{"):
-            for m in TOML_STATE_FIELD.finditer(value):
-                state[m.group(1)] = toml_scalar(m.group(2))
-        elif len(full) == 4 and full[3] in ("trusted_hash", "enabled"):
-            state[full[3]] = toml_scalar(value)
-    return states
+        groups = hooks[name]
+        if not isinstance(groups, list):
+            return []
+        for g, group in enumerate(groups):
+            if not isinstance(group, dict) or not json_opt_str(group.get("matcher")):
+                return []
+            handlers = group.get("hooks", [])
+            if not isinstance(handlers, list):
+                return []
+            for i, h in enumerate(handlers):
+                if not isinstance(h, dict) or h.get("type") not in HOOK_HANDLER_TYPES:
+                    return []
+                kind = h["type"]
+                if kind in ("command", "mcp_tool") and ((h.get("timeout") is not None and not json_u64(h["timeout"]))
+                                                        or not json_opt_str(h.get("statusMessage"))):
+                    return []
+                if kind == "command":
+                    if (not isinstance(h.get("command"), str) or not json_opt_str(h.get("commandWindows"))
+                            or ("async" in h and not isinstance(h["async"], bool))):
+                        return []
+                    if not h["command"].strip():
+                        continue
+                    what = h["command"]
+                elif kind == "mcp_tool":
+                    if not isinstance(h.get("server"), str) or not isinstance(h.get("tool"), str):
+                        return []
+                    if not h["server"].strip() or not h["tool"].strip():
+                        continue
+                    what = f"mcp {h['server']}/{h['tool']}"
+                else:
+                    continue
+                entries.append({"key": f"{source}:{event}:{g}:{i}", "event": event, "group": g, "index": i,
+                                "handler": kind, "command": what})
+    return entries
 
 
 def codex_hook_entries(hooks_file: Path) -> list[dict]:
-    """The hooks that Codex takes from one hooks.json, each with its state key: {"key", "event", "group", "index",
-    "command"}. Only command handlers that are not async and have a command; the positions count every handler. A
-    file that is missing, not regular, larger than HOOKS_FILE_MAX or not JSON gives none."""
-    hooks = read_small_json(hooks_file, HOOKS_FILE_MAX).get("hooks")
-    entries: list[dict] = []
-    if not isinstance(hooks, dict):
-        return entries
-    for name, event in CODEX_HOOK_EVENTS.items():
-        groups = hooks.get(name)
-        for g, group in enumerate(groups if isinstance(groups, list) else []):
-            handlers = group.get("hooks") if isinstance(group, dict) else None
-            for i, handler in enumerate(handlers if isinstance(handlers, list) else []):
-                if not isinstance(handler, dict) or handler.get("type") != "command" or handler.get("async") is True:
-                    continue
-                command = handler.get("command")
-                if isinstance(command, str) and command.strip():
-                    entries.append({"key": f"{hooks_file}:{event}:{g}:{i}", "event": event, "group": g, "index": i,
-                                    "command": command})
-    return entries
+    """hook_entries_of the hooks.json at `hooks_file`; none for a file that is missing, not regular, larger than
+    HOOKS_FILE_MAX or not JSON."""
+    data = read_small_bytes(hooks_file, HOOKS_FILE_MAX)
+    if data is None:
+        return []
+    try:
+        doc = json.loads(data)
+    except Exception:
+        return []
+    return hook_entries_of(doc, str(hooks_file))
 
 
 def hook_trusted(state: dict | None) -> bool:
     """Whether a hook state lets Codex start without the hooks review: it has a trusted hash."""
-    return bool(state and state.get("trusted_hash"))
+    return bool(state and isinstance(state.get("trusted_hash"), str) and state["trusted_hash"])
 
 
 def codex_hook_trusted(home: str) -> bool | None:
-    """Whether Codex runs Herdr's SessionStart hook in this home: trusted and not disabled (None: no such hook
-    found, or no config.toml)."""
+    """Whether Codex runs Herdr's SessionStart hook in this home (None: no such hook found, or the state cannot be
+    told). Without tomllib (Python before 3.11) this is the 0.9.0 check, unchanged; with it, config.toml is parsed.
+
+    Codex runs a hook from hooks.json only after the user trusts it once; the trust
+    is a `[hooks.state."<hooks.json>:session_start:<group>:<index>"]` table in config.toml.
+    """
+    if tomllib is None:
+        return codex_hook_trusted_text(home)
     base = Path(os.path.expanduser(home))
-    herdr_hooks = [e for e in codex_hook_entries(base / "hooks.json")
-                   if e["event"] == "session_start" and "herdr-agent-state" in e["command"]]
-    states = codex_hook_states(str(base)) if herdr_hooks else None
+    hooks_file = base / "hooks.json"
+    try:
+        groups = (json.loads(hooks_file.read_text()).get("hooks") or {}).get("SessionStart") or []
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not (base / "config.toml").is_file():
+        return None
+    states, _ = codex_hook_states(str(base))
     if states is None:
         return None
-    state = states.get(herdr_hooks[0]["key"])
-    return hook_trusted(state) and state.get("enabled") is not False
+    for i, group in enumerate(groups if isinstance(groups, list) else []):
+        for j, hook in enumerate((group or {}).get("hooks") or []):
+            if "herdr-agent-state" not in str((hook or {}).get("command", "")):
+                continue
+            state = states.get(f"{hooks_file}:session_start:{i}:{j}")
+            return hook_trusted(state) and state.get("enabled") is not False
+    return None
+
+
+def codex_hook_trusted_text(home: str) -> bool | None:
+    """The 0.9.0 form of codex_hook_trusted, kept for Python before 3.11 (no tomllib): a text search of config.toml."""
+    base = Path(os.path.expanduser(home))
+    hooks_file = base / "hooks.json"
+    try:
+        groups = (json.loads(hooks_file.read_text()).get("hooks") or {}).get("SessionStart") or []
+        config = (base / "config.toml").read_text(errors="replace")
+    except (OSError, ValueError, AttributeError):
+        return None
+    for i, group in enumerate(groups if isinstance(groups, list) else []):
+        for j, hook in enumerate((group or {}).get("hooks") or []):
+            if "herdr-agent-state" not in str((hook or {}).get("command", "")):
+                continue
+            parts = config.split(f'[hooks.state."{hooks_file}:session_start:{i}:{j}"]', 1)
+            if len(parts) < 2:
+                return False
+            table = parts[1].split("\n[", 1)[0]
+            return "trusted_hash" in table and not re.search(r"^\s*enabled\s*=\s*false", table, re.M)
+    return None
 
 
 def project_hook_files(cwd: str) -> list[dict]:
     """The project hooks.json files that Codex loads for a session started in `cwd`: {"file", "checkout"}, outermost
     first. Each directory from the checkout top (the first one up that has `.git`) down to `cwd` that has a `.codex`
     directory is a project layer. In a linked worktree Codex takes that layer's hooks from the main checkout (the
-    parent of the common git dir named in the worktree's `.git` file), at the same relative place, and keys them
-    by that path. File checks only, no git: bounded. Codex takes its cwd from the system, a real path."""
+    parent of the common git dir named in the worktree's `.git` file, which may be relative: it is resolved against
+    the worktree and normalized), at the same relative place, and keys them by that path. File checks only, no
+    git: bounded. Codex takes its cwd from the system, a real path."""
     try:
         start = Path(os.path.realpath(cwd))
     except (OSError, ValueError):
@@ -5399,8 +5460,7 @@ def project_hook_files(cwd: str) -> list[dict]:
             m = re.match(r"gitdir:\s*(.+)", (read_small_bytes(top / ".git", GIT_FILE_MAX) or b"").decode(
                 "utf-8", errors="replace").strip())
             if m:
-                gitdir = Path(m.group(1).strip())
-                gitdir = gitdir if gitdir.is_absolute() else top / gitdir
+                gitdir = Path(os.path.normpath(top / m.group(1).strip()))
                 if gitdir.parent.name == "worktrees":
                     main = gitdir.parent.parent.parent
         found = []
@@ -5417,22 +5477,25 @@ def project_hook_files(cwd: str) -> list[dict]:
         return []
 
 
-def codex_untrusted_project_hooks(cwd: str, home: str) -> list[dict]:
-    """The entries of the project hooks files for `cwd` (project_hook_files) that the Codex home `home` has no
-    trusted state for: Codex opens its hooks review for them. Each entry also names its "checkout"."""
+def codex_untrusted_project_hooks(cwd: str, home: str) -> tuple[list[dict] | None, str | None]:
+    """(the entries of the project hooks files for `cwd` (project_hook_files) that the Codex home `home` has no
+    trusted state for, why that cannot be told). Codex opens its hooks review for those entries; each also names its
+    "file" and "checkout". The list is None when the states are unknown (codex_hook_states) and there are entries."""
     base = os.path.expanduser(home)
-    states = codex_hook_states(base) or {}
-    found = []
+    entries = []
     for f in project_hook_files(cwd):
         try:
             if os.path.realpath(f["file"].parent) == os.path.realpath(base):
                 continue  # Codex skips a project .codex that is the home itself
         except (OSError, ValueError):
             continue
-        for e in codex_hook_entries(f["file"]):
-            if not hook_trusted(states.get(e["key"])):
-                found.append({**e, "file": str(f["file"]), "checkout": str(f["checkout"])})
-    return found
+        entries += [{**e, "file": str(f["file"]), "checkout": str(f["checkout"])} for e in codex_hook_entries(f["file"])]
+    if not entries:
+        return [], None
+    states, why = codex_hook_states(base)
+    if states is None:
+        return None, why
+    return [e for e in entries if not hook_trusted(states.get(e["key"]))], None
 
 
 def codex_launch_hint(account: str | None, home: str | None) -> str:
@@ -5515,8 +5578,9 @@ def project_hooks_report(cwd: str, homes: list[dict]) -> dict | None:
         if h["agent"] != "codex":
             continue
         home = account_home("codex", {"home": h["home"]})
-        untrusted = codex_untrusted_project_hooks(cwd, home)
-        rows.append({**h, "untrusted": untrusted, "ok": not untrusted,
+        untrusted, why = codex_untrusted_project_hooks(cwd, home)
+        rows.append({**h, "untrusted": untrusted, "ok": None if untrusted is None else not untrusted,
+                     "unknown": why,
                      "fix": hook_trust_fix(untrusted, h.get("account"), h["home"]) if untrusted else None})
     return {"cwd": cwd, "files": [str(f["file"]) for f in files], "homes": rows}
 
@@ -5593,8 +5657,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         show("codex hooks", f"{', '.join(project['files'])} (this checkout's Codex project hooks)")
         for h in project["homes"]:
             who = h["account"] or f"codex ({h['home']})"
-            state = "all trusted" if h["ok"] else (f"{len(h['untrusted'])} not trusted: "
-                                                   f"{hook_entry_names(h['untrusted'])}  fix: {h['fix']}")
+            state = (f"unknown: {h['unknown']}" if h["ok"] is None else "all trusted" if h["ok"] else
+                     f"{len(h['untrusted'])} not trusted: {hook_entry_names(h['untrusted'])}  fix: {h['fix']}")
             show("", f"{who:<16} {state}")
     show("conventions", f"{conv}" + ("" if conv.is_file() else "  (missing: run /fleet:onboard)"))
     projects = report["home"]["projects"]

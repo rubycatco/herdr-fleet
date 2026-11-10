@@ -632,19 +632,36 @@ class DoctorTests(FleetTestCase):
         self.assertIs(fleet.codex_hook_trusted(str(self.home)), True)
         config.write_text(f'{table}\nenabled = false\ntrusted_hash = "sha256:abc"\n')
         self.assertIs(fleet.codex_hook_trusted(str(self.home)), False)
+        # A comment is no setting, and a quoted field is one (tomllib); Python before 3.11 keeps the 0.9.0 check.
+        key = f'"{self.home / "hooks.json"}:session_start:1:0"'
+        config.write_text(f'[hooks.state]\n{key} = {{ trusted_hash = "h", enabled = true }} # enabled = false\n')
+        self.assertIs(fleet.codex_hook_trusted(str(self.home)), True)
+        config.write_text(f'[hooks.state]\n{key} = {{ "trusted_hash" = "h", "enabled" = false }}\n')
+        self.assertIs(fleet.codex_hook_trusted(str(self.home)), False)
+        config.write_text(f'[hooks.state]\n{key} = {{ enabled = true }} # trusted_hash = "old"\n')
+        self.assertIs(fleet.codex_hook_trusted(str(self.home)), False)
+        with mock.patch.object(fleet, "tomllib", None):
+            config.write_text(f'{table}\nenabled = false\ntrusted_hash = "sha256:abc"\n')
+            self.assertIs(fleet.codex_hook_trusted(str(self.home)), False)
+            config.write_text(f'[hooks.state]\n\n{table}\ntrusted_hash = "sha256:abc"\n')
+            self.assertIs(fleet.codex_hook_trusted(str(self.home)), True)
         (self.home / "hooks.json").write_text(json.dumps({"hooks": {"SessionStart": [other_hook]}}))
         self.assertIsNone(fleet.codex_hook_trusted(str(self.home)))
 
 
-# A project hooks file with three entries. The async handler and the prompt handler are no entries, but they keep
-# their positions: the key of an entry is its event and its place in the file.
+# A project hooks file with four entries, as the installed Codex lists them (hooks/list): an async command, an
+# event beyond the first eight (SessionEnd) and an MCP handler are entries; a prompt handler and a blank command
+# are not, but they keep their positions: the key of an entry is its event and its place in the file.
 PROJECT_HOOKS = {"hooks": {
     "SessionStart": [{"hooks": [{"type": "command", "command": "tool-a session-start"}]}],
-    "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "tool-b log", "async": True},
-                                               {"type": "command", "command": "tool-b post"}]}],
-    "Stop": [{"hooks": [{"type": "prompt"}]}, {"hooks": [{"type": "command", "command": "tool-c stop"}]}],
+    "PostToolUse": [{"matcher": "*", "hooks": [{"type": "prompt", "prompt": "check"},
+                                               {"type": "command", "command": "tool-b post", "async": True}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "  "}]},
+             {"hooks": [{"type": "mcp_tool", "server": "srv", "tool": "stop-tool"}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "tool-c end", "unknown-field": 1}]}],
 }}
-ENTRY_SUFFIXES = ["post_tool_use:0:1", "session_start:0:0", "stop:1:0"]  # in Codex's order of events
+ENTRY_SUFFIXES = ["post_tool_use:0:1", "session_start:0:0", "session_end:0:0", "stop:1:0"]  # in Codex's order
+OTHERS = ENTRY_SUFFIXES[1:]  # every entry but the async post_tool_use one
 
 HOOKS_REVIEW_SCREEN = """\
   >_ OpenAI Codex (v0.164.0)
@@ -720,19 +737,28 @@ class ProjectHookCase(FleetTestCase):
         (self.home / "config.toml").write_text(text)
 
     def untrusted(self, cwd):
-        return [e["key"] for e in fleet.codex_untrusted_project_hooks(str(cwd), str(self.home))]
+        entries, why = fleet.codex_untrusted_project_hooks(str(cwd), str(self.home))
+        self.assertIsNone(why)
+        return [e["key"] for e in entries]
 
 
 class ProjectHookTrustTests(ProjectHookCase):
     def test_entries_follow_codex_keys_and_the_main_checkout(self):
-        self.assertEqual([e["key"] for e in fleet.codex_hook_entries(self.hooks_file)],
-                         [self.key(s) for s in ENTRY_SUFFIXES])
-        self.trust("session_start:0:0", "stop:1:0")
+        self.assertEqual([(e["key"], e["handler"], e["command"]) for e in fleet.codex_hook_entries(self.hooks_file)],
+                         [(self.key("post_tool_use:0:1"), "command", "tool-b post"),
+                          (self.key("session_start:0:0"), "command", "tool-a session-start"),
+                          (self.key("session_end:0:0"), "command", "tool-c end"),
+                          (self.key("stop:1:0"), "mcp_tool", "mcp srv/stop-tool")])
+        self.assertEqual(list(fleet.CODEX_HOOK_EVENTS.values()), [
+            "pre_model_request", "post_model_request", "pre_tool_use", "permission_request", "post_tool_use",
+            "pre_compact", "post_compact", "session_start", "session_end", "user_prompt_submit", "subagent_start",
+            "subagent_stop", "stop", "interrupt"])
+        self.trust(*OTHERS)
         # In the main checkout, in the linked worktree, and below its top: the file and the key of the main
         # checkout. The worktree's own path has a table, and it does not count.
         for cwd in (self.main, self.wt, self.wt / "src"):
             self.assertEqual(self.untrusted(cwd), [self.key("post_tool_use:0:1")], cwd)
-        self.trust("session_start:0:0", "stop:1:0", "post_tool_use:0:1")
+        self.trust(*ENTRY_SUFFIXES)
         for cwd in (self.main, self.wt):
             self.assertEqual(self.untrusted(cwd), [], cwd)
         # No table at all, or no config.toml: every entry needs review.
@@ -759,6 +785,78 @@ class ProjectHookTrustTests(ProjectHookCase):
         os.mkfifo(self.hooks_file)
         self.assertEqual(self.untrusted(self.main), [])
 
+    def test_codex_reads_a_hooks_file_as_a_whole(self):
+        def keys(doc):
+            return [e["key"].rsplit(":", 3)[1:] for e in fleet.hook_entries_of(doc, "/r/.codex/hooks.json")]
+        stop = [{"hooks": [{"type": "command", "command": "y"}]}]
+        self.assertEqual(keys({"description": "d", "hooks": {"Stop": stop, "Notification": stop}}),
+                         [["stop", "0", "0"]])  # an unknown event is skipped
+        self.assertEqual(keys({"hooks": {"Stop": [{"x": 1, "matcher": None, "hooks": [
+            {"type": "command", "command": "y", "extra": 1, "timeout": 5, "statusMessage": None}]}]}}),
+            [["stop", "0", "0"]])  # unknown fields below the top level are ignored
+        self.assertEqual(keys({"hooks": {"Stop": [{"matcher": "x"}, *stop]}}), [["stop", "1", "0"]])
+        self.assertEqual(keys({"hooks": {"Stop": [{"hooks": [{"type": "mcp_tool", "server": "", "tool": "t"},
+                                                              {"type": "command", "command": "y"}]}]}}),
+                         [["stop", "0", "1"]])  # an MCP handler with a blank server is skipped
+        broken = [{"hooks": stop, "other": 1}, {"hooks": None}, {"hooks": {"Stop": None, "SessionStart": stop}},
+                  {"hooks": {"Stop": [3]}}, {"hooks": {"Stop": [{"matcher": 3, "hooks": []}], "SessionStart": stop}},
+                  {"hooks": {"Stop": [{"hooks": None}], "SessionStart": stop}}, {"description": 3, "hooks": {"Stop": stop}},
+                  {"hooks": {"Stop": [{"hooks": [{"command": "y"}]}]}},
+                  {"hooks": {"Stop": [{"hooks": [{"type": "weird", "command": "y"}]}], "SessionStart": stop}},
+                  {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": 3}]}]}},
+                  {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "y", "timeout": -1}]}]}},
+                  {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "y", "timeout": "5"}]}]}},
+                  {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "y", "async": "yes"}]}]}},
+                  {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "y", "statusMessage": 3}]}]}},
+                  {"hooks": {"Stop": [{"hooks": [{"type": "mcp_tool"}]}], "SessionStart": stop}}, []]
+        for doc in broken:  # Codex takes no hook from such a file
+            self.assertEqual(keys(doc), [], doc)
+
+    def test_quoted_fields_and_comments_in_config_toml(self):
+        key = self.key("post_tool_use:0:1")
+        others = "".join(f'"{self.key(s)}" = {{ trusted_hash = "h" }}\n' for s in OTHERS)
+        config = self.home / "config.toml"
+        # Quoted field names are TOML: the hook is trusted.
+        config.write_text(f'[hooks.state]\n{others}"{key}" = {{ "trusted_hash" = "h", "enabled" = true }}\n')
+        self.assertEqual(self.untrusted(self.wt), [])
+        # A hash only in a comment is no hash: the hook needs review.
+        config.write_text(f'[hooks.state]\n{others}"{key}" = {{ enabled = true }} # trusted_hash = "old"\n')
+        self.assertEqual(self.untrusted(self.wt), [key])
+        # A hash of the wrong type makes the state unreadable, as in Codex.
+        config.write_text(f'[hooks.state]\n{others}"{key}" = {{ trusted_hash = 3 }}\n')
+        self.assertEqual(self.untrusted(self.wt), [key])
+
+    def test_config_that_cannot_be_read_or_python_without_tomllib(self):
+        config = self.home / "config.toml"
+        config.write_text('[hooks.state\n')  # tomllib rejects it
+        entries, why = fleet.codex_untrusted_project_hooks(str(self.wt), str(self.home))
+        self.assertIsNone(entries)
+        self.assertIn("is not valid TOML", why)
+        [row] = json.loads(self.doctor("--json"))["project_hooks"]["homes"]
+        self.assertEqual((row["ok"], row["untrusted"], row["fix"]), (None, None, None))
+        self.assertIn("is not valid TOML", row["unknown"])
+        self.trust(*OTHERS)
+        with mock.patch.object(fleet, "tomllib", None):
+            self.assertEqual(fleet.codex_untrusted_project_hooks(str(self.wt), str(self.home)),
+                             (None, fleet.TOML_NEEDED))
+            self.assertIn("Python 3.11", self.doctor())
+            self.assertNotIn("post_tool_use", self.doctor())
+        # No project hooks file: nothing to tell, whatever the interpreter.
+        with mock.patch.object(fleet, "tomllib", None):
+            self.assertEqual(fleet.codex_untrusted_project_hooks(str(self.root), str(self.home)), ([], None))
+
+    def test_a_worktree_with_a_relative_gitdir_keys_the_main_checkout(self):
+        cp = subprocess.run(["git", "worktree", "add", "-h"], capture_output=True, text=True)
+        if "relative-paths" not in cp.stdout + cp.stderr:
+            self.skipTest("this git has no `git worktree add --relative-paths`")
+        rel = self.root / "rel-wt"
+        git("worktree", "add", "-q", "--relative-paths", str(rel), "-b", "feat/rel", cwd=self.main)
+        self.assertTrue((rel / ".git").read_text().startswith("gitdir: ../"))
+        self.trust(*OTHERS)
+        self.assertEqual(self.untrusted(rel), [self.key("post_tool_use:0:1")])
+        self.trust(*ENTRY_SUFFIXES)
+        self.assertEqual(self.untrusted(rel), [])
+
     def doctor(self, *argv):
         buf = io.StringIO()
         which = {"codex": "/opt/bin/codex"}
@@ -770,7 +868,7 @@ class ProjectHookTrustTests(ProjectHookCase):
         return buf.getvalue()
 
     def test_doctor_names_untrusted_entries_per_codex_home(self):
-        self.trust("session_start:0:0", "stop:1:0")
+        self.trust(*OTHERS)
         report = json.loads(self.doctor("--json"))
         [row] = report["project_hooks"]["homes"]
         self.assertEqual((row["agent"], row["home"], row["ok"]), ("codex", str(self.home), False))
@@ -781,7 +879,7 @@ class ProjectHookTrustTests(ProjectHookCase):
         self.assertIn("post_tool_use:0:1", text)
         self.assertIn("press t", text)
         self.assertIn(str(self.main), text)  # where to open Codex: the checkout that holds the hooks file
-        self.trust("session_start:0:0", "stop:1:0", "post_tool_use:0:1")
+        self.trust(*ENTRY_SUFFIXES)
         [row] = json.loads(self.doctor("--json"))["project_hooks"]["homes"]
         self.assertEqual((row["ok"], row["untrusted"], row["fix"]), (True, [], None))
         self.assertNotIn("post_tool_use", self.doctor())
@@ -834,7 +932,7 @@ class SpawnFrictionTests(ProjectHookCase):
                      "reason": "the Codex hooks review dialog is open in the pane", "notes": []}
 
     def test_untrusted_project_hooks_warn_and_name_the_blocked_reason(self):
-        self.trust("session_start:0:0", "stop:1:0")
+        self.trust(*OTHERS)
         code, out = self.spawn("--agent", "codex", "--cwd", str(self.wt))
         self.assertEqual((code, out["ok"]), (0, True))
         [warning] = out["warnings"]
@@ -853,7 +951,7 @@ class SpawnFrictionTests(ProjectHookCase):
         self.assertIn("post_tool_use:0:1", result["reason"])
 
     def test_trusted_hooks_and_claude_spawns_carry_no_hook_warning(self):
-        self.trust("session_start:0:0", "stop:1:0", "post_tool_use:0:1")
+        self.trust(*ENTRY_SUFFIXES)
         code, out = self.spawn("--agent", "codex", "--cwd", str(self.wt))
         self.assertEqual((code, out["warnings"]), (0, []))
         # The dialog shows although every entry is trusted (a changed hook, or one in CODEX_HOME): the reason
@@ -899,11 +997,27 @@ class SpawnFrictionTests(ProjectHookCase):
         self.assertEqual((code, out["warnings"]), (0, []))
 
 
+class FakeWallClock:
+    """fleet.time whose time() moves only with the harness's fake clock (its sleeps), from a fixed start: a wait
+    with a deadline in time() then ends by the helper's own sleeps, never by how long the test takes."""
+
+    def __init__(self, base):
+        self.base = base
+        self.start = base.monotonic()
+
+    def time(self):
+        return 1_000_000.0 + self.base.monotonic() - self.start
+
+    def __getattr__(self, name):
+        return getattr(self.base, name)
+
+
 class HooksReviewScreenTests(FleetTestCase):
     def start(self, status, accept_trust):
         keys = []
         lines = fleet.clean_lines(HOOKS_REVIEW_SCREEN)
-        with mock.patch.object(fleet, "pane_info", return_value={"agent": "codex", "agent_status": status}), \
+        with mock.patch.object(fleet, "time", FakeWallClock(fleet.time)), \
+                mock.patch.object(fleet, "pane_info", return_value={"agent": "codex", "agent_status": status}), \
                 mock.patch.object(fleet, "pane_lines", return_value=lines), \
                 mock.patch.object(fleet, "send_keys", side_effect=lambda *a: keys.append(a)), \
                 mock.patch.object(fleet, "choose_option", side_effect=lambda *a: keys.append(a) or True):
