@@ -4,6 +4,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -953,6 +954,11 @@ for line in sys.stdin:
         elif mode == "deep":  # valid JSON, nested deeper than a parser's recursion limit
             sys.stdout.write("[" * 200000 + "]" * 200000 + "\n")
             sys.stdout.flush()
+        elif mode == "linger":  # answers, then stays alive after its stdin closed
+            with open(os.environ["FAKE_CODEX_ANSWER"]) as f:
+                send({"id": 2, "result": json.load(f)})
+            import time
+            time.sleep(600)
         elif mode == "request":  # a request to the client with the same id comes first, then the answer
             send({"id": 2, "method": "item/tool/requestUserInput", "params": {}})
             with open(os.environ["FAKE_CODEX_ANSWER"]) as f:
@@ -972,16 +978,42 @@ def wait_for_file(path, limit=CHILD_LIMIT):
         time.sleep(0.02)
 
 
+def process_state(pid):
+    """"gone" when process `pid` no longer exists or is a zombie (it has ended; only its reaping is left), "alive"
+    when it runs. An inspection that fails raises: a failure is never proof of an exit."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "gone"
+    except PermissionError:
+        pass  # it exists (as another user's process could): ps tells whether it is a zombie
+    cp = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+    stat = cp.stdout.strip()
+    if cp.returncode == 0 and stat:
+        return "gone" if stat.startswith("Z") else "alive"
+    if cp.returncode == 1 and not stat and not cp.stderr.strip():  # ps found no such process: it ended meanwhile
+        return "gone"
+    raise AssertionError(f"cannot inspect process {pid}: ps exit {cp.returncode}: {cp.stderr.strip()}")
+
+
 def gone(pid, limit=CHILD_LIMIT):
     """Whether process `pid` ends (or is a zombie) within `limit` real seconds: a SIGKILL is delivered at once,
-    the wait only covers the reaping by its new parent. A guard against a hang, never a measure of speed."""
+    the wait only covers the reaping by its new parent. A guard against a hang, never a measure of speed. An
+    inspection that fails raises (process_state)."""
     end = time.monotonic() + limit
     while time.monotonic() < end:
-        cp = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
-        if not cp.stdout.strip() or cp.stdout.strip().startswith("Z"):
+        if process_state(pid) == "gone":
             return True
         time.sleep(0.05)
     return False
+
+
+def end_process(pid):
+    """Cleanup of a test: SIGKILL for `pid` if it still exists."""
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 class CodexHooksDoctorTests(ProjectHookCase):
@@ -1134,6 +1166,8 @@ class CodexHooksDoctorTests(ProjectHookCase):
         """The launcher of the real Codex starts a native child; a timeout ends both (the server runs in its own
         process group), and a hung server gets no grace beyond the per-home limit."""
         child_file = self.root / "child.pid"
+        # The child ends also when an assertion below fails.
+        self.addCleanup(lambda: child_file.exists() and end_process(int(child_file.read_text())))
         with mock.patch.dict(os.environ, {"FAKE_CODEX_CHILD": str(child_file)}), \
                 mock.patch.object(fleet, "wait_readable", side_effect=lambda sel, t: wait_for_file(child_file) or []):
             row = self.row(mode="tree")
@@ -1141,6 +1175,61 @@ class CodexHooksDoctorTests(ProjectHookCase):
         self.assertIn("no answer within", row["unknown"])
         pid = int(child_file.read_text())
         self.assertTrue(gone(pid), f"the native child {pid} outlived the timeout")
+
+    def test_gone_never_takes_a_failed_inspection_for_an_exit(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+        self.addCleanup(lambda: (child.kill(), child.wait()))
+        self.assertEqual(process_state(child.pid), "alive")
+        failed = subprocess.CompletedProcess(["ps"], 1, "", "ps: Operation not permitted\n")
+        with mock.patch.object(subprocess, "run", return_value=failed):
+            with self.assertRaises(AssertionError):
+                gone(child.pid)
+        child.kill()
+        child.wait()
+        self.assertTrue(gone(child.pid))
+
+    def test_a_denied_group_kill_is_unknown(self):
+        """Only ProcessLookupError means that the group is gone: a signal that fails otherwise makes the home
+        unknown, with the reason, also after a good answer; the launcher is still killed as a fallback."""
+        started = []
+        real_popen = subprocess.Popen
+
+        def popen(*a, **k):
+            started.append(real_popen(*a, **k))
+            return started[-1]
+        self.addCleanup(lambda: [(p.kill(), p.wait()) for p in started])
+        self.answer_with([])
+        with mock.patch.object(fleet.subprocess, "Popen", side_effect=popen), \
+                mock.patch.object(fleet.os, "killpg", side_effect=PermissionError(1, "Operation not permitted")):
+            row = self.row(mode="linger")
+        self.assertEqual((row["status"], row["ok"]), ("unknown", None))
+        self.assertIn("could not be ended: Operation not permitted", row["unknown"])
+        [proc] = started
+        self.assertIsNotNone(proc.poll())  # the fallback kill of the launcher
+
+    def test_the_reap_wait_keeps_to_the_limit(self):
+        """end_server waits for the launcher only for what is left of the per-home limit, and reports a launcher
+        that has not ended by then (a fake process; no real waiting)."""
+        waits = []
+
+        class Stuck:
+            pid = 999999
+            stdin = stdout = stderr = io.BytesIO()
+
+            def wait(self, timeout=None):
+                waits.append(timeout)
+                raise subprocess.TimeoutExpired("codex", timeout)
+
+            def kill(self):
+                pass
+        now = fleet.time.monotonic()
+        with mock.patch.object(fleet.os, "killpg", side_effect=ProcessLookupError()):
+            problem = fleet.end_server(Stuck(), None, now - 1, now - 1, answered=True)
+        self.assertIn("still runs at the end of the per-home limit", problem)
+        self.assertEqual(waits, [0.0, 0.0])
+        with mock.patch.object(fleet.os, "killpg", side_effect=ProcessLookupError()):
+            fleet.end_server(Stuck(), None, now + 2, now + 5, answered=False)
+        self.assertEqual(waits[2:], [5.0])
 
     def test_a_selector_failure_still_ends_the_server(self):
         started = []
@@ -1194,7 +1283,7 @@ class CodexHooksDoctorTests(ProjectHookCase):
         with mock.patch.object(fleet, "wait_readable", return_value=[]):
             row = self.row(mode="silent")
         self.assertEqual(row["status"], "unknown")
-        self.assertIn(f"no answer within {fleet.CODEX_HOOKS_TIMEOUT}s", row["unknown"])
+        self.assertIn(f"no answer within the per-home limit of {fleet.CODEX_HOOKS_TIMEOUT}s", row["unknown"])
         # A binary that cannot start.
         self.codex.chmod(0o644)
         row = self.row()

@@ -5845,7 +5845,8 @@ def project_hooks_report(cwd: str, homes: list[dict]) -> dict | None:
 # ignores) skips the start-up plugin sync. The server ends when its stdin closes. A panic inside hooks/list comes back
 # as an error answer (-32603); a crash, a timeout or another shape gives "unknown" too.
 CODEX_HOOKS_TIMEOUT = 15  # seconds per Codex home: the hard limit of the whole exchange
-CODEX_HOOKS_EXIT_WAIT = 3  # seconds for the server to end after its stdin closed; then it is killed
+CODEX_HOOKS_EXIT_WAIT = 3  # seconds at most for a server that answered to end by itself; then it is killed
+CODEX_HOOKS_REAP_RESERVE = 1  # seconds of the per-home limit kept for the end of the server (kill and reap)
 CODEX_HOOKS_OUTPUT_MAX = 8 * 1024 * 1024  # bytes of output that fleet reads at most
 CODEX_REVIEW_STATUSES = ("untrusted", "modified")  # the trust states that open Codex's hooks review
 CODEX_TRUSTED_STATUSES = ("trusted", "managed")  # the only states that count as trusted
@@ -5863,7 +5864,8 @@ def codex_rpc_lines(codex: str, env: dict, cwd: str, requests: list, answer_id: 
     for the whole exchange, its end included, and at most CODEX_HOOKS_OUTPUT_MAX bytes read. Neither the server nor
     a process that it started outlives the call (end_server)."""
     cmd = [codex, "app-server", "-c", "features.plugins=false"]
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + timeout  # the per-home limit, the end of the server included
+    talk_end = deadline - min(CODEX_HOOKS_REAP_RESERVE, timeout / 2)  # the exchange's own end, before the reap
     try:
         # Its own session, so its own process group: the launcher of Codex starts the native server as a child, and
         # the end below reaches both.
@@ -5872,66 +5874,75 @@ def codex_rpc_lines(codex: str, env: dict, cwd: str, requests: list, answer_id: 
     except (OSError, ValueError) as e:
         return None, [], f"codex could not start: {getattr(e, 'strerror', None) or e}"
     notes: list = []
-    answered = False
-    selector = None
-    try:
-        out, err, size = b"", b"", 0
-        selector = selectors.DefaultSelector()
+    state = {"answered": False, "selector": None}
+
+    def exchange() -> tuple:
         try:
-            proc.stdin.write(b"".join(json.dumps(r).encode() + b"\n" for r in requests))
-            proc.stdin.flush()
-        except BrokenPipeError:
-            pass  # it ended at once: the read loop below reports its exit and the end of its stderr
-        selector.register(proc.stdout, selectors.EVENT_READ)
-        selector.register(proc.stderr, selectors.EVENT_READ)
-        while True:
-            while b"\n" in out:
-                line, out = out.split(b"\n", 1)
-                try:
-                    msg = json.loads(line)
-                except Exception:  # not JSON, or nested too deep (RecursionError)
-                    return None, notes, f"codex app-server answered in another shape: {text_head(line.decode('utf-8', 'replace'), 80)!r}"
-                if not isinstance(msg, dict):
-                    return None, notes, "codex app-server answered in another shape: not a JSON object"
-                if msg.get("id") == answer_id and "method" not in msg:  # an answer, not a request to the client
-                    answered = True
-                    return msg, notes, None
-                if "id" in msg and "error" in msg:
-                    return None, notes, f"codex app-server refused request {msg.get('id')}: {text_head(json.dumps(msg['error']), 200)}"
-                if "method" in msg and "id" not in msg:
-                    notes.append(msg)
-            if not selector.get_map():
-                code = proc.wait(timeout=max(0.0, min(CODEX_HOOKS_EXIT_WAIT, deadline - time.monotonic())))
-                tail = text_head(err.decode("utf-8", "replace").strip()[-400:], 400)
-                return None, notes, f"codex app-server exited (code {code}) before it answered" + (
-                    f": {tail}" if tail else "")
-            left = deadline - time.monotonic()
-            events = wait_readable(selector, left) if left > 0 else []
-            if not events:
-                return None, notes, f"no answer within {timeout:g}s"
-            for key, _ in events:
-                chunk = os.read(key.fd, 65536)
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                size += len(chunk)
-                if size > CODEX_HOOKS_OUTPUT_MAX:
-                    return None, notes, f"codex app-server wrote more than {CODEX_HOOKS_OUTPUT_MAX} bytes"
-                if key.fileobj is proc.stdout:
-                    out += chunk
-                else:
-                    err = (err + chunk)[-8192:]
-    except (OSError, ValueError, subprocess.SubprocessError) as e:
-        return None, notes, f"the exchange with codex app-server failed: {getattr(e, 'strerror', None) or e}"
+            out, err, size = b"", b"", 0
+            selector = state["selector"] = selectors.DefaultSelector()
+            try:
+                proc.stdin.write(b"".join(json.dumps(r).encode() + b"\n" for r in requests))
+                proc.stdin.flush()
+            except BrokenPipeError:
+                pass  # it ended at once: the read loop below reports its exit and the end of its stderr
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            selector.register(proc.stderr, selectors.EVENT_READ)
+            while True:
+                while b"\n" in out:
+                    line, out = out.split(b"\n", 1)
+                    try:
+                        msg = json.loads(line)
+                    except Exception:  # not JSON, or nested too deep (RecursionError)
+                        return None, notes, f"codex app-server answered in another shape: {text_head(line.decode('utf-8', 'replace'), 80)!r}"
+                    if not isinstance(msg, dict):
+                        return None, notes, "codex app-server answered in another shape: not a JSON object"
+                    if msg.get("id") == answer_id and "method" not in msg:  # an answer, not a request to the client
+                        state["answered"] = True
+                        return msg, notes, None
+                    if "id" in msg and "error" in msg:
+                        return None, notes, f"codex app-server refused request {msg.get('id')}: {text_head(json.dumps(msg['error']), 200)}"
+                    if "method" in msg and "id" not in msg:
+                        notes.append(msg)
+                if not selector.get_map():
+                    code = proc.wait(timeout=max(0.0, min(CODEX_HOOKS_EXIT_WAIT, talk_end - time.monotonic())))
+                    tail = text_head(err.decode("utf-8", "replace").strip()[-400:], 400)
+                    return None, notes, f"codex app-server exited (code {code}) before it answered" + (
+                        f": {tail}" if tail else "")
+                left = talk_end - time.monotonic()
+                events = wait_readable(selector, left) if left > 0 else []
+                if not events:
+                    return None, notes, f"no answer within the per-home limit of {timeout:g}s"
+                for key, _ in events:
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    size += len(chunk)
+                    if size > CODEX_HOOKS_OUTPUT_MAX:
+                        return None, notes, f"codex app-server wrote more than {CODEX_HOOKS_OUTPUT_MAX} bytes"
+                    if key.fileobj is proc.stdout:
+                        out += chunk
+                    else:
+                        err = (err + chunk)[-8192:]
+        except (OSError, ValueError, subprocess.SubprocessError) as e:
+            return None, notes, f"the exchange with codex app-server failed: {getattr(e, 'strerror', None) or e}"
+
+    try:
+        result = exchange()
     finally:
-        end_server(proc, selector, deadline, answered)
+        problem = end_server(proc, state["selector"], talk_end, deadline, state["answered"])
+    if problem:  # a server that may still run is never a clean result
+        return None, result[1], (f"{result[2]}; " if result[2] else "") + problem
+    return result
 
 
-def end_server(proc: subprocess.Popen, selector, deadline: float, answered: bool) -> None:
-    """End a codex app-server of codex_rpc_lines and everything in its process group, within the per-home limit.
-    Its stdin closes first. A server that answered may end by itself until the deadline (CODEX_HOOKS_EXIT_WAIT at
-    most), so that it can close its state files; any other one gets no wait. Then the whole group gets SIGKILL
-    (the native child too, also when the launcher already ended), and the launcher is reaped."""
+def end_server(proc: subprocess.Popen, selector, talk_end: float, deadline: float, answered: bool) -> str | None:
+    """End a codex app-server of codex_rpc_lines and everything in its process group, within the per-home limit
+    (`deadline`); None when that is confirmed, else why not. Its stdin closes first. A server that answered may end
+    by itself until `talk_end` (CODEX_HOOKS_EXIT_WAIT at most), so that it can close its state files; any other one
+    gets no wait. Then the whole group gets SIGKILL (the native child too, also when the launcher already ended);
+    only ProcessLookupError means that the group is gone. A signal that fails otherwise falls back to a kill of the
+    launcher and is reported; so is a launcher that has not ended when the limit is over."""
     for close in ((selector.close,) if selector is not None else ()) + (proc.stdin.close, proc.stdout.close,
                                                                          proc.stderr.close):
         try:
@@ -5940,17 +5951,26 @@ def end_server(proc: subprocess.Popen, selector, deadline: float, answered: bool
             pass
     if answered:
         try:
-            proc.wait(timeout=max(0.0, min(CODEX_HOOKS_EXIT_WAIT, deadline - time.monotonic())))
+            proc.wait(timeout=max(0.0, min(CODEX_HOOKS_EXIT_WAIT, talk_end - time.monotonic())))
         except subprocess.TimeoutExpired:
             pass
+    problem = None
     try:
         os.killpg(proc.pid, signal.SIGKILL)  # the group's id is the pid of its leader (start_new_session)
-    except (ProcessLookupError, PermissionError):
+    except ProcessLookupError:
         pass  # the group has ended
+    except OSError as e:
+        problem = (f"the process group of codex app-server (pid {proc.pid}) could not be ended: "
+                   f"{getattr(e, 'strerror', None) or e}; a process that it started may still run")
+        try:
+            proc.kill()
+        except OSError:
+            pass
     try:
-        proc.wait(timeout=CODEX_HOOKS_EXIT_WAIT)
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
-        pass
+        problem = problem or f"codex app-server (pid {proc.pid}) still runs at the end of the per-home limit"
+    return problem
 
 
 def codex_listed_hook(h) -> bool:
