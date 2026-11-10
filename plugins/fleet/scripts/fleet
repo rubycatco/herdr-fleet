@@ -48,6 +48,7 @@ import re
 import selectors
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -5847,6 +5848,7 @@ CODEX_HOOKS_TIMEOUT = 15  # seconds per Codex home: the hard limit of the whole 
 CODEX_HOOKS_EXIT_WAIT = 3  # seconds for the server to end after its stdin closed; then it is killed
 CODEX_HOOKS_OUTPUT_MAX = 8 * 1024 * 1024  # bytes of output that fleet reads at most
 CODEX_REVIEW_STATUSES = ("untrusted", "modified")  # the trust states that open Codex's hooks review
+CODEX_TRUSTED_STATUSES = ("trusted", "managed")  # the only states that count as trusted
 
 
 def wait_readable(selector: selectors.BaseSelector, timeout: float) -> list:
@@ -5858,18 +5860,23 @@ def codex_rpc_lines(codex: str, env: dict, cwd: str, requests: list, answer_id: 
                     timeout: float = CODEX_HOOKS_TIMEOUT) -> tuple:
     """(the answer with id `answer_id`, the notifications before it, why there is none) of a `codex app-server` in
     `cwd` with `env`, after the `requests` (JSON objects) on its stdin. Bounded: one deadline of `timeout` seconds
-    for the whole exchange, at most CODEX_HOOKS_OUTPUT_MAX bytes read. The process never outlives the call: stdin is
-    closed, and a server that has not ended CODEX_HOOKS_EXIT_WAIT seconds later is killed."""
+    for the whole exchange, its end included, and at most CODEX_HOOKS_OUTPUT_MAX bytes read. Neither the server nor
+    a process that it started outlives the call (end_server)."""
     cmd = [codex, "app-server", "-c", "features.plugins=false"]
+    deadline = time.monotonic() + timeout
     try:
+        # Its own session, so its own process group: the launcher of Codex starts the native server as a child, and
+        # the end below reaches both.
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-                                cwd=cwd)
+                                cwd=cwd, start_new_session=True)
     except (OSError, ValueError) as e:
         return None, [], f"codex could not start: {getattr(e, 'strerror', None) or e}"
     notes: list = []
-    out, err, size = b"", b"", 0
-    selector = selectors.DefaultSelector()
+    answered = False
+    selector = None
     try:
+        out, err, size = b"", b"", 0
+        selector = selectors.DefaultSelector()
         try:
             proc.stdin.write(b"".join(json.dumps(r).encode() + b"\n" for r in requests))
             proc.stdin.flush()
@@ -5877,7 +5884,6 @@ def codex_rpc_lines(codex: str, env: dict, cwd: str, requests: list, answer_id: 
             pass  # it ended at once: the read loop below reports its exit and the end of its stderr
         selector.register(proc.stdout, selectors.EVENT_READ)
         selector.register(proc.stderr, selectors.EVENT_READ)
-        deadline = time.monotonic() + timeout
         while True:
             while b"\n" in out:
                 line, out = out.split(b"\n", 1)
@@ -5888,13 +5894,14 @@ def codex_rpc_lines(codex: str, env: dict, cwd: str, requests: list, answer_id: 
                 if not isinstance(msg, dict):
                     return None, notes, "codex app-server answered in another shape: not a JSON object"
                 if msg.get("id") == answer_id and "method" not in msg:  # an answer, not a request to the client
+                    answered = True
                     return msg, notes, None
                 if "id" in msg and "error" in msg:
                     return None, notes, f"codex app-server refused request {msg.get('id')}: {text_head(json.dumps(msg['error']), 200)}"
                 if "method" in msg and "id" not in msg:
                     notes.append(msg)
             if not selector.get_map():
-                code = proc.wait(timeout=CODEX_HOOKS_EXIT_WAIT)
+                code = proc.wait(timeout=max(0.0, min(CODEX_HOOKS_EXIT_WAIT, deadline - time.monotonic())))
                 tail = text_head(err.decode("utf-8", "replace").strip()[-400:], 400)
                 return None, notes, f"codex app-server exited (code {code}) before it answered" + (
                     f": {tail}" if tail else "")
@@ -5917,17 +5924,33 @@ def codex_rpc_lines(codex: str, env: dict, cwd: str, requests: list, answer_id: 
     except (OSError, ValueError, subprocess.SubprocessError) as e:
         return None, notes, f"the exchange with codex app-server failed: {getattr(e, 'strerror', None) or e}"
     finally:
-        selector.close()
-        for f in (proc.stdin, proc.stdout, proc.stderr):
-            try:
-                f.close()
-            except OSError:
-                pass
+        end_server(proc, selector, deadline, answered)
+
+
+def end_server(proc: subprocess.Popen, selector, deadline: float, answered: bool) -> None:
+    """End a codex app-server of codex_rpc_lines and everything in its process group, within the per-home limit.
+    Its stdin closes first. A server that answered may end by itself until the deadline (CODEX_HOOKS_EXIT_WAIT at
+    most), so that it can close its state files; any other one gets no wait. Then the whole group gets SIGKILL
+    (the native child too, also when the launcher already ended), and the launcher is reaped."""
+    for close in ((selector.close,) if selector is not None else ()) + (proc.stdin.close, proc.stdout.close,
+                                                                         proc.stderr.close):
         try:
-            proc.wait(timeout=CODEX_HOOKS_EXIT_WAIT)
+            close()
+        except Exception:
+            pass
+    if answered:
+        try:
+            proc.wait(timeout=max(0.0, min(CODEX_HOOKS_EXIT_WAIT, deadline - time.monotonic())))
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+            pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)  # the group's id is the pid of its leader (start_new_session)
+    except (ProcessLookupError, PermissionError):
+        pass  # the group has ended
+    try:
+        proc.wait(timeout=CODEX_HOOKS_EXIT_WAIT)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def codex_listed_hook(h) -> bool:
@@ -5972,12 +5995,16 @@ def codex_hooks_list(codex: str | None, env: dict, cwd: str) -> dict:
         said = "; ".join(f"{e.get('path')}: {e.get('message')}" if isinstance(e, dict) else str(e) for e in errors)
         return {**out, "unknown": f"codex could not read the hooks here: {text_head(said, 300)}"}
     project = [h for h in hooks if h["source"] == "project"]
+    strange = sorted({h["trustStatus"] for h in project} - set(CODEX_REVIEW_STATUSES + CODEX_TRUSTED_STATUSES))
+    if strange:
+        return {**out, "unknown": f"codex gave a project hook a trust status that fleet does not know: "
+                                  f"{text_head(', '.join(strange), 120)}"}
     review = [{"key": h["key"], "status": h["trustStatus"], "event": h["eventName"],
                "command": h.get("command") or "", "file": h.get("sourcePath") or h["key"].rsplit(":", 3)[0],
                "enabled": h.get("enabled")}
               for h in project if h["trustStatus"] in CODEX_REVIEW_STATUSES]
     out.update(review=review, listed=len(project), warnings=[text_head(str(w), 300) for w in warnings],
-               trusted=sum(1 for h in project if h["trustStatus"] in ("trusted", "managed")))
+               trusted=sum(1 for h in project if h["trustStatus"] in CODEX_TRUSTED_STATUSES))
     if review:
         return {**out, "status": "review", "ok": False}
     if project:
@@ -6154,21 +6181,24 @@ def usage_mark(row: dict | None) -> str:
     return "" if row["stale"] is False else "  (age unknown)"
 
 
-USAGE_LIMIT_ROW = re.compile(r"^(.*?\S)\s{2,}(?:(\d{1,3})%|-\s+reset since cached\b)")
+USAGE_LIMIT_ROW = re.compile(r"^(.*?\S)\s{2,}(?:(\d{1,3}(?:\.\d{1,6})?)%(?![\d.,%])|-\s+reset since cached\b)")
 
 
-def usage_limits(rows: list) -> list:
-    """The limits of an account's usage rows (parse_remuda_usage): [{"limit", "used"}], `used` in %. A limit that
-    reset since the cache was taken (`-  reset since cached`) is 0 %. The marks after a % (`!`, `!!`), and rows of
-    another form (a `note:` row) are no limit."""
+def usage_limits(rows: list) -> tuple:
+    """(the limits of an account's usage rows (parse_remuda_usage): [{"limit", "used"}], the first row that cannot be
+    read). `used` is the % as remuda prints it, a fraction too (91.5); a limit that reset since the cache was taken
+    (`-  reset since cached`) is 0 %. The marks after a % (`!`, `!!`) do not count, and a `note:` row is no limit.
+    Any other row is a limit that cannot be read: the caller must not judge the account by the other rows."""
     limits = []
     for row in rows or ():
         if row.lower().startswith("note:"):
             continue
         m = USAGE_LIMIT_ROW.match(row)
-        if m:
-            limits.append({"limit": m.group(1), "used": int(m.group(2)) if m.group(2) is not None else 0})
-    return limits
+        if not m:
+            return limits, row
+        used = float(m.group(2)) if m.group(2) is not None else 0.0
+        limits.append({"limit": m.group(1), "used": int(used) if used.is_integer() else used})
+    return limits, None
 
 
 def pick_candidate(account: str, row: dict | None, level: int) -> dict:
@@ -6182,7 +6212,9 @@ def pick_candidate(account: str, row: dict | None, level: int) -> dict:
         return {**out, "why": "cached usage of unknown age"}
     if row["stale"]:
         return {**out, "why": f"cached usage {age_text(row['age_seconds'])} old (stale at {USAGE_STALE_HOURS}h)"}
-    limits = usage_limits(row["rows"])
+    limits, unread = usage_limits(row["rows"])
+    if unread is not None:
+        return {**out, "why": f"a usage row cannot be read: {text_head(unread, 60)!r}"}
     if not limits:
         return {**out, "why": "no limit in the cached usage"}
     top = max(limits, key=lambda x: x["used"])

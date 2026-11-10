@@ -924,6 +924,13 @@ with open(os.environ["FAKE_CODEX_LOG"], "a") as log:
 def send(msg):
     sys.stdout.write(json.dumps(msg) + "\n")
     sys.stdout.flush()
+if mode == "tree":  # a launcher whose native child hangs: the launcher waits on it, and neither answers
+    import subprocess
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+    with open(os.environ["FAKE_CODEX_CHILD"], "w") as f:
+        f.write(str(child.pid))
+    child.wait()
+    sys.exit(0)
 if mode == "crash":
     sys.stderr.write("thread 'main' panicked at hooks/src/engine/discovery.rs:888:9:\ninternal error\n")
     sys.exit(101)
@@ -958,6 +965,25 @@ for line in sys.stdin:
 '''
 
 
+def wait_for_file(path, limit=CHILD_LIMIT):
+    """Wait (real time, a guard against a hang, never a measure of speed) until `path` exists."""
+    end = time.monotonic() + limit
+    while not path.exists() and time.monotonic() < end:
+        time.sleep(0.02)
+
+
+def gone(pid, limit=CHILD_LIMIT):
+    """Whether process `pid` ends (or is a zombie) within `limit` real seconds: a SIGKILL is delivered at once,
+    the wait only covers the reaping by its new parent. A guard against a hang, never a measure of speed."""
+    end = time.monotonic() + limit
+    while time.monotonic() < end:
+        cp = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+        if not cp.stdout.strip() or cp.stdout.strip().startswith("Z"):
+            return True
+        time.sleep(0.05)
+    return False
+
+
 class CodexHooksDoctorTests(ProjectHookCase):
     """doctor --codex-hooks asks a Codex (here a stand-in script) which project hooks need review, per Codex home;
     every failure gives unknown with the reason. Without the flag, doctor starts no Codex process."""
@@ -973,6 +999,26 @@ class CodexHooksDoctorTests(ProjectHookCase):
         self.answer = self.root / "answer.json"
         self.config = 'model = "model-x"\n'
         (self.home / "config.toml").write_text(self.config)
+        # No read of the native homes: `default` maps to temporary folders, and a read under the real ones fails.
+        native = [os.path.expanduser("~/.codex"), os.path.expanduser("~/.claude")]
+        self.native_reads = []
+
+        def guarded(real):
+            def opener(path, *a, **k):
+                text = os.fspath(path) if isinstance(path, (str, bytes, os.PathLike)) else ""
+                text = text.decode() if isinstance(text, bytes) else text
+                if any(text == n or text.startswith(n + os.sep) or text.startswith(n + ".") for n in native):
+                    self.native_reads.append(text)
+                    raise AssertionError(f"a test read the native home: {text}")
+                return real(path, *a, **k)
+            return opener
+        defaults = {"claude": str(self.root / "claude-default"), "codex": str(self.root / "codex-default")}
+        for patcher in (mock.patch.dict(fleet.DEFAULT_HOME, defaults),
+                        mock.patch("builtins.open", guarded(open)), mock.patch("io.open", guarded(io.open)),
+                        mock.patch.object(fleet.os, "open", guarded(os.open))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(lambda: self.assertEqual(self.native_reads, []))
 
     def hook(self, suffix, status, source="project", hooks_file=None, command="./hook.sh"):
         key = self.key(suffix, hooks_file)
@@ -1067,7 +1113,50 @@ class CodexHooksDoctorTests(ProjectHookCase):
         rows = json.loads(buf.getvalue())["codex_hooks"]["homes"]
         self.assertEqual([(r["account"], r["status"]) for r in rows], [("codex:default", "review"), ("codex:v0", "review")])
         self.assertEqual(sorted((s["home"] or "") for s in self.starts()), ["", "/home/u/.remuda/homes/codex/v0"])
+        self.assertEqual(rows[0]["home"], "default")
         self.assertEqual(len(self.starts()), 2)
+
+    def test_only_trusted_and_managed_count_as_trusted(self):
+        self.answer_with([self.hook("session_start:0:0", "trusted"), self.hook("stop:1:0", "managed")])
+        row = self.row()
+        self.assertEqual((row["status"], row["trusted"]), ("ok", 2))
+        self.answer_with([self.hook("session_start:0:0", "trusted"), self.hook("stop:1:0", "unexpected-state")])
+        row = self.row()
+        self.assertEqual((row["status"], row["ok"]), ("unknown", None))
+        self.assertIn("unexpected-state", row["unknown"])
+        self.assertNotIn("trusted", self.doctor("--codex-hooks").split("unknown", 1)[0].split("doctor --codex-hooks)")[-1])
+        # A strange status of a hook outside the project (a user hook) does not matter here.
+        self.answer_with([self.hook("session_start:0:0", "trusted"),
+                          self.hook("stop:1:0", "unexpected-state", source="user", hooks_file=self.home / "hooks.json")])
+        self.assertEqual(self.row()["status"], "ok")
+
+    def test_a_timeout_ends_the_whole_process_tree(self):
+        """The launcher of the real Codex starts a native child; a timeout ends both (the server runs in its own
+        process group), and a hung server gets no grace beyond the per-home limit."""
+        child_file = self.root / "child.pid"
+        with mock.patch.dict(os.environ, {"FAKE_CODEX_CHILD": str(child_file)}), \
+                mock.patch.object(fleet, "wait_readable", side_effect=lambda sel, t: wait_for_file(child_file) or []):
+            row = self.row(mode="tree")
+        self.assertEqual(row["status"], "unknown")
+        self.assertIn("no answer within", row["unknown"])
+        pid = int(child_file.read_text())
+        self.assertTrue(gone(pid), f"the native child {pid} outlived the timeout")
+
+    def test_a_selector_failure_still_ends_the_server(self):
+        started = []
+        real_popen = subprocess.Popen
+
+        def popen(*a, **k):
+            started.append(real_popen(*a, **k))
+            return started[-1]
+        self.answer_with([])
+        with mock.patch.object(fleet.subprocess, "Popen", side_effect=popen), \
+                mock.patch.object(fleet.selectors, "DefaultSelector", side_effect=OSError(24, "Too many open files")):
+            row = self.row()
+        self.assertEqual(row["status"], "unknown")
+        self.assertIn("Too many open files", row["unknown"])
+        [proc] = started
+        self.assertIsNotNone(proc.poll(), "the server still runs")
 
     def test_no_listed_project_hooks_is_never_all_trusted(self):
         summary = ("Project-local config, hooks, and exec policies are disabled in the following folders until the "
@@ -1417,6 +1506,40 @@ class PickTests(FleetTestCase):
         self.assertEqual(out["account"], "codex:first")
         code, out = self.codex(LOW, LOW, rules="- Skip level: 10 %\n")
         self.assertEqual((out["account"], out["skip_level"]), (None, 10))
+
+    def test_fractional_percentages_count_in_full(self):
+        """remuda prints a fraction too (`91.5% !!`): the whole number counts, against the level and in the rank."""
+        frac_high = ("5h                 91.5% !!  resets Nov 10 18:00", "Week (all models)    10%     resets Nov 13 12:59")
+        frac_low = ("5h                 40%     resets Nov 10 18:00", "Week (all models)  20.25%  resets Nov 13 12:59")
+        code, out = self.codex(frac_high, frac_low)  # ordered pick
+        self.assertEqual((code, out["account"], out["warnings"]), (0, "codex:second", []))
+        by = {c["account"]: c for c in out["candidates"]}
+        self.assertEqual((by["codex:first"]["used"], by["codex:first"]["above"]), (91.5, True))
+        self.assertEqual(by["codex:second"]["used"], 40)
+        self.assertIn("91.5 %", out["reason"])
+        code, out = self.codex(frac_high, frac_low, rules="- Pick order codex: most headroom\n")
+        self.assertEqual(out["account"], "codex:second")
+        code, out = self.codex(frac_low, ("Week (all models)  20.5%",), rules="- Pick order codex: most headroom\n")
+        self.assertEqual(out["account"], "codex:second")  # 20.5 below 40: the fraction ranks too
+        # The strict boundary: 85.0 is not above 85, 85.01 is.
+        code, out = self.codex(("Week (all models)  85.0%",), LOW, rules="")
+        self.assertEqual(out["account"], "codex:first")
+        code, out = self.codex(("Week (all models)  85.01%",), LOW, rules="")
+        self.assertEqual(out["account"], "codex:second")
+        # Every account above, by fractions: null.
+        code, out = self.codex(frac_high, ("Week (all models)  85.5%",), rules="")
+        self.assertEqual((code, out["account"]), (0, None))
+        self.assertIn("85.5 %", out["reason"])
+
+    def test_a_usage_row_that_cannot_be_read_makes_the_account_unknown(self):
+        for row in ("5h                 91,5%", "5h                 n/a", "Week (all models)  ~90%"):
+            code, out = self.codex(("Week (all models)  10%", row), LOW, rules="")
+            by = {c["account"]: c for c in out["candidates"]}
+            self.assertFalse(by["codex:first"]["known"], row)
+            self.assertIn("cannot be read", by["codex:first"]["why"], row)
+            self.assertEqual((out["account"], len(out["warnings"])), ("codex:first", 1), row)  # ordered: warned
+            code, out = self.codex(("Week (all models)  10%", row), LOW, rules="- Pick order codex: most headroom\n")
+            self.assertEqual(out["account"], "codex:second", row)  # most headroom: known first
 
     def test_a_reset_limit_counts_as_available(self):
         code, out = self.codex(RESET + ("Week (model-x)     -     reset since cached (Nov 8 08:00)",), LOW)
