@@ -3506,7 +3506,7 @@ class DocsTests(FleetTestCase):
         self.assertIn("Review round limit", review)
         self.assertIn("ask the user before another round", review)
         for doc in (fleet_skill, readme):
-            for text in ("`compactions`", "`review_rounds`", "`review_limit`"):
+            for text in ("`compactions`", "`review_rounds`", "`review_limit`", "`review_approved`"):
                 self.assertIn(text, doc)
         self.assertIn("Review round limit", readme)
         parser = fleet.build_parser()
@@ -4413,7 +4413,27 @@ class OrchTests(FleetTestCase):
         (a / ".fleet" / "REVIEW-REQUEST-5.md").unlink()
         out, recs, lines = self.signals(lanes, FLEET_CONVENTIONS=str(conventions))
         self.assertEqual((recs[str(a)]["phase"], recs[str(a)]["review_rounds"]), ("reviewed 4: APPROVE", 4))
+        self.assertIs(recs[str(a)]["review_approved"], True)
         self.assertTrue(lines["feat/a"].endswith("next: Fix round 4."), lines)
+        # Also once the pull request is open: the phase no longer shows the verdict, the record does.
+        pr = {"number": 7, "state": "OPEN", "url": "https://example.com/pr/7"}
+        opened = [{**lanes[0], "pr": pr}]
+        out, recs, lines = self.signals(opened, FLEET_CONVENTIONS=str(conventions))
+        self.assertEqual((recs[str(a)]["phase"], recs[str(a)]["review_approved"]), ("pr open", True))
+        self.assertTrue(lines["feat/a"].endswith("next: Fix round 4."), lines)
+        # A newest round with a change request, or a later round that was requested, keeps the note.
+        self.write_reviews(a, {"REVIEW-4-pr.md": "CHANGES REQUESTED"})
+        out, recs, lines = self.signals(opened, FLEET_CONVENTIONS=str(conventions))
+        self.assertIs(recs[str(a)]["review_approved"], False)
+        self.assertTrue(lines["feat/a"].endswith("4 review rounds (limit 4): ask the user first"), lines)
+        self.write_reviews(a, {"REVIEW-4-pr.md": "APPROVE"})
+        (a / ".fleet" / "REVIEW-REQUEST-5.md").write_text("Write REVIEW-5.md.\n")
+        out, recs, lines = self.signals(opened, FLEET_CONVENTIONS=str(conventions))
+        self.assertIs(recs[str(a)]["review_approved"], False)
+        self.assertTrue(lines["feat/a"].endswith("4 review rounds (limit 4): ask the user first"), lines)
+        # Below the limit the verdicts are not read: review_approved is null.
+        conventions.write_text("## Critic\n- Review round limit: 5\n")
+        self.assertIsNone(self.signals(opened, FLEET_CONVENTIONS=str(conventions))[1][str(a)]["review_approved"])
 
     def test_review_round_limit_reads_one_line_form_only(self):
         default = fleet.REVIEW_LIMIT_DEFAULT
@@ -4461,7 +4481,8 @@ class OrchTests(FleetTestCase):
                  ({}, "5 review rounds (limit 4): ask the user first"),
                  ({"review_rounds": 3}, "compacted 3x: fleet reset w2:p1 at the next commit"),
                  ({"review_rounds": 3, "compactions": 0}, "next: Go."),
-                 ({"phase": "reviewed 5: APPROVE"}, "compacted 3x: fleet reset w2:p1 at the next commit"),
+                 ({"review_approved": True}, "compacted 3x: fleet reset w2:p1 at the next commit"),
+                 ({"review_approved": "yes"}, "5 review rounds (limit 4): ask the user first"),
                  ({"phase": "merged"}, "next: Go."), ({"phase": "removed"}, "next: Go.")]
         for extra, note in cases:
             line = fleet.board_lines([{**base, "lane": "feat/x", **extra}])[1]
@@ -4494,6 +4515,7 @@ class OrchTests(FleetTestCase):
             self.assertIsInstance(r["compactions"], int)
             self.assertIsInstance(r["review_rounds"], int)
             self.assertEqual(r["review_limit"], 4)
+            self.assertIn("review_approved", r)
         self.assertEqual((recs[str(a)]["compactions"], recs[str(a)]["review_rounds"]), (1, 4))
         self.assertEqual((recs[str(b)]["phase"], recs[str(b)]["compactions"]), ("plan ready 1", 1))
         self.assertEqual(recs[str(self.root / "gone")]["phase"], "removed")

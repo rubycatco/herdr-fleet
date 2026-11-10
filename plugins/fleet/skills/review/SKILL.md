@@ -68,7 +68,7 @@ Read each review file yourself. For each finding, decide: fix, decline with a re
 
 ## 5. Stop
 
-The hard limit: once a lane's review files hold as many round numbers as the conventions' `Review round limit` (default 4), the board notes `<n> review rounds (limit <m>): ask the user first`. Then ask the user before another round: show the open findings and the rounds so far, and offer to merge with follow-ups, to run one more round, or to stop the lane. The helper never stops a review by itself; you do, on this note. An approved newest round or a merged lane shows no note.
+The hard limit: once a lane's review files hold as many round numbers as the conventions' `Review round limit` (default 4), the board notes `<n> review rounds (limit <m>): ask the user first`. Then ask the user before another round: show the open findings and the rounds so far, and offer to merge with follow-ups, to run one more round, or to stop the lane. The helper never stops a review by itself; you do, on this note. A lane whose newest round every critic approved (also after its pull request opened), a merged lane and a removed one show no note.
 
 Enforce the stop rule from the conventions. Once it applies, a finding below the blocking level becomes a follow-up in PROJECT.md (or an issue, if the user wants one), not another round. Each declined finding that the user may want later is a follow-up too. Add each one with the lane and the review file as its source:
 

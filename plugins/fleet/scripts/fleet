@@ -3546,10 +3546,10 @@ def review_rounds(d: Path) -> tuple[dict[int, Path], dict[int, list[Path]]]:
     return requests, reviews
 
 
-def review_verdict(path: Path) -> str | None:
+def review_verdict(path: Path, read=read_text) -> str | None:
     """`APPROVE`, `CHANGES REQUESTED` (or the text that follows) on the last `VERDICT:` line; None without one
-    (also for a missing file)."""
-    hits = VERDICT_LINE.findall(read_text(path))
+    (also for a missing file). `read`: how the file is read."""
+    hits = VERDICT_LINE.findall(read(path))
     if not hits:
         return None
     text = re.sub(r"[*_`]", "", hits[-1]).strip().upper()
@@ -3560,15 +3560,42 @@ def review_verdict(path: Path) -> str | None:
     return text or "?"
 
 
-def round_files(d: Path, n: int, requests: dict[int, Path], reviews: dict[int, list[Path]]) -> list[Path]:
+def round_files(d: Path, n: int, requests: dict[int, Path], reviews: dict[int, list[Path]],
+                read=read_text) -> list[Path]:
     """The review files that round n expects: the ones its request names (REVIEW-<n>.md, REVIEW-<n>-<name>.md),
-    else the ones that exist. A named file can be missing: its critic has not written yet."""
+    else the ones that exist. A named file can be missing: its critic has not written yet. `read`: how the
+    request is read."""
     names: list[str] = []
     if n in requests:
-        for name in re.findall(rf"\bREVIEW-{n}(?:-[A-Za-z0-9._-]+?)?\.md\b", read_text(requests[n])):
+        for name in re.findall(rf"\bREVIEW-{n}(?:-[A-Za-z0-9._-]+?)?\.md\b", read(requests[n])):
             if name not in names:
                 names.append(name)
     return [Path(d) / name for name in names] if names else reviews.get(n) or []
+
+
+REVIEW_FILE_MAX = 1024 * 1024  # bytes of a review file or request that newest_round_approved reads at most
+
+
+def bounded_text(path: Path, limit: int = REVIEW_FILE_MAX) -> str:
+    """The text of a regular file of at most `limit` bytes (read_small_file), else ''."""
+    try:
+        return read_small_file(path, limit).decode("utf-8", errors="replace")
+    except (OSError, ValueError):
+        return ""
+
+
+def newest_round_approved(d: Path, rounds: tuple[dict[int, Path], dict[int, list[Path]]]) -> bool:
+    """True when the newest round that has review files is approved: no later round was requested, and each file
+    that the round expects (round_files) has `VERDICT: APPROVE`, as `reviewed <n>: APPROVE` says. Reads the
+    round's request and review files bounded (bounded_text), whatever the lane's phase."""
+    requests, reviews = rounds
+    if not reviews:
+        return False
+    n = max(reviews)
+    if requests and max(requests) > n:
+        return False
+    files = round_files(Path(d), n, requests, reviews, read=bounded_text)
+    return bool(files) and all(review_verdict(p, read=bounded_text) == "APPROVE" for p in files)
 
 
 def implementer_pane(panes: list[dict]) -> dict | None:
@@ -3694,7 +3721,9 @@ def board_record(f: dict, events: list[dict], home: Path | None = None,
     viewer's for an unowned lane; `roots`, orch_roots): the lane sits in another clone of the project.
     `compactions`: the lane's count per pane (compaction_counts); `compactions` in the record sums those of its
     implementer and planner panes, and `compacted_pane` names the one with the most. `review_rounds` counts the
-    round numbers of its review files; `review_limit` is the limit of the conventions (review_round_limit)."""
+    round numbers of its review files; `review_limit` is the limit of the conventions (review_round_limit);
+    `review_approved`, at the limit only (else None, nothing read), whether the newest round is approved
+    (newest_round_approved), also when the phase does not show it (`pr open`)."""
     d = Path(f["path"]) / FLEET_DIR
     roles = load_panes(d)
     panes = [{"pane": p.get("pane"), "role": (roles.get(p.get("pane") or "") or {}).get("role"),
@@ -3714,7 +3743,9 @@ def board_record(f: dict, events: list[dict], home: Path | None = None,
            "follow_ups": [x["id"] for x in (follow_ups or {}).get(f.get("branch") or "", []) if x["id"]],
            "orch": lane_owner(f["path"]), "checkout": f.get("main_root"),
            "compactions": sum(n for _, n in counted), "compacted_pane": top[0] if top[1] else None,
-           "review_rounds": len(rounds[1]), "review_limit": review_limit}
+           "review_rounds": len(rounds[1]), "review_limit": review_limit,
+           "review_approved": (newest_round_approved(d, rounds)
+                               if review_limit >= 1 and len(rounds[1]) >= review_limit else None)}
     root = (roots or {}).get(out["orch"] or viewer)
     if root and f.get("main_root") and os.path.realpath(f["main_root"]) != os.path.realpath(root):
         out["clone"] = f["main_root"]
@@ -3810,14 +3841,14 @@ def as_count(value) -> int | None:
 def signal_notes(r: dict) -> tuple[str, str]:
     """(the review limit note, the compaction note) of a board record, or '' for each. Only the record's own fields
     count, so a cached board gives the same notes. None for a lane that merged or was removed; no review note once
-    the newest round is approved."""
+    the newest round is approved (`review_approved` is true)."""
     phase = as_text(r.get("phase"))
     if phase in ("merged", "removed"):
         return "", ""
     rounds, limit = as_count(r.get("review_rounds")), as_count(r.get("review_limit"))
     review = (f"{rounds} review rounds (limit {limit}): ask the user first"
               if rounds is not None and limit and limit >= 1 and rounds >= limit
-              and not (phase.startswith("reviewed ") and phase.endswith(": APPROVE")) else "")
+              and r.get("review_approved") is not True else "")
     n, pane = as_count(r.get("compactions")), as_text(r.get("compacted_pane"))
     compact = f"compacted {n}x: fleet reset {pane} at the next commit" if n and n > 0 and pane else ""
     return review, compact
@@ -4084,7 +4115,7 @@ def make_board(home: Path, since: float | None, names: dict[str, str], view: dic
                for f in lanes]
     for r in removed_records(events, since, {os.path.realpath(r["path"]) for r in records}, names, view):
         records.append({**r, "compactions": 0, "compacted_pane": None, "review_rounds": 0,
-                        "review_limit": review_limit})
+                        "review_limit": review_limit, "review_approved": None})
     if view is not None:
         view["lanes"], view["branches"] = dict(select.lanes), dict(select.branches)
         for r in records:
