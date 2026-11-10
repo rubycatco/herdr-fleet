@@ -16,7 +16,7 @@ allowed-tools:
    - `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" accounts`: accounts and cached usage. An account whose cache is 24 h old or older is marked `STALE` (`(age unknown)` when remuda cannot tell). Pass `--live` only when the user asks for fresh numbers; it starts each agent briefly, seconds per account.
    - `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" status`: the ACCOUNT column shows each pane's account.
 4. Summarize per account: plan, usage, which panes use it. Flag each account above the skip level in the conventions (default 85 % of a limit), and each `STALE` one: its numbers are old.
-5. Recommend by the user's rules, in one or two lines. When a rule chooses by usage and a candidate is `STALE`, say so and offer `accounts --live` before you rely on it.
+5. Recommend by the user's rules, in one or two lines. For a new claude or codex pane, run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" accounts --pick <agent>`: it prints the account to pass as `--account` and why, by the conventions' `- Skip level: <n> %` and `- Pick order <agent>: ...` lines (it reads the cache only and never refreshes). `account: none` means every account of that agent is above the skip level: fall back as the conventions say (for example a Claude critic instead of a Codex one), or ask. A `warning:` line names an account whose usage is unknown (stale or missing cache) and how to refresh it. When the user's rules are prose that `--pick` cannot read (its `rules:` lines say which line it could not read), choose by the prose; when such a rule chooses by usage and a candidate is `STALE`, say so and offer `accounts --live` before you rely on it.
 
 ## Switch
 

@@ -1120,6 +1120,233 @@ class UsageCacheTests(FleetTestCase):
         self.assertEqual(json.loads(buf.getvalue()), {"mode": "plain", "accounts": [], "stale_after_hours": 24})
 
 
+# `remuda list` and `remuda usage` for the pick tests (synthetic accounts and numbers), with each row form that remuda
+# prints: a plain %, a % with `!` or `!!`, a % without a reset, `-  reset since cached`, and a `note:` row.
+PICK_LIST = """\
+ACCOUNT        EMAIL                  ORG     PLAN  HOME
+claude:one     a@example.com          Org A   max   default
+claude:two     b@example.com          Org B   max   /home/u/.profiles/two
+claude:three   c@example.com          Org C   team  /home/u/.profiles/three
+codex:first    logged in (ChatGPT)    -       -     default
+codex:second   logged in (ChatGPT)    -       -     /home/u/.remuda/homes/codex/second
+"""
+
+
+def usage_block(account, header, *rows):
+    return f"{account}  {header}\n" + "".join(f"  {r}\n" for r in rows) + "\n"
+
+
+LOW = ("5h                 0%", "Week (all models)  12%     resets Nov 13 12:59")
+HIGH = ("Week (all models)  91% !   resets Nov 14 03:43", "note: at this pace 100% by Nov 11 17:19")
+FULL = ("Week (all models)  100% !!  resets Nov 11 14:39",)
+RESET = ("5h                 -     reset since cached (Nov 10 11:40)",
+         "Week (all models)  -     reset since cached (Nov 10 12:00)")
+
+
+class PickTests(FleetTestCase):
+    """fleet accounts --pick <agent>: the account to pass as --account, by the conventions' rule lines and remuda's
+    cached usage. remuda is stubbed; the conventions file is the test's own."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conventions = Path(self.tmp.name) / "conventions.md"
+        self.conventions.write_text("# Fleet conventions\n\n## Critic\n- Review round limit: 4\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def pick(self, usage, agent="codex", rules=None, json_out=True, extra=()):
+        if rules is not None:
+            self.conventions.write_text("# Fleet conventions\n\n## Accounts\n" + rules)
+        calls = []
+
+        def run(cmd, *a, **k):
+            calls.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, PICK_LIST if cmd[1] == "list" else usage, "")
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, {"FLEET_CONVENTIONS": str(self.conventions)}), \
+                mock.patch.object(fleet, "remuda_path", return_value="/opt/bin/remuda"), \
+                mock.patch.object(fleet, "run", side_effect=run), redirect_stdout(buf):
+            code = fleet.main(["accounts", "--pick", agent, *(["--json"] if json_out else []), *extra])
+        for cmd in calls:  # the cache only: --pick never refreshes and starts no agent
+            self.assertNotIn("--live", cmd)
+            self.assertIn(cmd[1], ("list", "usage"))
+        return code, (json.loads(buf.getvalue()) if json_out else buf.getvalue())
+
+    def codex(self, first, second, **kw):
+        return self.pick(usage_block("codex:first", "cached 2h ago (Nov 10 11:39)", *first)
+                         + usage_block("codex:second", "cached 5m ago (Nov 10 13:30)", *second), **kw)
+
+    def test_the_first_account_below_the_level(self):
+        code, out = self.codex(LOW, LOW)
+        self.assertEqual((code, out["mode"], out["agent"], out["account"]), (0, "remuda", "codex", "codex:first"))
+        self.assertEqual(out["warnings"], [])
+        self.assertEqual((out["skip_level"], out["order"]), (85, "remuda"))
+
+    def test_the_first_above_the_second_below(self):
+        code, out = self.codex(HIGH, LOW)
+        self.assertEqual((code, out["account"]), (0, "codex:second"))
+        self.assertIn("codex:first", out["reason"])
+        self.assertIn("91 %", out["reason"])
+        by = {c["account"]: c for c in out["candidates"]}
+        self.assertEqual((by["codex:first"]["used"], by["codex:first"]["above"]), (91, True))
+        self.assertEqual((by["codex:second"]["used"], by["codex:second"]["above"]), (12, False))
+
+    def test_every_account_above_gives_null(self):
+        code, out = self.codex(HIGH, FULL)
+        self.assertEqual((code, out["account"]), (0, None))
+        self.assertIn("every codex account is above the skip level 85 %", out["reason"])
+        code, text = self.codex(HIGH, FULL, json_out=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(text.splitlines()[0], "account: none")
+
+    def test_the_level_itself_is_not_above(self):
+        code, out = self.codex(("Week (all models)  85%     resets Nov 14 03:43",), LOW)
+        self.assertEqual(out["account"], "codex:first")
+        code, out = self.codex(LOW, LOW, rules="- Skip level: 10 %\n")
+        self.assertEqual((out["account"], out["skip_level"]), (None, 10))
+
+    def test_a_reset_limit_counts_as_available(self):
+        code, out = self.codex(RESET + ("Week (Fable)       -     reset since cached (Nov 8 08:00)",), LOW)
+        self.assertEqual(out["account"], "codex:first")
+        by = {c["account"]: c for c in out["candidates"]}
+        self.assertEqual((by["codex:first"]["used"], by["codex:first"]["known"]), (0, True))
+        # A reset row beside a full one: the full one decides.
+        code, out = self.codex(RESET + FULL, LOW)
+        self.assertEqual(out["account"], "codex:second")
+
+    def test_a_stale_cache_is_unknown_and_warned(self):
+        usage = (usage_block("codex:first", "cached 1d ago (Nov 9 10:00)", *FULL)
+                 + usage_block("codex:second", "cached 5m ago (Nov 10 13:30)", *LOW))
+        code, out = self.pick(usage)
+        self.assertEqual((code, out["account"]), (0, "codex:first"))  # an ordered pick does not skip it
+        self.assertEqual(len(out["warnings"]), 1)
+        self.assertIn("codex:first", out["warnings"][0])
+        self.assertIn("remuda usage --live codex:first", out["warnings"][0])
+        self.assertFalse({c["account"]: c for c in out["candidates"]}["codex:first"]["known"])
+        # No cache, an unknown age and a cache without a limit row are unknown too.
+        for header, rows in (("no cached usage (no auth.json)", ()), ("cached (time unknown)", LOW),
+                             ("cached 3m ago (Nov 10 13:32)", ("note: nothing yet",))):
+            usage = usage_block("codex:first", header, *rows) + usage_block("codex:second", "cached 5m ago (x)", *LOW)
+            code, out = self.pick(usage)
+            self.assertEqual((out["account"], len(out["warnings"])), ("codex:first", 1), header)
+
+    def test_no_rule_lines_give_the_defaults_with_the_reason(self):
+        code, out = self.codex(LOW, LOW, rules="- Something else: yes\n")
+        self.assertEqual((code, out["skip_level"], out["order"]), (0, 85, "remuda"))
+        notes = " ".join(out["rules"]["notes"])
+        self.assertIn("no '- Skip level: <n> %' line", notes)
+        self.assertIn("no '- Pick order codex: ...' line", notes)
+        self.assertEqual(out["rules"]["source"], str(self.conventions))
+        code, text = self.codex(LOW, LOW, rules="- Something else: yes\n", json_out=False)
+        self.assertEqual(text.splitlines()[0], "account: codex:first")
+        self.assertIn("no '- Skip level: <n> %' line", text)
+        # claude without an order line: most headroom.
+        usage = (usage_block("claude:one", "cached 1h ago (x)", "Week (all models)  60%")
+                 + usage_block("claude:two", "cached 1h ago (x)", "Week (all models)  20%", "5h  30%")
+                 + usage_block("claude:three", "cached 1h ago (x)", "Week (all models)  40%"))
+        code, out = self.pick(usage, agent="claude", rules="")
+        self.assertEqual((out["account"], out["order"]), ("claude:two", "most headroom"))
+
+    def test_malformed_rule_lines_give_the_defaults_with_the_reason(self):
+        for rules, key in (("- Skip level: 85\n", "Skip level"), ("- Skip level: high %\n", "Skip level"),
+                           ("- Skip level: 0 %\n", "Skip level"), ("- Skip level: 101 %\n", "Skip level"),
+                           ("- **Skip level**: 50 %\n", "Skip level"),
+                           ("- Skip level: 50 %\n- Skip level: 60 %\n", "disagree"),
+                           ("- Pick order codex: codex:second then codex:first\n", "Pick order"),
+                           ("- Pick order: codex:second\n", "Pick order"),
+                           ("- Pick order codex: most room\n", "Pick order")):
+            code, out = self.codex(HIGH, LOW, rules=rules)
+            self.assertEqual((code, out["skip_level"], out["order"]), (0, 85, "remuda"), rules)
+            self.assertEqual(out["account"], "codex:second", rules)
+            self.assertTrue(any(key in e for e in out["rules"]["errors"]), (rules, out["rules"]))
+        # Lines in an HTML comment do not count; a line for another agent is not this agent's.
+        code, out = self.codex(LOW, LOW, rules="<!-- - Skip level: 5 % -->\n- Pick order claude: most headroom\n")
+        self.assertEqual((out["skip_level"], out["order"], out["rules"]["errors"]), (85, "remuda", []))
+
+    def test_rule_lines_of_the_conventions(self):
+        code, out = self.codex(LOW, LOW, rules="- Skip level: 50 %. Then ask.\n- Pick order codex: second, codex:first\n")
+        self.assertEqual((out["skip_level"], out["order"], out["account"]), (50, ["codex:second", "codex:first"],
+                                                                            "codex:second"))
+        self.assertEqual(out["rules"]["errors"], [])
+        # Most headroom for codex: known accounts below the level first, by their highest limit; unknown ones after.
+        usage = (usage_block("codex:first", "cached 1d ago (x)", *LOW)
+                 + usage_block("codex:second", "cached 5m ago (x)", "Week (all models)  70%"))
+        code, out = self.pick(usage, rules="- Pick order codex: most headroom\n")
+        self.assertEqual((out["account"], out["warnings"]), ("codex:second", []))
+        usage = (usage_block("codex:first", "cached 1d ago (x)", *LOW)
+                 + usage_block("codex:second", "cached 5m ago (x)", *FULL))
+        code, out = self.pick(usage, rules="- Pick order codex: most headroom\n")
+        self.assertEqual((out["account"], len(out["warnings"])), ("codex:first", 1))
+        # The order line is the candidate list: an account it does not name is not picked; a name remuda does not
+        # know, or one of another agent, is a warning and is ignored.
+        code, out = self.codex(LOW, HIGH, rules="- Pick order codex: second, codex:nine, claude:one\n")
+        self.assertEqual((code, out["account"]), (0, None))
+        self.assertTrue(any("codex:nine" in w for w in out["warnings"]))
+        self.assertTrue(any("claude:one" in w for w in out["warnings"]))
+
+    def test_plain_mode(self):
+        buf = io.StringIO()
+        with mock.patch.object(fleet, "remuda_path", return_value=None), \
+                mock.patch.object(fleet, "run", side_effect=AssertionError("no remuda in plain mode")), \
+                redirect_stdout(buf):
+            self.assertEqual(fleet.main(["accounts", "--pick", "codex", "--json"]), 0)
+        out = json.loads(buf.getvalue())
+        self.assertEqual((out["mode"], out["account"]), ("plain", None))
+        self.assertIn("plain mode", out["reason"])
+        with mock.patch.object(fleet, "remuda_path", return_value=None), redirect_stdout(io.StringIO()) as buf:
+            self.assertEqual(fleet.main(["accounts", "--pick", "claude"]), 0)
+        self.assertEqual(buf.getvalue().splitlines()[0], "account: none")
+
+    def test_pick_never_refreshes(self):
+        with mock.patch.object(fleet, "remuda_path", return_value="/opt/bin/remuda"), \
+                mock.patch.object(fleet, "run", side_effect=AssertionError("no remuda call")), \
+                redirect_stdout(io.StringIO()), mock.patch("sys.stderr", io.StringIO()) as err:
+            self.assertEqual(fleet.main(["accounts", "--pick", "codex", "--live"]), 2)
+        self.assertIn("--live", err.getvalue())
+        with self.assertRaises(SystemExit):
+            with mock.patch("sys.stderr", io.StringIO()):
+                fleet.build_parser().parse_args(["accounts", "--pick", "gemini"])
+
+    def test_a_remuda_failure_is_an_error(self):
+        def run(cmd, *a, **k):
+            return subprocess.CompletedProcess(cmd, 1, "", "remuda: broken cache\n")
+        buf = io.StringIO()
+        with mock.patch.object(fleet, "remuda_path", return_value="/opt/bin/remuda"), \
+                mock.patch.object(fleet, "run", side_effect=run), redirect_stdout(buf):
+            self.assertEqual(fleet.main(["accounts", "--pick", "codex", "--json"]), 1)
+        out = json.loads(buf.getvalue())
+        self.assertEqual(out["account"], None)
+        self.assertIn("broken cache", out["reason"])
+
+    def test_the_defaults_carry_the_rule_lines(self):
+        defaults = (SCRIPT.parent.parent / "defaults" / "conventions.md").read_text()
+        self.assertEqual(fleet.parse_pick_rules(defaults, "codex")["skip_level"], 85)
+        rules = fleet.parse_pick_rules(defaults, "claude")
+        self.assertEqual((rules["skip_level"], rules["order"], rules["errors"]), (85, "most headroom", []))
+        self.assertIn("- Skip level: 85 %", defaults)
+        self.assertIn("- Pick order claude: most headroom", defaults)
+        self.assertIn("- Review round limit: 4.", defaults)
+
+    def test_docs_and_help_name_the_pick(self):
+        plugin = SCRIPT.parent.parent
+        for name in ("accounts", "review", "lane", "fleet"):
+            doc = (plugin / "skills" / name / "SKILL.md").read_text()
+            self.assertIn("accounts --pick <agent>", doc, name)
+        onboard = (plugin / "skills" / "onboard" / "SKILL.md").read_text()
+        for text in ("`- Skip level: <n> %`", "`- Pick order <agent>: <account>, <account>`",
+                     "`- Pick order <agent>: most headroom`"):
+            self.assertIn(text, onboard)
+        readme = (plugin.parent.parent / "README.md").read_text()
+        for text in ("accounts --pick", "- Skip level: <n> %", "most headroom", "reset since cached"):
+            self.assertIn(text, readme)
+        parser = fleet.build_parser()
+        accounts = parser._subparsers._group_actions[0].choices["accounts"]
+        help_text = " ".join(accounts.format_help().split())
+        for text in ("--pick", "Skip level", "Pick order", "most headroom", "never refreshed"):
+            self.assertIn(text, help_text)
+
+
 @contextmanager
 def ExitStackCompat(patches):
     from contextlib import ExitStack

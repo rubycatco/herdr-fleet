@@ -29,6 +29,15 @@
 - Hand the orchestrator off to a new pane when its context passes about 70 %.
 - New panes split beside the caller (right when the pane is wide, down when it is tall). Lanes get their own worktree workspace.
 
+## Accounts
+<!-- remuda mode only: plain mode has no accounts and ignores this section. `fleet accounts --pick <agent>` reads the
+     two kinds of lines below; keep their form. An order line for codex names its accounts, for example:
+- Pick order codex: codex:first, codex:second
+     Without an order line, codex takes its accounts in remuda's order and claude the one with the most headroom. -->
+- Skip level: 85 %. An account is skipped while any of its limits in `fleet accounts` is above this level. Keep this line's form: `- Skip level: <n> %`.
+- Pick order claude: most headroom. Keep this line's form: `- Pick order <agent>: most headroom`, or `- Pick order <agent>: <account>, <account>` to take the named accounts in that order (an account the line does not name is not picked).
+- Choose an account for a new pane with `fleet accounts --pick <agent>`. When it gives no account (every account is above the level), use the other agent where the conventions allow it (a Claude critic instead of a Codex one), or ask the user.
+
 ## Projects
 <!-- Optional notes per repository: setup and check commands, the base branch, and a cleanup command that
      /fleet:cleanup offers after it removes lanes. For example:

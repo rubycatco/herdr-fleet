@@ -3927,20 +3927,98 @@ def parse_review_limit(text: str) -> tuple[int, str | None]:
     return (values[0] if values else REVIEW_LIMIT_DEFAULT), None
 
 
-def review_round_limit() -> dict:
-    """`{limit, source, error?}`: the review round limit of the user's conventions file, or of the plugin defaults
-    while that file does not exist. The file is read once, bounded (read_small_file): a file that cannot be read,
-    is not a regular file or is too large gives the default and the reason, as a line that cannot be read does."""
+def conventions_text() -> tuple:
+    """(the text, the path, why it cannot be read) of the user's conventions file, or of the plugin defaults while
+    that file does not exist. The file is read once, bounded (read_small_file): a file that cannot be read, is not a
+    regular file or is too large gives no text (None) and the reason."""
     path = conventions_path()
     if not os.path.lexists(path):
         path = PLUGIN_ROOT / "defaults" / "conventions.md"
-    out = {"limit": REVIEW_LIMIT_DEFAULT, "source": str(path)}
     try:
-        text = read_small_file(path, CONVENTIONS_MAX).decode("utf-8", errors="replace")
+        return read_small_file(path, CONVENTIONS_MAX).decode("utf-8", errors="replace"), str(path), None
     except (OSError, ValueError) as e:
-        return {**out, "error": f"{path} cannot be read: {getattr(e, 'strerror', None) or e}"}
+        return None, str(path), f"{path} cannot be read: {getattr(e, 'strerror', None) or e}"
+
+
+def review_round_limit() -> dict:
+    """`{limit, source, error?}`: the review round limit of the conventions (conventions_text). A file that cannot
+    be read gives the default and the reason, as a line that cannot be read does."""
+    text, path, error = conventions_text()
+    out = {"limit": REVIEW_LIMIT_DEFAULT, "source": path}
+    if text is None:
+        return {**out, "error": error}
     limit, error = parse_review_limit(text)
     return {**out, "limit": limit, **({"error": f"{path}: {error}"} if error else {})}
+
+
+# The rules of `fleet accounts --pick`, fixed-form list items of the conventions, read as the review round limit is:
+#   - Skip level: <n> %                              (a whole number from 1 to 100; default SKIP_LEVEL_DEFAULT)
+#   - Pick order <agent>: <account>, <account>       (`<agent>:<name>` or the bare name), or
+#   - Pick order <agent>: most headroom
+# Without an order line, codex takes its accounts in remuda's order and claude takes the most headroom.
+SKIP_LEVEL_DEFAULT = 85
+SKIP_LEVEL_KEY = re.compile(r"^[ \t]*[-*][ \t]+[*_`]*skip level\b", re.I)
+SKIP_LEVEL_LINE = re.compile(r"^[ \t]*[-*][ \t]+skip level:[ \t]*(\d{1,3})[ \t]*%(?:[.,;:]?(?=[ \t]|$))", re.I)
+PICK_ORDER_KEY = re.compile(r"^[ \t]*[-*][ \t]+[*_`]*pick order\b", re.I)
+PICK_ORDER_LINE = re.compile(r"^[ \t]*[-*][ \t]+pick order[ \t]+([A-Za-z0-9_-]+):[ \t]*(.*?)[ \t]*$", re.I)
+PICK_ACCOUNT = re.compile(r"[A-Za-z0-9_.-]+(?::[^\s,]+)?\Z")
+MOST_HEADROOM = "most headroom"
+REMUDA_ORDER = "remuda"
+DEFAULT_PICK_ORDER = {"claude": MOST_HEADROOM, "codex": REMUDA_ORDER}
+
+
+def pick_order_value(value: str):
+    """The order of a `- Pick order <agent>:` line's value: MOST_HEADROOM, a list of account names, or None when it
+    is neither. As for the review round limit, `.`, `;` or `:` and a blank (or the end) end the value, and free text
+    may follow; after `most headroom`, a `,` too (in a list it parts the names)."""
+    value = value.strip()
+    if re.match(r"most headroom(?:[.,;:]?(?=[ \t]|$))", value, re.I):
+        return MOST_HEADROOM
+    value = re.split(r"[.;:](?=[ \t]|$)", value, maxsplit=1)[0]
+    names = [n.strip() for n in value.split(",")]
+    return names if names and all(PICK_ACCOUNT.match(n) for n in names) else None
+
+
+def parse_pick_rules(text: str, agent: str) -> dict:
+    """`{skip_level, order, errors, notes}`: the pick rules for `agent` in a conventions text. Text in HTML comments
+    does not count. A missing line gives its default and a note; a line whose item starts with the key in another
+    form, a level outside 1 to 100, or two lines that disagree give the default and an error. An order line for
+    another agent is not read."""
+    levels, orders, errors, notes = [], [], [], []
+    skip_bad = order_bad = False
+    for line in HTML_COMMENT.sub("", text or "").splitlines():
+        if SKIP_LEVEL_KEY.match(line):
+            m = SKIP_LEVEL_LINE.match(line)
+            if not m or not 1 <= int(m.group(1)) <= 100:
+                skip_bad = True
+                errors.append(f"{line.strip()!r} is not '- Skip level: <n> %' with a whole number from 1 to 100")
+            else:
+                levels.append(int(m.group(1)))
+        elif PICK_ORDER_KEY.match(line):
+            m = PICK_ORDER_LINE.match(line)
+            if m and m.group(1).lower() != agent:
+                continue
+            value = pick_order_value(m.group(2)) if m else None
+            if value is None:
+                order_bad = True
+                errors.append(f"{line.strip()!r} is not '- Pick order {agent}: <account>, <account>' or "
+                              f"'- Pick order {agent}: most headroom'")
+            else:
+                orders.append(value)
+    if len(set(levels)) > 1:
+        skip_bad = True
+        errors.append(f"the Skip level lines disagree: {', '.join(map(str, levels))}")
+    if len({json.dumps(o) for o in orders}) > 1:
+        order_bad = True
+        errors.append(f"the Pick order {agent} lines disagree")
+    default_order = DEFAULT_PICK_ORDER.get(agent, REMUDA_ORDER)
+    order_text = "the most headroom" if default_order == MOST_HEADROOM else "remuda's order"
+    if not levels and not skip_bad:
+        notes.append(f"no '- Skip level: <n> %' line: the default {SKIP_LEVEL_DEFAULT} %")
+    if not orders and not order_bad:
+        notes.append(f"no '- Pick order {agent}: ...' line: the default, {order_text}")
+    return {"skip_level": SKIP_LEVEL_DEFAULT if skip_bad or not levels else levels[0],
+            "order": default_order if order_bad or not orders else orders[0], "errors": errors, "notes": notes}
 
 
 def as_count(value) -> int | None:
@@ -5868,7 +5946,166 @@ def usage_mark(row: dict | None) -> str:
     return "" if row["stale"] is False else "  (age unknown)"
 
 
+USAGE_LIMIT_ROW = re.compile(r"^(.*?\S)\s{2,}(?:(\d{1,3})%|-\s+reset since cached\b)")
+
+
+def usage_limits(rows: list) -> list:
+    """The limits of an account's usage rows (parse_remuda_usage): [{"limit", "used"}], `used` in %. A limit that
+    reset since the cache was taken (`-  reset since cached`) is 0 %. The marks after a % (`!`, `!!`), and rows of
+    another form (a `note:` row) are no limit."""
+    limits = []
+    for row in rows or ():
+        if row.lower().startswith("note:"):
+            continue
+        m = USAGE_LIMIT_ROW.match(row)
+        if m:
+            limits.append({"limit": m.group(1), "used": int(m.group(2)) if m.group(2) is not None else 0})
+    return limits
+
+
+def pick_candidate(account: str, row: dict | None, level: int) -> dict:
+    """What `accounts --pick` knows of one account: {account, known, used, limit, above, why}. `used` is its
+    highest limit in % and `limit` that limit's name. A stale cache (USAGE_STALE_HOURS), one of unknown age, no
+    cache, or a cache without a limit row is unknown (`known` false, `why` says which)."""
+    out = {"account": account, "known": False, "used": None, "limit": None, "above": None, "why": None}
+    if not row or row["source"] == "none":
+        return {**out, "why": "no cached usage"}
+    if row["stale"] is None:
+        return {**out, "why": "cached usage of unknown age"}
+    if row["stale"]:
+        return {**out, "why": f"cached usage {age_text(row['age_seconds'])} old (stale at {USAGE_STALE_HOURS}h)"}
+    limits = usage_limits(row["rows"])
+    if not limits:
+        return {**out, "why": "no limit in the cached usage"}
+    top = max(limits, key=lambda x: x["used"])
+    return {**out, "known": True, "used": top["used"], "limit": top["limit"], "above": top["used"] > level}
+
+
+def pick_account(agent: str, accounts: list, usage: dict, rules: dict) -> dict:
+    """pick_from, with `order` the accounts of an order line in full (`<agent>:<name>`, the ignored ones left out)."""
+    out = pick_from(agent, accounts, usage, rules)
+    return {**out, **({"order": [c["account"] for c in out["candidates"]]} if isinstance(rules["order"], list) else {})}
+
+
+def pick_from(agent: str, accounts: list, usage: dict, rules: dict) -> dict:
+    """The account to pass as --account for a new `agent` pane: {account, reason, warnings, candidates}. `accounts`
+    are the agent's remuda accounts in remuda's order, `usage` parse_remuda_usage of the cache, `rules`
+    parse_pick_rules. An account is above the skip level when any of its limits is. An ordered pick takes the first
+    account that is not known to be above it (an unknown one with a warning); the most headroom takes the known
+    accounts below it by their highest limit (ties in remuda's order), then the unknown ones. account None when no
+    account is left."""
+    level, order = rules["skip_level"], rules["order"]
+    warnings = []
+    if isinstance(order, list):
+        names = []
+        for name in order:
+            full = name if ":" in name else f"{agent}:{name}"
+            if not full.startswith(agent + ":"):
+                warnings.append(f"the pick order names {name}, which is not a {agent} account: ignored")
+            elif full not in accounts:
+                warnings.append(f"the pick order names {name}, which remuda does not list: ignored")
+            elif full not in names:
+                names.append(full)
+        how = "the pick order of the conventions"
+    else:
+        names = list(accounts)
+        how = "remuda's order" if order == REMUDA_ORDER else MOST_HEADROOM
+    candidates = [pick_candidate(a, usage.get(a), level) for a in names]
+    if not accounts:
+        return {"account": None, "reason": f"remuda lists no {agent} account", "warnings": warnings,
+                "candidates": candidates}
+    if not candidates:
+        return {"account": None, "reason": f"the pick order of the conventions names no {agent} account that remuda "
+                                           "lists", "warnings": warnings, "candidates": candidates}
+
+    def above(c: dict) -> str:
+        return f"{c['account']} {c['used']} % ({c['limit']})"
+
+    if order == MOST_HEADROOM:
+        known = sorted((c for c in candidates if c["known"] and not c["above"]), key=lambda c: c["used"])
+        ranked = known + [c for c in candidates if not c["known"]]
+    else:
+        ranked = [c for c in candidates if not c["above"]]
+    skipped = [c for c in candidates if c["above"]]
+    if not ranked:
+        return {"account": None, "warnings": warnings, "candidates": candidates,
+                "reason": f"every {agent} account is above the skip level {level} %: "
+                          + ", ".join(above(c) for c in skipped)}
+    pick = ranked[0]
+    if pick["known"]:
+        why = (f"{pick['account']} has the most headroom" if order == MOST_HEADROOM
+               else f"{pick['account']} is the first in {how} not above the skip level {level} %")
+        why += f": its highest limit is {pick['used']} % ({pick['limit']})"
+    else:
+        why = (f"{pick['account']} is the first in {how} not known to be above the skip level {level} %"
+               if order != MOST_HEADROOM else
+               f"no {agent} account with a known usage is below the skip level {level} %, so {pick['account']}, "
+               "whose usage is unknown, is next")
+        warnings.append(f"the usage of {pick['account']} is unknown ({pick['why']}): it may be above the skip "
+                        f"level. `remuda usage --live {pick['account']}` (or `fleet accounts --live`) refreshes it; "
+                        "it starts the agent briefly")
+    if skipped:
+        why = f"above the skip level {level} %: {', '.join(above(c) for c in skipped)}; " + why
+    return {"account": pick["account"], "reason": why, "warnings": warnings, "candidates": candidates}
+
+
+def cmd_pick(args: argparse.Namespace) -> int:
+    """fleet accounts --pick <agent>: the account to pass as --account, from the cache only. It never refreshes
+    and starts no agent. No account (all above the skip level, plain mode): `account: null`, exit code 0."""
+    agent = args.pick
+    out = {"mode": "plain", "agent": agent, "account": None, "warnings": []}
+    remuda = remuda_path()
+    if not remuda:
+        out["reason"] = ("plain mode: remuda is not installed (or FLEET_NO_REMUDA=1); spawn without --account, "
+                         "with the agent's own login")
+        code = 0
+    else:
+        text, source, error = conventions_text()
+        rules = parse_pick_rules(text or "", agent)
+        if error:
+            rules["errors"].insert(0, f"{error}: the defaults apply")
+        rules["errors"] = [e if e.startswith(source) else f"{source}: {e}" for e in rules["errors"]]
+        out.update(mode="remuda", skip_level=rules["skip_level"], order=rules["order"],
+                   rules={"source": source, "errors": rules["errors"], "notes": rules["notes"]})
+        code = 0
+        try:
+            cps = [run([remuda, "list"], timeout=20), run([remuda, "usage"], timeout=60)]
+            failed = next((cp for cp in cps if cp.returncode != 0), None)
+            if failed is not None:
+                raise FleetError(f"{shlex.join(failed.args)} failed: {(failed.stderr or failed.stdout).strip()[:300]}")
+        except FleetError as e:
+            out.update(reason=str(e), candidates=[])
+            code = 1
+        else:
+            accounts = [a["account"] for a in parse_remuda_list(cps[0].stdout) if a["provider"] == agent]
+            out.update(pick_account(agent, accounts, parse_remuda_usage(cps[1].stdout), rules))
+    if args.json:
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return code
+    print(f"account: {out['account'] or 'none'}")
+    print(f"reason: {out['reason']}")
+    for w in out["warnings"]:
+        print(f"warning: {w}")
+    for c in out.get("candidates") or ():
+        state = (f"{c['used']} % ({c['limit']})" + (", above the skip level" if c["above"] else "")
+                 if c["known"] else f"unknown: {c['why']}")
+        print(f"  {c['account']:<16} {state}")
+    if out["mode"] == "remuda":
+        order = ("remuda's order" if out["order"] == REMUDA_ORDER else out["order"] if isinstance(out["order"], str)
+                 else ", ".join(out["order"]))
+        print(f"rules: skip level {out['skip_level']} %, order {order} (from {out['rules']['source']})")
+        for note in out["rules"]["notes"] + out["rules"]["errors"]:
+            print(f"  {note}")
+    return code
+
+
 def cmd_accounts(args: argparse.Namespace) -> int:
+    if args.pick:
+        if args.live:
+            sys.stderr.write("fleet accounts: --pick reads the cache only and never refreshes; run "
+                             "`fleet accounts --live` first, then --pick without --live\n")
+            return 2
+        return cmd_pick(args)
     remuda = remuda_path()
     if not remuda:
         if args.json:
@@ -6667,6 +6904,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="query usage live instead of the cache (starts each agent briefly: seconds per account)")
     a.add_argument("--json", action="store_true",
                    help=f"accounts with their parsed usage; a cache {USAGE_STALE_HOURS}h old or older has stale: true")
+    a.add_argument("--pick", choices=AGENTS, metavar="AGENT",
+                   help="print the account to pass as --account for a new claude or codex pane, and why, by the "
+                        "conventions' `- Skip level: <n> %%` (default 85) and `- Pick order <agent>: <account>, "
+                        "<account>` or `most headroom` lines (default: codex in remuda's order, claude the most "
+                        "headroom). An account with any limit above the level is skipped; a stale or missing cache "
+                        "is unknown (warned, never refreshed). account null (exit 0) when every account is above "
+                        "the level, and in plain mode")
     a.set_defaults(func=cmd_accounts)
 
     pr = sub.add_parser("prep", help="create <git top>/.fleet and keep it out of git")
