@@ -886,6 +886,13 @@ class SpawnFrictionTests(ProjectHookCase):
                                    "--cwd", str(self.root), remuda=remuda)
             self.assertEqual(len(out["warnings"]), 1, account)
             self.assertIn("usage", out["warnings"][0])
+        # Without --account the agent runs on the caller's account, which nobody chose by usage: no read, no warning.
+        self.remuda_calls.clear()
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/home/u/.profiles/team"}):
+            code, out = self.spawn("--agent", "claude", "--cwd", str(self.root), remuda=remuda)
+        self.assertEqual((code, out["account"], out["account_source"], out["warnings"]),
+                         (0, "claude:team", "caller", []))
+        self.assertEqual([argv for argv, _ in self.remuda_calls if argv[0] == "usage"], [])
         # remuda failing does not fail the spawn and gives no usage warning.
         code, out = self.spawn("--agent", "claude", "--account", "team", "--cwd", str(self.root), remuda=remuda,
                                usage="")

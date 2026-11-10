@@ -43,7 +43,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --from <impl pane> --role cr
   --prompt "Read .fleet/REVIEW-REQUEST-<n>.md and follow it."
 ```
 
-The split starts in the lane's worktree. `--accept-trust` answers the folder trust dialog there, because the critic's account has not seen this new worktree. It never answers Codex's hooks review: when the result's `warnings` or its blocked `reason` names Codex project hooks, tell the user which account must trust them (they open Codex in the checkout and press `t`), and run that critic on another account or wait. Then, for each critic, start a background watcher (Bash with `run_in_background: true`) on that critic's own output file, the one that the request names for it:
+The split starts in the lane's worktree. `--accept-trust` answers the folder trust dialog there, because the critic's account has not seen this new worktree. It never answers Codex's hooks review: when the result's `warnings` or its blocked `reason` names Codex project hooks, tell the user which account must trust them (they open Codex in the checkout and press `t`). Then, for each critic, start a background watcher (Bash with `run_in_background: true`) on that critic's own output file, the one that the request names for it:
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" watch <critic pane> --marker "VERDICT:" --file .fleet/REVIEW-<n>.md

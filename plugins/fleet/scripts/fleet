@@ -829,7 +829,9 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     # agent refreshes its own usage cache.
     untrusted = untrusted_hooks_for(launch, target.get("cwd")) if agent == "codex" else []
     warnings = [project_hooks_warning(untrusted, launch["account"], launch["home"])] if untrusted else []
-    usage_note = usage_warning(remuda, launch["account"]) if remuda and launch["account"] else None
+    # Only an account that the caller chose: the caller's own account was not chosen by usage.
+    explicit = remuda and launch["account"] and launch["account_source"] == "explicit"
+    usage_note = usage_warning(remuda, launch["account"]) if explicit else None
     warnings += [usage_note] if usage_note else []
     run(["herdr", "pane", "run", pane, launch["command"]])
     # Record the launch now: the wait can take minutes, and the caller can stop the command during it.
