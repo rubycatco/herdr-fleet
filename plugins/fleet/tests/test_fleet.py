@@ -1387,7 +1387,7 @@ class PickTests(FleetTestCase):
         self.assertEqual((out["account"], out["skip_level"]), (None, 10))
 
     def test_a_reset_limit_counts_as_available(self):
-        code, out = self.codex(RESET + ("Week (Fable)       -     reset since cached (Nov 8 08:00)",), LOW)
+        code, out = self.codex(RESET + ("Week (model-x)     -     reset since cached (Nov 8 08:00)",), LOW)
         self.assertEqual(out["account"], "codex:first")
         by = {c["account"]: c for c in out["candidates"]}
         self.assertEqual((by["codex:first"]["used"], by["codex:first"]["known"]), (0, True))
