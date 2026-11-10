@@ -648,6 +648,31 @@ class DoctorTests(FleetTestCase):
         (self.home / "hooks.json").write_text(json.dumps({"hooks": {"SessionStart": [other_hook]}}))
         self.assertIsNone(fleet.codex_hook_trusted(str(self.home)))
 
+    def test_codex_hook_trusted_with_a_defective_hooks_file(self):
+        # Review 2: a malformed hooks.json and a FIFO give None, as in 0.9.0, with no exception and no wait.
+        hooks_file = self.home / "hooks.json"
+        (self.home / "config.toml").write_text(
+            f'[hooks.state."{hooks_file}:session_start:1:0"]\ntrusted_hash = "sha256:abc"\n')
+        herdr_hook = {"hooks": [{"type": "command", "command": "herdr-agent-state session"}]}
+        for groups in ([7, herdr_hook], [{"hooks": 7}, herdr_hook], [{"hooks": [7]}, herdr_hook], 7):
+            hooks_file.write_text(json.dumps({"hooks": {"SessionStart": groups}}))
+            self.assertIsNone(fleet.codex_hook_trusted(str(self.home)), groups)
+        hooks_file.write_text(json.dumps({"hooks": {"SessionStart": [{"hooks": []}, herdr_hook]}}))
+        self.assertIs(fleet.codex_hook_trusted(str(self.home)), True)  # the guard drops no valid file
+        # doctor's hook report, with herdr stubbed to say the hook is current, does not raise either.
+        hooks_file.write_text(json.dumps({"hooks": {"SessionStart": [7, herdr_hook]}}))
+        status = subprocess.CompletedProcess([], 0, f"codex: current (v9) ({self.home}/herdr-agent-state.sh)\n", "")
+        with mock.patch.object(fleet, "run", return_value=status):
+            [row] = fleet.hook_report("herdr", [{"agent": "codex", "account": None, "home": str(self.home)}], {})
+        self.assertEqual((row["ok"], row["status"]), (True, "current (v9)"))
+        hooks_file.unlink()
+        os.mkfifo(hooks_file)  # no writer: a plain open would wait for ever
+        result = []
+        worker = threading.Thread(target=lambda: result.append(fleet.codex_hook_trusted(str(self.home))), daemon=True)
+        worker.start()
+        worker.join(CHILD_LIMIT)  # a guard against a hang, never a measure of speed
+        self.assertEqual(result, [None])
+
 
 # A project hooks file with four entries, as the installed Codex lists them (hooks/list): an async command, an
 # event beyond the first eight (SessionEnd) and an MCP handler are entries; a prompt handler and a blank command

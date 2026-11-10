@@ -5401,18 +5401,25 @@ def codex_hook_trusted(home: str) -> bool | None:
         return codex_hook_trusted_text(home)
     base = Path(os.path.expanduser(home))
     hooks_file = base / "hooks.json"
-    try:
-        groups = (json.loads(hooks_file.read_text()).get("hooks") or {}).get("SessionStart") or []
-    except (OSError, ValueError, AttributeError):
-        return None
-    if not (base / "config.toml").is_file():
+    # A bounded, non-blocking read of a regular file only (a FIFO gives {}), and no step into a value of another
+    # shape: a hooks.json that Codex itself would reject gives None, as no such hook found.
+    hooks = read_small_json(hooks_file, HOOKS_FILE_MAX).get("hooks")
+    groups = (hooks.get("SessionStart") if isinstance(hooks, dict) else None) or []
+    if not isinstance(groups, list) or not (base / "config.toml").is_file():
         return None
     states, _ = codex_hook_states(str(base))
     if states is None:
         return None
-    for i, group in enumerate(groups if isinstance(groups, list) else []):
-        for j, hook in enumerate((group or {}).get("hooks") or []):
-            if "herdr-agent-state" not in str((hook or {}).get("command", "")):
+    for i, group in enumerate(groups):
+        if not isinstance(group, dict):
+            return None
+        handlers = group.get("hooks") or []
+        if not isinstance(handlers, list):
+            return None
+        for j, hook in enumerate(handlers):
+            if not isinstance(hook, dict):
+                return None
+            if "herdr-agent-state" not in str(hook.get("command", "")):
                 continue
             state = states.get(f"{hooks_file}:session_start:{i}:{j}")
             return hook_trusted(state) and state.get("enabled") is not False
