@@ -4372,6 +4372,62 @@ class OrchTests(FleetTestCase):
         fleet.record("spawn", str(a), pane="w2:p1", cwd=str(a), branch="feat/a", role="impl")
         self.assertEqual(self.signals(lanes)[1][str(a)]["compactions"], 0)
 
+    def test_a_same_named_branch_in_another_clone_feeds_no_lane(self):
+        """Review 1, P1: a critic split from the lane's pane into another clone's lane of the same branch name.
+        An event with a path counts only for the lane that holds the path; the branch decides only without one;
+        an event's own role outside impl, planner and none never counts."""
+        a = self.add_lane("a", STATUS_md="## Next step\nGo.\n")
+        clone = self.root / "clone"
+        git("clone", "-q", str(self.repo), str(clone), cwd=self.root)
+        other = self.root / "clone-lanes" / "a"
+        other.parent.mkdir()
+        git("worktree", "add", "-q", "-b", "feat/a", str(other), cwd=clone)  # the same branch name
+        (other / ".fleet").mkdir()
+        fleet.save_panes(a / ".fleet", {"w2:p1": {"role": "impl"}})
+        fleet.save_panes(other / ".fleet", {"w2:p2": {"role": "critic"}})
+        self.session_event(other, "w2:p2", "compact", role="critic")
+        self.session_event(other, "w2:p2", "compact", role=None)  # untagged, but the path is the other clone's
+        self.session_event(other, "w2:p1", "compact")  # the lane's own pane id, in the other checkout
+        panes = [{"pane": "w2:p1", "agent": "claude", "status": "idle"},
+                 {"pane": "w2:p2", "agent": "claude", "status": "working"}]  # in a's workspace, no role in a
+        lanes = [self.facts(a, panes=panes)]
+        out, recs, lines = self.signals(lanes)
+        self.assertEqual((recs[str(a)]["compactions"], recs[str(a)]["compacted_pane"]), (0, None))
+        self.assertTrue(lines["feat/a"].endswith("next: Go."), lines)
+        # The event's own role wins over the lane's panes.json, in the lane's own checkout too.
+        for role in ("critic", "researcher", "helper", "orchestrator"):
+            self.session_event(a, "w2:p1", "compact", role=role)
+        self.assertEqual(self.signals(lanes)[1][str(a)]["compactions"], 0)
+        # Without a path, the branch decides.
+        fleet.record("session_start", None, by=False, home=self.project, pane="w2:p1", branch="feat/a",
+                     agent="claude", role="impl", source="compact")
+        self.session_event(a, "w2:p1", "compact")
+        recs = self.signals(lanes)[1]
+        self.assertEqual((recs[str(a)]["compactions"], recs[str(a)]["compacted_pane"]), (2, "w2:p1"))
+
+    def test_an_unreadable_request_never_approves_a_round(self):
+        """Review 1, P2: a request that exists and cannot be read within the bound gives review_approved false; a
+        readable request that names no report keeps the fallback to the reports that exist."""
+        a = self.add_lane("a", STATUS_md="## Next step\nWait for the second critic.\n")
+        self.write_reviews(a, {"REVIEW-1.md": "CHANGES REQUESTED", "REVIEW-2.md": "CHANGES REQUESTED",
+                               "REVIEW-3.md": "CHANGES REQUESTED", "REVIEW-4.md": "APPROVE"})
+        request = a / ".fleet" / "REVIEW-REQUEST-4.md"
+        request.write_text("Write REVIEW-4.md and REVIEW-4-second.md.\n" + "x" * (fleet.REVIEW_FILE_MAX + 1))
+        lanes = [self.facts(a, panes=[{"pane": "w2:p1", "agent": "claude", "status": "idle"}])]
+        out, recs, lines = self.signals(lanes)
+        self.assertEqual((recs[str(a)]["phase"], recs[str(a)]["review_approved"]), ("review 4", False))
+        self.assertTrue(lines["feat/a"].endswith("4 review rounds (limit 4): ask the user first"), lines)
+        request.write_text("Write REVIEW-4.md and REVIEW-4-second.md.\n")  # readable: the second is missing
+        self.assertIs(self.signals(lanes)[1][str(a)]["review_approved"], False)
+        request.unlink()
+        os.mkfifo(request)  # not a regular file: never read, never approved
+        self.assertIs(self.signals(lanes)[1][str(a)]["review_approved"], False)
+        request.unlink()
+        request.write_text("Review the lane.\n")  # names no report: the reports that exist decide
+        out, recs, lines = self.signals(lanes)
+        self.assertEqual((recs[str(a)]["phase"], recs[str(a)]["review_approved"]), ("reviewed 4: APPROVE", True))
+        self.assertTrue(lines["feat/a"].endswith("next: Wait for the second critic."), lines)
+
     def test_board_counts_a_planners_compactions(self):
         a = self.add_lane("a", PLAN_md="Risk: none\n")
         fleet.save_panes(a / ".fleet", {"w2:p1": {"role": "planner"}})
@@ -4507,8 +4563,10 @@ class OrchTests(FleetTestCase):
         self.write_reviews(a, {f"REVIEW-{n}.md": "CHANGES REQUESTED" for n in range(1, 5)})
         lanes = [self.facts(a, panes=[{"pane": "w2:p1", "agent": "claude", "status": "idle"}]),
                  self.facts(b, panes=[{"pane": "w3:p1", "agent": "claude", "status": "idle"}])]
-        fleet.write_json(self.project / "digest.json", {"cursor": "2020-01-01T00:00:00+00:00", "lanes": {}})
-        fleet.record("cleanup", str(self.repo), lane=str(self.root / "gone"), branch="feat/gone", removed=True)
+        # The cursor and the cleanup event both have fixed times, the event after the cursor: no wall clock.
+        fleet.write_json(self.project / "digest.json", {"cursor": "2026-01-01T00:00:00+00:00", "lanes": {}})
+        with mock.patch.object(fleet, "now_iso", return_value="2026-01-02T00:00:00+00:00"):
+            fleet.record("cleanup", str(self.repo), lane=str(self.root / "gone"), branch="feat/gone", removed=True)
         out, recs, lines = self.signals(lanes)
         self.assertEqual(len(recs), 3)
         for r in recs.values():

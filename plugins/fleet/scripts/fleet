@@ -3576,26 +3576,31 @@ def round_files(d: Path, n: int, requests: dict[int, Path], reviews: dict[int, l
 REVIEW_FILE_MAX = 1024 * 1024  # bytes of a review file or request that newest_round_approved reads at most
 
 
-def bounded_text(path: Path, limit: int = REVIEW_FILE_MAX) -> str:
-    """The text of a regular file of at most `limit` bytes (read_small_file), else ''."""
-    try:
-        return read_small_file(path, limit).decode("utf-8", errors="replace")
-    except (OSError, ValueError):
-        return ""
+def bounded_text(path: Path) -> str:
+    """The text of a regular file of at most REVIEW_FILE_MAX bytes (read_small_file). OSError or ValueError when
+    it cannot be read within that bound: the caller must not take that for an empty file."""
+    return read_small_file(path, REVIEW_FILE_MAX).decode("utf-8", errors="replace")
 
 
 def newest_round_approved(d: Path, rounds: tuple[dict[int, Path], dict[int, list[Path]]]) -> bool:
     """True when the newest round that has review files is approved: no later round was requested, and each file
     that the round expects (round_files) has `VERDICT: APPROVE`, as `reviewed <n>: APPROVE` says. Reads the
-    round's request and review files bounded (bounded_text), whatever the lane's phase."""
+    round's request and review files bounded (bounded_text), whatever the lane's phase. A request that exists and
+    an expected review file that cannot be read within the bound (missing, too large, not a regular file) give
+    False: only a request that was read and names no report falls back to the reports that exist."""
     requests, reviews = rounds
     if not reviews:
         return False
     n = max(reviews)
     if requests and max(requests) > n:
         return False
-    files = round_files(Path(d), n, requests, reviews, read=bounded_text)
-    return bool(files) and all(review_verdict(p, read=bounded_text) == "APPROVE" for p in files)
+    if n not in requests and os.path.lexists(Path(d) / f"REVIEW-REQUEST-{n}.md"):
+        return False  # a request that review_rounds does not list (not a regular file) cannot be read
+    try:
+        files = round_files(Path(d), n, requests, reviews, read=bounded_text)
+        return bool(files) and all(review_verdict(p, read=bounded_text) == "APPROVE" for p in files)
+    except (OSError, ValueError):
+        return False
 
 
 def implementer_pane(panes: list[dict]) -> dict | None:
@@ -3764,8 +3769,10 @@ def compaction_counts(events: list[dict], lanes: list[dict]) -> dict[str, dict[s
     `session_start` events with `source: compact` since the pane's last fresh context. A `spawn` in the pane, a
     `reset` of it that succeeded (`ok`), or a `session_start` with `source` `clear` or `startup` (a /clear by hand,
     a new agent) sets it back to 0; a resumed session keeps its count. An event counts for a lane when its `pane`
-    is one of the lane's panes and it is the lane's (its branch, or a path in the lane's checkout, as
-    newest_lane_event). Reads no file."""
+    is one of the lane's panes and it is the lane's: an event with a path (`cwd` or `lane`) when that path is in
+    the lane's checkout, whatever its branch (another clone can have a branch of the same name); an event without
+    one by its branch. A compaction whose event names a role outside COMPACTION_ROLES (a critic, a researcher, a
+    helper) never counts, whatever the lane's panes.json says of the pane now. Reads no file."""
     wanted: dict[str, list[dict]] = {}
     for f in lanes:
         for p in f.get("panes") or []:
@@ -3779,10 +3786,12 @@ def compaction_counts(events: list[dict], lanes: list[dict]) -> dict[str, dict[s
         source = e.get("source")
         fresh = (kind == "spawn" or (kind == "reset" and e.get("ok") is True)
                  or (kind == "session_start" and source in ("clear", "startup")))
-        if not fresh and not (kind == "session_start" and source == "compact"):
+        if not fresh and not (kind == "session_start" and source == "compact" and e.get("role") in COMPACTION_ROLES):
             continue
+        paths = [os.path.expanduser(p) for p in (e.get("lane"), e.get("cwd")) if isinstance(p, str) and p]
         for f in wanted[pane]:
-            if not ((f.get("branch") and e.get("branch") == f["branch"]) or lane_matches(e, f["path"])):
+            if not (any(inside(p, f["path"]) for p in paths) if paths
+                    else bool(f.get("branch")) and e.get("branch") == f["branch"]):
                 continue
             lane = counts.setdefault(f["path"], {})
             lane[pane] = 0 if fresh else lane.get(pane, 0) + 1
