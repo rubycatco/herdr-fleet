@@ -5870,8 +5870,11 @@ def codex_rpc_lines(codex: str, env: dict, cwd: str, requests: list, answer_id: 
     out, err, size = b"", b"", 0
     selector = selectors.DefaultSelector()
     try:
-        proc.stdin.write(b"".join(json.dumps(r).encode() + b"\n" for r in requests))
-        proc.stdin.flush()
+        try:
+            proc.stdin.write(b"".join(json.dumps(r).encode() + b"\n" for r in requests))
+            proc.stdin.flush()
+        except BrokenPipeError:
+            pass  # it ended at once: the read loop below reports its exit and the end of its stderr
         selector.register(proc.stdout, selectors.EVENT_READ)
         selector.register(proc.stderr, selectors.EVENT_READ)
         deadline = time.monotonic() + timeout
@@ -5880,11 +5883,11 @@ def codex_rpc_lines(codex: str, env: dict, cwd: str, requests: list, answer_id: 
                 line, out = out.split(b"\n", 1)
                 try:
                     msg = json.loads(line)
-                except ValueError:
+                except Exception:  # not JSON, or nested too deep (RecursionError)
                     return None, notes, f"codex app-server answered in another shape: {text_head(line.decode('utf-8', 'replace'), 80)!r}"
                 if not isinstance(msg, dict):
                     return None, notes, "codex app-server answered in another shape: not a JSON object"
-                if msg.get("id") == answer_id:
+                if msg.get("id") == answer_id and "method" not in msg:  # an answer, not a request to the client
                     return msg, notes, None
                 if "id" in msg and "error" in msg:
                     return None, notes, f"codex app-server refused request {msg.get('id')}: {text_head(json.dumps(msg['error']), 200)}"
@@ -6003,7 +6006,12 @@ def codex_hooks_report(cwd: str, homes: list, env: dict) -> dict:
     codex_homes = [h for h in homes if h["agent"] == "codex"] or [
         {"agent": "codex", "account": None, "home": env.get("CODEX_HOME") or "default"}]  # plain mode, no codex
     for h in codex_homes:
-        row = {**h, **codex_hooks_list(codex, config_env("codex", h["home"], env), here)}
+        try:
+            found = codex_hooks_list(codex, config_env("codex", h["home"], env), here)
+        except Exception as e:  # never a traceback: whatever goes wrong is unknown, with the reason
+            found = {"status": "unknown", "ok": None, "review": [], "trusted": 0, "listed": 0, "warnings": [],
+                     "note": None, "unknown": f"fleet could not read the answer: {type(e).__name__}: {e}"}
+        row = {**h, **found}
         files = sorted({r["file"] for r in row["review"]})
         row["fix"] = (hook_trust_fix([{"checkout": str(Path(f).parent.parent)} for f in files], h.get("account"),
                                      h["home"]) if row["review"] else None)
@@ -6228,8 +6236,9 @@ def pick_from(agent: str, accounts: list, usage: dict, rules: dict) -> dict:
         ranked = [c for c in candidates if not c["above"]]
     skipped = [c for c in candidates if c["above"]]
     if not ranked:
+        who = (f"every account of the pick order" if isinstance(order, list) else f"every {agent} account")
         return {"account": None, "warnings": warnings, "candidates": candidates,
-                "reason": f"every {agent} account is above the skip level {level} %: "
+                "reason": f"{who} is above the skip level {level} %: "
                           + ", ".join(above(c) for c in skipped)}
     pick = ranked[0]
     if pick["known"]:

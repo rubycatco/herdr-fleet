@@ -943,6 +943,13 @@ for line in sys.stdin:
                                      "message \"internal error: entered unreachable code\""}})
         elif mode == "shape":
             send({"id": 2, "result": {"data": "not a list"}})
+        elif mode == "deep":  # valid JSON, nested deeper than a parser's recursion limit
+            sys.stdout.write("[" * 200000 + "]" * 200000 + "\n")
+            sys.stdout.flush()
+        elif mode == "request":  # a request to the client with the same id comes first, then the answer
+            send({"id": 2, "method": "item/tool/requestUserInput", "params": {}})
+            with open(os.environ["FAKE_CODEX_ANSWER"]) as f:
+                send({"id": 2, "result": json.load(f)})
         elif mode == "garbage":
             sys.stdout.write("this is not json\n")
             sys.stdout.flush()
@@ -1038,6 +1045,30 @@ class CodexHooksDoctorTests(ProjectHookCase):
         row = self.row()
         self.assertEqual((row["status"], row["ok"], row["review"], row["fix"]), ("ok", True, [], None))
 
+    def test_a_request_with_the_answer_id_is_no_answer(self):
+        self.answer_with([self.hook("stop:1:0", "untrusted")])
+        row = self.row(mode="request")
+        self.assertEqual((row["status"], [h["key"] for h in row["review"]]), ("review", [self.key("stop:1:0")]))
+
+    def test_one_codex_process_per_codex_home_of_remuda(self):
+        """With remuda, one app-server per Codex account, each with its own CODEX_HOME (unset for `default`), and
+        none for a Claude account."""
+        self.answer_with([self.hook("stop:1:0", "untrusted")])
+        accounts = fleet.parse_remuda_list(REMUDA_LIST)
+        buf = io.StringIO()
+        env = {"CODEX_HOME": str(self.home), "FAKE_CODEX_LOG": str(self.log), "FAKE_CODEX_ANSWER": str(self.answer),
+               "FAKE_CODEX_MODE": "answer"}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(fleet, "remuda_path", return_value="/opt/bin/remuda"), \
+                mock.patch.object(fleet, "remuda_accounts", return_value=accounts), \
+                mock.patch.object(fleet.shutil, "which", side_effect=lambda name: {"codex": str(self.codex)}.get(name)), \
+                mock.patch.object(fleet, "tool_version", return_value="x 0.0.0"), chdir(self.wt), redirect_stdout(buf):
+            self.assertEqual(fleet.main(["doctor", "--json", "--codex-hooks"]), 0)
+        rows = json.loads(buf.getvalue())["codex_hooks"]["homes"]
+        self.assertEqual([(r["account"], r["status"]) for r in rows], [("codex:default", "review"), ("codex:v0", "review")])
+        self.assertEqual(sorted((s["home"] or "") for s in self.starts()), ["", "/home/u/.remuda/homes/codex/v0"])
+        self.assertEqual(len(self.starts()), 2)
+
     def test_no_listed_project_hooks_is_never_all_trusted(self):
         summary = ("Project-local config, hooks, and exec policies are disabled in the following folders until the "
                    "project is trusted, but skills still load.\n    1. /x/.codex\n")
@@ -1052,7 +1083,8 @@ class CodexHooksDoctorTests(ProjectHookCase):
 
     def test_every_failure_is_unknown_with_the_reason(self):
         self.answer_with([self.hook("stop:1:0", "untrusted")])
-        cases = {"error": "panicked", "crash": "exited", "shape": "another shape", "garbage": "another shape"}
+        cases = {"error": "panicked", "crash": "exited", "shape": "another shape", "garbage": "another shape",
+                 "deep": "another shape"}
         for mode, why in cases.items():
             row = self.row(mode=mode)
             self.assertEqual((row["status"], row["ok"]), ("unknown", None), mode)
@@ -1462,6 +1494,7 @@ class PickTests(FleetTestCase):
         # know, or one of another agent, is a warning and is ignored.
         code, out = self.codex(LOW, HIGH, rules="- Pick order codex: second, codex:nine, claude:one\n")
         self.assertEqual((code, out["account"]), (0, None))
+        self.assertIn("every account of the pick order is above", out["reason"])
         self.assertTrue(any("codex:nine" in w for w in out["warnings"]))
         self.assertTrue(any("claude:one" in w for w in out["warnings"]))
 
