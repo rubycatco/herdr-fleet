@@ -4001,6 +4001,17 @@ class DocsTests(FleetTestCase):
         self.assertIn("rulings only", row)
         self.assertNotIn("decisions go to PROJECT.md", readme)
 
+    def test_onboard_writes_the_round_limit_line(self):
+        """F21: /fleet:onboard writes the round limit line, in the form the helper reads, into the Critic section of
+        the file it creates, without a question of its own (the question budget stays three calls)."""
+        onboard = (self.PLUGIN / "skills" / "onboard" / "SKILL.md").read_text()
+        critic = next(line for line in onboard.splitlines() if line.lstrip().startswith("- `## Critic`"))
+        self.assertIn("`- Review round limit: 4`", critic)
+        self.assertEqual(fleet.parse_review_limit("- Review round limit: 4\n"), (4, None))
+        asked = onboard.split("## 2. Ask", 1)[1].split("## 3. Write", 1)[0]
+        self.assertNotIn("round limit", asked.lower())
+        self.assertIn("at most three calls", asked)
+
     def test_docs_name_the_lane_signals(self):
         defaults = (self.PLUGIN / "defaults" / "conventions.md").read_text()
         self.assertEqual(fleet.parse_review_limit(defaults), (4, None))
