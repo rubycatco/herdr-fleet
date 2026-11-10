@@ -30,6 +30,8 @@ NOTE = "could not confirm that this session works in that project"  # the note f
 # No test writes to the real ~/.fleet, also not through a subprocess.
 _FLEET_HOME = tempfile.TemporaryDirectory()
 os.environ["FLEET_HOME"] = _FLEET_HOME.name
+# No test reads the user's conventions file: without a file of the test's own, the plugin defaults apply.
+os.environ["FLEET_CONVENTIONS"] = str(Path(_FLEET_HOME.name) / "no-conventions.md")
 
 # No test runs herdr or gh through fleet.run: a test that needs them stubs fleet.run (or the function that calls
 # it). git runs for real.
@@ -3978,6 +3980,31 @@ class DocsTests(FleetTestCase):
         self.assertIn('changed: "nothing"', lane)
         self.assertIn("high-risk pattern", (self.PLUGIN / "defaults" / "conventions.md").read_text())
 
+    def test_docs_name_the_lane_signals(self):
+        defaults = (self.PLUGIN / "defaults" / "conventions.md").read_text()
+        self.assertEqual(fleet.parse_review_limit(defaults), (4, None))
+        self.assertIn("- Review round limit: 4.", defaults)
+        self.assertIn("auto-compacted", defaults)
+        skills = self.PLUGIN / "skills"
+        context = (skills / "context" / "SKILL.md").read_text()
+        review = (skills / "review" / "SKILL.md").read_text()
+        fleet_skill = (skills / "fleet" / "SKILL.md").read_text()
+        readme = (self.PLUGIN.parent.parent / "README.md").read_text()
+        for doc in (context, fleet_skill, readme):
+            self.assertIn("compacted <n>x", doc)
+        for doc in (review, fleet_skill, readme):
+            self.assertIn("review rounds (limit", doc)
+        self.assertIn("Review round limit", review)
+        self.assertIn("ask the user before another round", review)
+        for doc in (fleet_skill, readme):
+            for text in ("`compactions`", "`review_rounds`", "`review_limit`", "`review_approved`"):
+                self.assertIn(text, doc)
+        self.assertIn("Review round limit", readme)
+        parser = fleet.build_parser()
+        board = next(a for a in parser._subparsers._group_actions[0].choices.items() if a[0] == "board")[1]
+        help_text = board.format_help()
+        for text in ("compact", "review round", "never resets"):
+            self.assertIn(text, help_text)
 
     def test_docs_name_the_follow_up_commands(self):
         skills = self.PLUGIN / "skills"
@@ -4783,6 +4810,284 @@ class OrchTests(FleetTestCase):
             self.assertEqual(fleet.board_lines([{**record, "risk": damaged}]), before)
         self.assertTrue(fleet.board_lines([{**record, "risk": {"needs_user": [{"path": "a"}]}}])[1]
                         .endswith("risky diff needs the user (1): ? a"))
+
+    # lane signals: compactions and review rounds ---------------------------
+
+    def session_event(self, path, pane, source, role="impl"):
+        """The SessionStart hook's record of a Claude session in `pane` of the lane at `path`."""
+        fleet.record("session_start", str(path), by=False, home=self.project, pane=pane, cwd=str(path),
+                     branch=f"feat/{Path(path).name}", agent="claude", role=role, session="sess-1", source=source)
+
+    def signals(self, lanes, **extra):
+        """The board's records by lane path, and its text lines by lane name."""
+        with mock.patch.dict(os.environ, extra):
+            out = json.loads(self.board(lanes, "board", "--json")[1])
+            text = self.board(lanes, "board")[1]
+        return out, {r["path"]: r for r in out["lanes"]}, {l.split()[0]: l for l in text.splitlines()[2:] if l}
+
+    def test_board_counts_compactions_since_the_last_reset(self):
+        a = self.add_lane("a", STATUS_md="## Next step\nGo.\n")
+        b = self.add_lane("b")
+        fleet.save_panes(a / ".fleet", {"w2:p1": {"role": "impl"}, "w2:p2": {"role": "critic"}})
+        fleet.record("spawn", str(a), pane="w2:p1", cwd=str(a), branch="feat/a", role="impl")
+        self.session_event(a, "w2:p1", "startup")
+        self.session_event(a, "w2:p1", "compact")
+        self.session_event(a, "w2:p1", "resume")  # a resumed session keeps its context
+        self.session_event(a, "w2:p1", "compact")
+        self.session_event(a, "w2:p2", "compact", role="critic")  # a critic never counts
+        self.session_event(b, "w2:p1", "compact")  # the same pane id in another lane: not this lane's
+        self.session_event(a, "w7:p1", "compact")  # a pane that is no longer on the board
+        panes = [{"pane": "w2:p1", "agent": "claude", "status": "idle"},
+                 {"pane": "w2:p2", "agent": "codex", "status": "idle"}]
+        lanes = [self.facts(a, panes=panes), self.facts(b)]
+        out, recs, lines = self.signals(lanes)
+        self.assertEqual((recs[str(a)]["compactions"], recs[str(a)]["compacted_pane"]), (2, "w2:p1"))
+        self.assertEqual((recs[str(b)]["compactions"], recs[str(b)]["compacted_pane"]), (0, None))
+        self.assertTrue(lines["feat/a"].endswith("compacted 2x: fleet reset w2:p1 at the next commit"), lines)
+        self.assertTrue(lines["feat/b"].endswith("session_start"), lines)  # no note
+        saved = {r["path"]: r for r in fleet.read_json(self.project / "board.json")["lanes"]}
+        self.assertEqual(saved[str(a)]["compactions"], 2)
+        # A reset that did not confirm its /clear leaves the count; a confirmed one ends it.
+        fleet.record("reset", str(a), pane="w2:p1", cwd=str(a), branch="feat/a", command="/clear", ok=False)
+        self.assertEqual(self.signals(lanes)[1][str(a)]["compactions"], 2)
+        fleet.record("reset", str(a), pane="w2:p1", cwd=str(a), branch="feat/a", command="/clear", ok=True)
+        out, recs, lines = self.signals(lanes)
+        self.assertEqual((recs[str(a)]["compactions"], recs[str(a)]["compacted_pane"]), (0, None))
+        self.assertTrue(lines["feat/a"].endswith("next: Go."), lines)
+        self.session_event(a, "w2:p1", "compact")
+        self.assertEqual(self.signals(lanes)[1][str(a)]["compactions"], 1)
+        # A /clear by hand (a new session in the pane) ends the count too, and so does a new spawn.
+        self.session_event(a, "w2:p1", "clear")
+        self.assertEqual(self.signals(lanes)[1][str(a)]["compactions"], 0)
+        self.session_event(a, "w2:p1", "compact")
+        fleet.record("spawn", str(a), pane="w2:p1", cwd=str(a), branch="feat/a", role="impl")
+        self.assertEqual(self.signals(lanes)[1][str(a)]["compactions"], 0)
+
+    def test_a_same_named_branch_in_another_clone_feeds_no_lane(self):
+        """Review 1, P1: a critic split from the lane's pane into another clone's lane of the same branch name.
+        An event with a path counts only for the lane that holds the path; the branch decides only without one;
+        an event's own role outside impl, planner and none never counts."""
+        a = self.add_lane("a", STATUS_md="## Next step\nGo.\n")
+        clone = self.root / "clone"
+        git("clone", "-q", str(self.repo), str(clone), cwd=self.root)
+        other = self.root / "clone-lanes" / "a"
+        other.parent.mkdir()
+        git("worktree", "add", "-q", "-b", "feat/a", str(other), cwd=clone)  # the same branch name
+        (other / ".fleet").mkdir()
+        fleet.save_panes(a / ".fleet", {"w2:p1": {"role": "impl"}})
+        fleet.save_panes(other / ".fleet", {"w2:p2": {"role": "critic"}})
+        self.session_event(other, "w2:p2", "compact", role="critic")
+        self.session_event(other, "w2:p2", "compact", role=None)  # untagged, but the path is the other clone's
+        self.session_event(other, "w2:p1", "compact")  # the lane's own pane id, in the other checkout
+        panes = [{"pane": "w2:p1", "agent": "claude", "status": "idle"},
+                 {"pane": "w2:p2", "agent": "claude", "status": "working"}]  # in a's workspace, no role in a
+        lanes = [self.facts(a, panes=panes)]
+        out, recs, lines = self.signals(lanes)
+        self.assertEqual((recs[str(a)]["compactions"], recs[str(a)]["compacted_pane"]), (0, None))
+        self.assertTrue(lines["feat/a"].endswith("next: Go."), lines)
+        # The event's own role wins over the lane's panes.json, in the lane's own checkout too.
+        for role in ("critic", "researcher", "helper", "orchestrator"):
+            self.session_event(a, "w2:p1", "compact", role=role)
+        self.assertEqual(self.signals(lanes)[1][str(a)]["compactions"], 0)
+        # Without a path, the branch decides.
+        fleet.record("session_start", None, by=False, home=self.project, pane="w2:p1", branch="feat/a",
+                     agent="claude", role="impl", source="compact")
+        self.session_event(a, "w2:p1", "compact")
+        recs = self.signals(lanes)[1]
+        self.assertEqual((recs[str(a)]["compactions"], recs[str(a)]["compacted_pane"]), (2, "w2:p1"))
+
+    def test_an_unreadable_request_never_approves_a_round(self):
+        """Review 1, P2: a request that exists and cannot be read within the bound gives review_approved false; a
+        readable request that names no report keeps the fallback to the reports that exist."""
+        a = self.add_lane("a", STATUS_md="## Next step\nWait for the second critic.\n")
+        self.write_reviews(a, {"REVIEW-1.md": "CHANGES REQUESTED", "REVIEW-2.md": "CHANGES REQUESTED",
+                               "REVIEW-3.md": "CHANGES REQUESTED", "REVIEW-4.md": "APPROVE"})
+        request = a / ".fleet" / "REVIEW-REQUEST-4.md"
+        request.write_text("Write REVIEW-4.md and REVIEW-4-second.md.\n" + "x" * (fleet.REVIEW_FILE_MAX + 1))
+        lanes = [self.facts(a, panes=[{"pane": "w2:p1", "agent": "claude", "status": "idle"}])]
+        out, recs, lines = self.signals(lanes)
+        self.assertEqual((recs[str(a)]["phase"], recs[str(a)]["review_approved"]), ("review 4", False))
+        self.assertTrue(lines["feat/a"].endswith("4 review rounds (limit 4): ask the user first"), lines)
+        request.write_text("Write REVIEW-4.md and REVIEW-4-second.md.\n")  # readable: the second is missing
+        self.assertIs(self.signals(lanes)[1][str(a)]["review_approved"], False)
+        request.unlink()
+        os.mkfifo(request)  # not a regular file: never read, never approved
+        self.assertIs(self.signals(lanes)[1][str(a)]["review_approved"], False)
+        request.unlink()
+        request.write_text("Review the lane.\n")  # names no report: the reports that exist decide
+        out, recs, lines = self.signals(lanes)
+        self.assertEqual((recs[str(a)]["phase"], recs[str(a)]["review_approved"]), ("reviewed 4: APPROVE", True))
+        self.assertTrue(lines["feat/a"].endswith("next: Wait for the second critic."), lines)
+
+    def test_board_counts_a_planners_compactions(self):
+        a = self.add_lane("a", PLAN_md="Risk: none\n")
+        fleet.save_panes(a / ".fleet", {"w2:p1": {"role": "planner"}})
+        self.session_event(a, "w2:p1", "compact", role="planner")
+        lanes = [self.facts(a, panes=[{"pane": "w2:p1", "agent": "claude", "status": "working"}])]
+        out, recs, lines = self.signals(lanes)
+        self.assertEqual((recs[str(a)]["phase"], recs[str(a)]["compactions"]), ("planning", 1))
+        self.assertTrue(lines["feat/a"].endswith("compacted 1x: fleet reset w2:p1 at the next commit"), lines)
+
+    def write_reviews(self, path, verdicts):
+        for name, verdict in verdicts.items():
+            (path / ".fleet" / name).write_text(f"# Review\n\nVERDICT: {verdict}\n")
+
+    def test_board_counts_review_rounds_against_the_limit(self):
+        a = self.add_lane("a", STATUS_md="## Next step\nFix round 4.\n")
+        self.write_reviews(a, {"REVIEW-1.md": "CHANGES REQUESTED", "REVIEW-2-codex.md": "CHANGES REQUESTED",
+                               "REVIEW-2-claude.md": "APPROVE", "REVIEW-3.md": "CHANGES REQUESTED",
+                               "REVIEW-4-pr.md": "CHANGES REQUESTED"})
+        (a / ".fleet" / "REVIEW-REQUEST-4.md").write_text("Write REVIEW-4-pr.md.\n")
+        (a / ".fleet" / "REVIEW-REQUEST-5.md").write_text("Write REVIEW-5.md.\n")  # no review yet: no round
+        (a / ".fleet" / "REVIEW-NOTES.md").write_text("not a round\n")
+        lanes = [self.facts(a, panes=[{"pane": "w2:p1", "agent": "claude", "status": "idle"}])]
+        conventions = self.root / "conventions.md"
+        # The plugin defaults hold the limit 4.
+        out, recs, lines = self.signals(lanes)
+        self.assertEqual((recs[str(a)]["review_rounds"], recs[str(a)]["review_limit"]), (4, 4))
+        self.assertEqual(out["review_limit"], {"limit": 4, "source": str(fleet.PLUGIN_ROOT / "defaults" /
+                                                                             "conventions.md")})
+        self.assertTrue(lines["feat/a"].endswith("4 review rounds (limit 4): ask the user first"), lines)
+        conventions.write_text("# Fleet conventions\n\n## Critic\n- Review round limit: 5. Then ask the user.\n")
+        out, recs, lines = self.signals(lanes, FLEET_CONVENTIONS=str(conventions))
+        self.assertEqual((recs[str(a)]["review_rounds"], recs[str(a)]["review_limit"]), (4, 5))
+        self.assertEqual(out["review_limit"], {"limit": 5, "source": str(conventions)})
+        self.assertTrue(lines["feat/a"].endswith("next: Fix round 4."), lines)
+        conventions.write_text("## Critic\n- Review round limit: 4\n")
+        self.assertIn("4 review rounds (limit 4)", self.signals(lanes, FLEET_CONVENTIONS=str(conventions))[2]["feat/a"])
+        # A newest round that every critic approved ends the loop: no note.
+        self.write_reviews(a, {"REVIEW-4-pr.md": "APPROVE"})
+        (a / ".fleet" / "REVIEW-REQUEST-5.md").unlink()
+        out, recs, lines = self.signals(lanes, FLEET_CONVENTIONS=str(conventions))
+        self.assertEqual((recs[str(a)]["phase"], recs[str(a)]["review_rounds"]), ("reviewed 4: APPROVE", 4))
+        self.assertIs(recs[str(a)]["review_approved"], True)
+        self.assertTrue(lines["feat/a"].endswith("next: Fix round 4."), lines)
+        # Also once the pull request is open: the phase no longer shows the verdict, the record does.
+        pr = {"number": 7, "state": "OPEN", "url": "https://example.com/pr/7"}
+        opened = [{**lanes[0], "pr": pr}]
+        out, recs, lines = self.signals(opened, FLEET_CONVENTIONS=str(conventions))
+        self.assertEqual((recs[str(a)]["phase"], recs[str(a)]["review_approved"]), ("pr open", True))
+        self.assertTrue(lines["feat/a"].endswith("next: Fix round 4."), lines)
+        # A newest round with a change request, or a later round that was requested, keeps the note.
+        self.write_reviews(a, {"REVIEW-4-pr.md": "CHANGES REQUESTED"})
+        out, recs, lines = self.signals(opened, FLEET_CONVENTIONS=str(conventions))
+        self.assertIs(recs[str(a)]["review_approved"], False)
+        self.assertTrue(lines["feat/a"].endswith("4 review rounds (limit 4): ask the user first"), lines)
+        self.write_reviews(a, {"REVIEW-4-pr.md": "APPROVE"})
+        (a / ".fleet" / "REVIEW-REQUEST-5.md").write_text("Write REVIEW-5.md.\n")
+        out, recs, lines = self.signals(opened, FLEET_CONVENTIONS=str(conventions))
+        self.assertIs(recs[str(a)]["review_approved"], False)
+        self.assertTrue(lines["feat/a"].endswith("4 review rounds (limit 4): ask the user first"), lines)
+        # Below the limit the verdicts are not read: review_approved is null.
+        conventions.write_text("## Critic\n- Review round limit: 5\n")
+        self.assertIsNone(self.signals(opened, FLEET_CONVENTIONS=str(conventions))[1][str(a)]["review_approved"])
+
+    def test_review_round_limit_reads_one_line_form_only(self):
+        default = fleet.REVIEW_LIMIT_DEFAULT
+        self.assertEqual(default, 4)
+        for text, limit in (("", default), ("## Critic\n- One critic.\n", default),
+                            ("- Review round limit: 6\n", 6), ("* review round limit: 3 rounds.\n", 3),
+                            ("  - Review round limit:7.\n", 7),
+                            ("- Review round limit: 6\n- Review round limit: 6, as above\n", 6),
+                            ("<!-- - Review round limit: 9 -->\n- Review round limit: 5\n", 5),
+                            ("<!--\n- Review round limit: 9\n-->\n", default),
+                            ("The review round limit: 9 is prose, not the line.\n", default)):
+            self.assertEqual(fleet.parse_review_limit(text), (limit, None), text)
+        for text in ("- Review round limit: 4.5\n", "- Review round limit: 4-6\n", "- Review round limit: four\n",
+                     "- Review round limit: 0\n", "- Review round limit:\n", "- **Review round limit**: 5\n",
+                     "- Review round limit: 1234567890\n", "- Review round limit: 4\n- Review round limit: 5\n"):
+            limit, error = fleet.parse_review_limit(text)
+            self.assertEqual(limit, default, text)
+            self.assertTrue(error, text)
+
+    def test_an_unreadable_review_limit_falls_back_and_says_why(self):
+        a = self.add_lane("a")
+        lanes = [self.facts(a)]
+        conventions = self.root / "conventions.md"
+        conventions.write_text("## Critic\n- Review round limit: 4.5\n")
+        out, recs, lines = self.signals(lanes, FLEET_CONVENTIONS=str(conventions))
+        self.assertEqual((out["review_limit"]["limit"], out["review_limit"]["source"]), (4, str(conventions)))
+        self.assertIn("4.5", out["review_limit"]["error"])
+        self.assertEqual((recs[str(a)]["review_rounds"], recs[str(a)]["review_limit"]), (0, 4))
+        with mock.patch.dict(os.environ, {"FLEET_CONVENTIONS": str(conventions)}):
+            text = self.board(lanes, "board")[1]
+        self.assertIn(f"\nReview round limit 4 (the default): {out['review_limit']['error']}", text)
+        # A file that is not a regular file is not read (the open does not block), and gives the default.
+        fifo = self.root / "fifo.md"
+        os.mkfifo(fifo)
+        out = self.signals(lanes, FLEET_CONVENTIONS=str(fifo))[0]
+        self.assertEqual(out["review_limit"]["limit"], 4)
+        self.assertIn("not a regular file", out["review_limit"]["error"])
+
+    def test_signal_notes_yield_to_plan_risk_and_blocked(self):
+        base = {"phase": "working", "pr": None, "panes": [], "last_event": None, "blocked": None, "next": "Go.",
+                "compactions": 3, "compacted_pane": "w2:p1", "review_rounds": 5, "review_limit": 4}
+        cases = [({"warning": "1 lane commit: approve-plan refuses"}, "1 lane commit: approve-plan refuses"),
+                 ({"risk": {"needs_user": "cannot be told: x"}}, "risky diff cannot be told: x"),
+                 ({"blocked": "Which API?"}, "blocked: Which API?"),
+                 ({}, "5 review rounds (limit 4): ask the user first"),
+                 ({"review_rounds": 3}, "compacted 3x: fleet reset w2:p1 at the next commit"),
+                 ({"review_rounds": 3, "compactions": 0}, "next: Go."),
+                 ({"review_approved": True}, "compacted 3x: fleet reset w2:p1 at the next commit"),
+                 ({"review_approved": "yes"}, "5 review rounds (limit 4): ask the user first"),
+                 ({"phase": "merged"}, "next: Go."), ({"phase": "removed"}, "next: Go.")]
+        for extra, note in cases:
+            line = fleet.board_lines([{**base, "lane": "feat/x", **extra}])[1]
+            self.assertTrue(line.endswith(note), (extra, line))
+        # Damaged or missing fields of a cached record give no signal note.
+        for damaged in ({"compactions": True}, {"compactions": "3"}, {"compacted_pane": None},
+                        {"compactions": None, "review_rounds": None}):
+            rec = {**base, "lane": "feat/x", "review_rounds": 0, **damaged}
+            self.assertTrue(fleet.board_lines([rec])[1].endswith("next: Go."), damaged)
+        for damaged in ({"review_rounds": True}, {"review_limit": "4"}, {"review_limit": 0}, {"review_limit": None}):
+            rec = {**base, "lane": "feat/x", "compactions": 0, **damaged}
+            self.assertTrue(fleet.board_lines([rec])[1].endswith("next: Go."), damaged)
+
+    def test_every_record_carries_both_counts(self):
+        a = self.add_lane("a", STATUS_md="## Blocked\n- Which API?\n")
+        b = self.add_lane("b", PLAN_md="Risk: none\nPLAN READY: 1\n")
+        fleet.save_panes(a / ".fleet", {"w2:p1": {"role": "impl"}})
+        fleet.save_panes(b / ".fleet", {"w3:p1": {"role": "planner"}})
+        self.session_event(a, "w2:p1", "compact")
+        self.session_event(b, "w3:p1", "compact", role="planner")
+        (b / "x.py").write_text("")
+        self.write_reviews(a, {f"REVIEW-{n}.md": "CHANGES REQUESTED" for n in range(1, 5)})
+        lanes = [self.facts(a, panes=[{"pane": "w2:p1", "agent": "claude", "status": "idle"}]),
+                 self.facts(b, panes=[{"pane": "w3:p1", "agent": "claude", "status": "idle"}])]
+        # The cursor and the cleanup event both have fixed times, the event after the cursor: no wall clock.
+        fleet.write_json(self.project / "digest.json", {"cursor": "2026-01-01T00:00:00+00:00", "lanes": {}})
+        with mock.patch.object(fleet, "now_iso", return_value="2026-01-02T00:00:00+00:00"):
+            fleet.record("cleanup", str(self.repo), lane=str(self.root / "gone"), branch="feat/gone", removed=True)
+        out, recs, lines = self.signals(lanes)
+        self.assertEqual(len(recs), 3)
+        for r in recs.values():
+            self.assertIsInstance(r["compactions"], int)
+            self.assertIsInstance(r["review_rounds"], int)
+            self.assertEqual(r["review_limit"], 4)
+            self.assertIn("review_approved", r)
+        self.assertEqual((recs[str(a)]["compactions"], recs[str(a)]["review_rounds"]), (1, 4))
+        self.assertEqual((recs[str(b)]["phase"], recs[str(b)]["compactions"]), ("plan ready 1", 1))
+        self.assertEqual(recs[str(self.root / "gone")]["phase"], "removed")
+        self.assertTrue(lines["feat/a"].endswith("blocked: Which API?"), lines)  # blocked wins over both
+        self.assertTrue(lines["feat/b"].endswith("1 changed path outside .fleet/: approve-plan refuses"), lines)
+
+    def test_rebrief_shows_the_signal_notes_of_the_cached_board(self):
+        self.orch_setup()
+        board = fleet.read_json(self.project / "board.json")
+        self.stop_clock(board, 5)
+        lane = board["lanes"][0]
+
+        def rebrief(**fields):
+            fleet.write_json(self.project / "board.json", dict(board, lanes=[dict(lane, **fields)]))
+            return fleet.session_start_context({"source": "compact", "cwd": str(self.repo)},
+                                               env={"HERDR_PANE_ID": "w1:p1"})
+        before = rebrief()  # a record of 0.9.0, without the counts
+        self.assertEqual(rebrief(compactions=0, compacted_pane=None, review_rounds=1, review_limit=4), before)
+        compacted = rebrief(compactions=2, compacted_pane="w2:p1", review_rounds=1, review_limit=4)
+        self.assertIn("compacted 2x: fleet reset w2:p1 at the next commit\n", compacted)
+        self.assertEqual(len(compacted.splitlines()), len(before.splitlines()))
+        limited = rebrief(compactions=2, compacted_pane="w2:p1", review_rounds=4, review_limit=4)
+        self.assertIn("4 review rounds (limit 4): ask the user first\n", limited)
 
     def test_status_notes(self):
         md = ("# Status: x\n\n## Plan\n1. a\n\n## Blocked\n- none\n\n## Next steps\n\n- Run the tests.\n- More.\n\n"

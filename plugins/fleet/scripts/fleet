@@ -285,13 +285,6 @@ def usage_stale(age_seconds: int | None) -> bool | None:
     return None if age_seconds is None else age_seconds >= USAGE_STALE_HOURS * 3600
 
 
-def age_text(seconds: int) -> str:
-    for unit in ("d", "h", "m"):
-        if seconds >= AGE_UNIT[unit]:
-            return f"{seconds // AGE_UNIT[unit]}{unit}"
-    return f"{seconds}s"
-
-
 def parse_remuda_usage(text: str) -> dict:
     """{account: {"source": "cached" | "live" | "none", "age_seconds", "at", "stale", "header", "rows"}} from the
     output of `remuda usage`. `age_seconds` is remuda's floored age; `stale` is None when the age is unknown."""
@@ -1589,33 +1582,39 @@ def checkout_top(path) -> Path | None:
     return None
 
 
-def read_small_bytes(path, limit: int) -> bytes | None:
-    """The bytes of `path` when it is a regular file of at most `limit` bytes, else None. The open does not block
-    (O_NONBLOCK: a FIFO without a writer would hold a plain open for ever), fstat must say a regular file (a FIFO,
-    a device or a directory gives None), and the read takes at most `limit` + 1 bytes. No thread, no timer."""
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
-    except OSError:
-        return None
+def read_small_file(path, limit: int) -> bytes:
+    """The bytes of `path` when it is a regular file of at most `limit` bytes. The open does not block
+    (O_NONBLOCK: a FIFO without a writer would hold a plain open for ever), fstat must say a regular file, and the
+    read takes at most `limit` + 1 bytes. No thread, no timer. OSError when it cannot be opened or read, ValueError
+    (with the reason) for a file that is not regular or is too large."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
-            return None
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("not a regular file")
+        if info.st_size > limit:
+            raise ValueError(f"larger than {limit} bytes")
         data = os.read(fd, limit + 1)
-        return None if len(data) > limit else data
-    except Exception:
-        return None
+        if len(data) > limit:
+            raise ValueError(f"larger than {limit} bytes")
+        return data
     finally:
         os.close(fd)
 
 
-def read_small_json(path: Path, limit: int) -> dict:
-    """The JSON object in `path` when it is a regular file of at most `limit` bytes, else {} (read_small_bytes)."""
-    data = read_small_bytes(path, limit)
-    if data is None:
-        return {}
+def read_small_bytes(path, limit: int) -> bytes | None:
+    """read_small_file, with None for a file that cannot be opened or read, is not regular or is too large."""
     try:
-        parsed = json.loads(data)
+        return read_small_file(path, limit)
+    except (OSError, ValueError):
+        return None
+
+
+def read_small_json(path: Path, limit: int) -> dict:
+    """The JSON object in `path` when it is a regular file of at most `limit` bytes (read_small_file), else {}:
+    a FIFO, a device or a directory gives {}."""
+    try:
+        parsed = json.loads(read_small_file(path, limit))
     except Exception:
         return {}
     return parsed if isinstance(parsed, dict) else {}
@@ -3646,10 +3645,10 @@ def review_rounds(d: Path) -> tuple[dict[int, Path], dict[int, list[Path]]]:
     return requests, reviews
 
 
-def review_verdict(path: Path) -> str | None:
+def review_verdict(path: Path, read=read_text) -> str | None:
     """`APPROVE`, `CHANGES REQUESTED` (or the text that follows) on the last `VERDICT:` line; None without one
-    (also for a missing file)."""
-    hits = VERDICT_LINE.findall(read_text(path))
+    (also for a missing file). `read`: how the file is read."""
+    hits = VERDICT_LINE.findall(read(path))
     if not hits:
         return None
     text = re.sub(r"[*_`]", "", hits[-1]).strip().upper()
@@ -3660,15 +3659,47 @@ def review_verdict(path: Path) -> str | None:
     return text or "?"
 
 
-def round_files(d: Path, n: int, requests: dict[int, Path], reviews: dict[int, list[Path]]) -> list[Path]:
+def round_files(d: Path, n: int, requests: dict[int, Path], reviews: dict[int, list[Path]],
+                read=read_text) -> list[Path]:
     """The review files that round n expects: the ones its request names (REVIEW-<n>.md, REVIEW-<n>-<name>.md),
-    else the ones that exist. A named file can be missing: its critic has not written yet."""
+    else the ones that exist. A named file can be missing: its critic has not written yet. `read`: how the
+    request is read."""
     names: list[str] = []
     if n in requests:
-        for name in re.findall(rf"\bREVIEW-{n}(?:-[A-Za-z0-9._-]+?)?\.md\b", read_text(requests[n])):
+        for name in re.findall(rf"\bREVIEW-{n}(?:-[A-Za-z0-9._-]+?)?\.md\b", read(requests[n])):
             if name not in names:
                 names.append(name)
     return [Path(d) / name for name in names] if names else reviews.get(n) or []
+
+
+REVIEW_FILE_MAX = 1024 * 1024  # bytes of a review file or request that newest_round_approved reads at most
+
+
+def bounded_text(path: Path) -> str:
+    """The text of a regular file of at most REVIEW_FILE_MAX bytes (read_small_file). OSError or ValueError when
+    it cannot be read within that bound: the caller must not take that for an empty file."""
+    return read_small_file(path, REVIEW_FILE_MAX).decode("utf-8", errors="replace")
+
+
+def newest_round_approved(d: Path, rounds: tuple[dict[int, Path], dict[int, list[Path]]]) -> bool:
+    """True when the newest round that has review files is approved: no later round was requested, and each file
+    that the round expects (round_files) has `VERDICT: APPROVE`, as `reviewed <n>: APPROVE` says. Reads the
+    round's request and review files bounded (bounded_text), whatever the lane's phase. A request that exists and
+    an expected review file that cannot be read within the bound (missing, too large, not a regular file) give
+    False: only a request that was read and names no report falls back to the reports that exist."""
+    requests, reviews = rounds
+    if not reviews:
+        return False
+    n = max(reviews)
+    if requests and max(requests) > n:
+        return False
+    if n not in requests and os.path.lexists(Path(d) / f"REVIEW-REQUEST-{n}.md"):
+        return False  # a request that review_rounds does not list (not a regular file) cannot be read
+    try:
+        files = round_files(Path(d), n, requests, reviews, read=bounded_text)
+        return bool(files) and all(review_verdict(p, read=bounded_text) == "APPROVE" for p in files)
+    except (OSError, ValueError):
+        return False
 
 
 def implementer_pane(panes: list[dict]) -> dict | None:
@@ -3696,8 +3727,10 @@ def plan_phase(panes: list[dict], fleet_dir: Path, status_md: str) -> str | None
     return f"plan approved {n}" if n in approved else f"plan ready {n}"
 
 
-def lane_phase(f: dict, fleet_dir: Path, removed: bool = False) -> str:
-    """The lane's phase; the first rule that matches wins. `f` holds the lane facts and panes with roles."""
+def lane_phase(f: dict, fleet_dir: Path, removed: bool = False,
+               rounds: tuple[dict[int, Path], dict[int, list[Path]]] | None = None) -> str:
+    """The lane's phase; the first rule that matches wins. `f` holds the lane facts and panes with roles. `rounds`:
+    review_rounds of the lane's .fleet/, when the caller has listed it already."""
     if removed:
         return "removed"
     state = (f.get("pr") or {}).get("state")
@@ -3712,7 +3745,7 @@ def lane_phase(f: dict, fleet_dir: Path, removed: bool = False) -> str:
     planned = plan_phase(panes, fleet_dir, status_md)
     if planned:
         return planned
-    requests, reviews = review_rounds(Path(fleet_dir))
+    requests, reviews = rounds if rounds is not None else review_rounds(Path(fleet_dir))
     ready = max((int(n) for n in READY_LINE.findall(status_md)), default=None)
     if requests or reviews:
         n = max(requests) if requests else max(reviews)
@@ -3785,24 +3818,38 @@ def risk_note(risk) -> str:
 
 def board_record(f: dict, events: list[dict], home: Path | None = None,
                  follow_ups: dict[str, list[dict]] | None = None, roots: dict[str, str | None] | None = None,
-                 viewer: str | None = None) -> dict:
+                 viewer: str | None = None, compactions: dict[str, int] | None = None,
+                 review_limit: int = 0) -> dict:
     """The board's record of a lane. `orch` is its owner (lane.json), `checkout` its main checkout. `clone`, the
     lane's main checkout, when that is not the main checkout of its orch's recorded checkout (the owner's, else the
-    viewer's for an unowned lane; `roots`, orch_roots): the lane sits in another clone of the project."""
+    viewer's for an unowned lane; `roots`, orch_roots): the lane sits in another clone of the project.
+    `compactions`: the lane's count per pane (compaction_counts); `compactions` in the record sums those of its
+    implementer and planner panes, and `compacted_pane` names the one with the most. `review_rounds` counts the
+    round numbers of its review files; `review_limit` is the limit of the conventions (review_round_limit);
+    `review_approved`, at the limit only (else None, nothing read), whether the newest round is approved
+    (newest_round_approved), also when the phase does not show it (`pr open`)."""
     d = Path(f["path"]) / FLEET_DIR
     roles = load_panes(d)
     panes = [{"pane": p.get("pane"), "role": (roles.get(p.get("pane") or "") or {}).get("role"),
               "agent": p.get("agent"), "status": p.get("status")} for p in f.get("panes") or []]
     status_md = read_text(d / "STATUS.md")
     pr = f.get("pr") or None
-    phase = lane_phase({**f, "panes": panes}, d)
+    rounds = review_rounds(d)
+    phase = lane_phase({**f, "panes": panes}, d, rounds=rounds)
+    counted = [(p["pane"], (compactions or {}).get(p["pane"], 0)) for p in panes
+               if p.get("agent") and p.get("pane") and p.get("role") in COMPACTION_ROLES]
+    top = max(counted, key=lambda x: x[1], default=(None, 0))
     out = {"lane": lane_name(f), "path": f["path"], "branch": f.get("branch"), "workspace": f.get("workspace"),
            "panes": panes, "pr": {"number": pr.get("number"), "state": pr.get("state")} if pr else None,
            "phase": phase, "last_event": newest_lane_event(events, f["path"], f.get("branch")),
            "blocked": first_note(status_md, "Blocked"), "next": first_note(status_md, r"Next steps?"),
            "risk": board_risk(f["path"], phase, home, bool(f.get("git"))),
            "follow_ups": [x["id"] for x in (follow_ups or {}).get(f.get("branch") or "", []) if x["id"]],
-           "orch": lane_owner(f["path"]), "checkout": f.get("main_root")}
+           "orch": lane_owner(f["path"]), "checkout": f.get("main_root"),
+           "compactions": sum(n for _, n in counted), "compacted_pane": top[0] if top[1] else None,
+           "review_rounds": len(rounds[1]), "review_limit": review_limit,
+           "review_approved": (newest_round_approved(d, rounds)
+                               if review_limit >= 1 and len(rounds[1]) >= review_limit else None)}
     root = (roots or {}).get(out["orch"] or viewer)
     if root and f.get("main_root") and os.path.realpath(f["main_root"]) != os.path.realpath(root):
         out["clone"] = f["main_root"]
@@ -3811,6 +3858,108 @@ def board_record(f: dict, events: list[dict], home: Path | None = None,
         if warning:
             out["warning"] = warning
     return out
+
+
+COMPACTION_ROLES = ("impl", None, "planner")  # the panes whose compactions the board counts: implementers, planners
+
+
+def compaction_counts(events: list[dict], lanes: list[dict]) -> dict[str, dict[str, int]]:
+    """For each lane (by path), the compactions of each of its panes now on the board, in one pass over the log:
+    `session_start` events with `source: compact` since the pane's last fresh context. A `spawn` in the pane, a
+    `reset` of it that succeeded (`ok`), or a `session_start` with `source` `clear` or `startup` (a /clear by hand,
+    a new agent) sets it back to 0; a resumed session keeps its count. An event counts for a lane when its `pane`
+    is one of the lane's panes and it is the lane's: an event with a path (`cwd` or `lane`) when that path is in
+    the lane's checkout, whatever its branch (another clone can have a branch of the same name); an event without
+    one by its branch. A compaction whose event names a role outside COMPACTION_ROLES (a critic, a researcher, a
+    helper) never counts, whatever the lane's panes.json says of the pane now. Reads no file."""
+    wanted: dict[str, list[dict]] = {}
+    for f in lanes:
+        for p in f.get("panes") or []:
+            if p.get("pane"):
+                wanted.setdefault(p["pane"], []).append(f)
+    counts: dict[str, dict[str, int]] = {}
+    for e in events:
+        kind, pane = e.get("event"), e.get("pane")
+        if kind not in ("spawn", "reset", "session_start") or pane not in wanted:
+            continue
+        source = e.get("source")
+        fresh = (kind == "spawn" or (kind == "reset" and e.get("ok") is True)
+                 or (kind == "session_start" and source in ("clear", "startup")))
+        if not fresh and not (kind == "session_start" and source == "compact" and e.get("role") in COMPACTION_ROLES):
+            continue
+        paths = [os.path.expanduser(p) for p in (e.get("lane"), e.get("cwd")) if isinstance(p, str) and p]
+        for f in wanted[pane]:
+            if not (any(inside(p, f["path"]) for p in paths) if paths
+                    else bool(f.get("branch")) and e.get("branch") == f["branch"]):
+                continue
+            lane = counts.setdefault(f["path"], {})
+            lane[pane] = 0 if fresh else lane.get(pane, 0) + 1
+    return counts
+
+
+REVIEW_LIMIT_DEFAULT = 4
+CONVENTIONS_MAX = 256 * 1024  # bytes of the conventions file that the board reads at most
+HTML_COMMENT = re.compile(r"<!--.*?(?:-->|\Z)", re.S)
+REVIEW_LIMIT_KEY = re.compile(r"^[ \t]*[-*][ \t]+[*_`]*review round limit\b", re.I)
+REVIEW_LIMIT_LINE = re.compile(r"^[ \t]*[-*][ \t]+review round limit:[ \t]*(\d{1,9})(?:[.,;:]?(?=[ \t]|$))", re.I)
+
+
+def parse_review_limit(text: str) -> tuple[int, str | None]:
+    """(the review round limit of a conventions text, why it cannot be read). The limit is one list item of a fixed
+    form, `- Review round limit: <n>` with a whole number n >= 1, followed by the end of the line, or by `.`, `,`,
+    `;`, `:` or a blank and free text. Text in HTML comments does not count. No such line: the default. A line
+    whose item starts with the key in another form (`4.5`, `four`, `**Review round limit**`), a limit below 1, or
+    lines that give different numbers: the default, and the reason."""
+    values: list[int] = []
+    for line in HTML_COMMENT.sub("", text).splitlines():
+        if not REVIEW_LIMIT_KEY.match(line):
+            continue
+        m = REVIEW_LIMIT_LINE.match(line)
+        if not m:
+            return REVIEW_LIMIT_DEFAULT, f"{line.strip()!r} is not '- Review round limit: <n>' with a whole number"
+        if int(m.group(1)) < 1:
+            return REVIEW_LIMIT_DEFAULT, f"{line.strip()!r}: the limit must be 1 or more"
+        values.append(int(m.group(1)))
+    if len(set(values)) > 1:
+        return REVIEW_LIMIT_DEFAULT, f"the review round limit lines disagree: {', '.join(map(str, values))}"
+    return (values[0] if values else REVIEW_LIMIT_DEFAULT), None
+
+
+def review_round_limit() -> dict:
+    """`{limit, source, error?}`: the review round limit of the user's conventions file, or of the plugin defaults
+    while that file does not exist. The file is read once, bounded (read_small_file): a file that cannot be read,
+    is not a regular file or is too large gives the default and the reason, as a line that cannot be read does."""
+    path = conventions_path()
+    if not os.path.lexists(path):
+        path = PLUGIN_ROOT / "defaults" / "conventions.md"
+    out = {"limit": REVIEW_LIMIT_DEFAULT, "source": str(path)}
+    try:
+        text = read_small_file(path, CONVENTIONS_MAX).decode("utf-8", errors="replace")
+    except (OSError, ValueError) as e:
+        return {**out, "error": f"{path} cannot be read: {getattr(e, 'strerror', None) or e}"}
+    limit, error = parse_review_limit(text)
+    return {**out, "limit": limit, **({"error": f"{path}: {error}"} if error else {})}
+
+
+def as_count(value) -> int | None:
+    """An int of a cached record (not a bool), else None."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def signal_notes(r: dict) -> tuple[str, str]:
+    """(the review limit note, the compaction note) of a board record, or '' for each. Only the record's own fields
+    count, so a cached board gives the same notes. None for a lane that merged or was removed; no review note once
+    the newest round is approved (`review_approved` is true)."""
+    phase = as_text(r.get("phase"))
+    if phase in ("merged", "removed"):
+        return "", ""
+    rounds, limit = as_count(r.get("review_rounds")), as_count(r.get("review_limit"))
+    review = (f"{rounds} review rounds (limit {limit}): ask the user first"
+              if rounds is not None and limit and limit >= 1 and rounds >= limit
+              and r.get("review_approved") is not True else "")
+    n, pane = as_count(r.get("compactions")), as_text(r.get("compacted_pane"))
+    compact = f"compacted {n}x: fleet reset {pane} at the next commit" if n and n > 0 and pane else ""
+    return review, compact
 
 
 def plan_gate_note(path: str) -> str | None:
@@ -4054,10 +4203,12 @@ def orch_roots(home: Path, orchs: dict[str, dict]) -> dict[str, str | None]:
     return roots
 
 
-def make_board(home: Path, since: float | None, names: dict[str, str], view: dict | None = None) -> list[dict]:
+def make_board(home: Path, since: float | None, names: dict[str, str], view: dict | None = None,
+               limit: dict | None = None) -> list[dict]:
     """A fresh board of the project's lanes (of the view's lanes, for a view that filters), with the lanes removed
     since `since`. Runs herdr, git and gh. It puts the lanes that it saw, with their owners, in view["lanes"] and
-    view["branches"] (lane_selector), for the digest's event filter."""
+    view["branches"] (lane_selector), for the digest's event filter. `limit`: review_round_limit, read here when
+    the caller did not."""
     if not shutil.which("herdr"):
         raise FleetError("herdr not found in PATH")
     select = lane_selector(home, view)
@@ -4066,8 +4217,13 @@ def make_board(home: Path, since: float | None, names: dict[str, str], view: dic
     held, _ = lane_follow_ups(home)  # PROJECT.md, read once per board
     roots = orch_roots(home, view["orchs"]) if view else {}
     viewer = view.get("name") if view else None
-    records = [board_record(f, events, home, held, roots, viewer) for f in lanes]
-    records += removed_records(events, since, {os.path.realpath(r["path"]) for r in records}, names, view)
+    compacted = compaction_counts(events, lanes)
+    review_limit = (limit or review_round_limit())["limit"]
+    records = [board_record(f, events, home, held, roots, viewer, compacted.get(f["path"]), review_limit)
+               for f in lanes]
+    for r in removed_records(events, since, {os.path.realpath(r["path"]) for r in records}, names, view):
+        records.append({**r, "compactions": 0, "compacted_pane": None, "review_rounds": 0,
+                        "review_limit": review_limit, "review_approved": None})
     if view is not None:
         view["lanes"], view["branches"] = dict(select.lanes), dict(select.branches)
         for r in records:
@@ -4135,9 +4291,11 @@ def as_dict(value) -> dict:
 
 
 def board_lines(records: list, owners: bool = False, column: bool = False) -> list[str]:
-    """The board as a compact text table: one line per lane. A damaged record in board.json shows as blanks. `owners`
-    (a project with several orchs): an unowned lane gets the note `unowned: adopt it`, last of the notes. `column`
-    (every lane, --all): an ORCH column, and LANE clipped to 24."""
+    """The board as a compact text table: one line per lane. A damaged record in board.json shows as blanks. NOTE is
+    the first that applies: the plan warning, a risky diff, the blocked line, the review limit, the compactions
+    (signal_notes), the next step, the follow-ups, another clone, unowned. `owners` (a project with several
+    orchs): an unowned lane gets the note `unowned: adopt it`, last of the notes. `column` (every lane, --all): an
+    ORCH column, and LANE clipped to 24."""
     records = [r for r in records if isinstance(r, dict)] if isinstance(records, list) else []
     if not records:
         return ["no lanes"]
@@ -4153,8 +4311,9 @@ def board_lines(records: list, owners: bool = False, column: bool = False) -> li
         held = [x for x in r.get("follow_ups") or [] if isinstance(x, str)] if isinstance(r.get("follow_ups"), list) else []
         clone = as_text(r.get("clone"))
         unowned = owners and "orch" in r and r.get("orch") is None and r.get("phase") != "removed"
+        review, compact = signal_notes(r)
         note = (warning if warning else risky if risky else f"blocked: {blocked}" if blocked
-                else f"next: {nxt}" if nxt else f"follow-ups: {', '.join(held)}" if held
+                else review if review else compact if compact else f"next: {nxt}" if nxt else f"follow-ups: {', '.join(held)}" if held
                 else f"in another clone: {short_path(clone)}" if clone else "unowned: adopt it" if unowned else "")
         number = pr.get("number")
         table.append([clip(as_text(r.get("lane")) or "?", 24 if column else 28)]
@@ -4770,7 +4929,8 @@ def cmd_board(args: argparse.Namespace) -> int:
     files = view["files"]
     made = precise_now()
     cursor, base, _ = digest_base(files["digest"])
-    records = make_board(home, cursor, {p: b.get("lane") for p, b in base.items() if b.get("lane")}, view)
+    limit = review_round_limit()
+    records = make_board(home, cursor, {p: b.get("lane") for p, b in base.items() if b.get("lane")}, view, limit)
     saved, stale = False, None
     if not view["all"]:
         with project_lock(home):
@@ -4782,12 +4942,14 @@ def cmd_board(args: argparse.Namespace) -> int:
         print(json.dumps({"project": home.name, "orch": view["name"], "all": view["all"],
                           "board": str(files["board"]) if not view["all"] else None, "saved": saved,
                           **({"stale": stale} if stale else {}),
-                          "lanes": records, "research": research}, indent=2, ensure_ascii=False))
+                          "review_limit": limit, "lanes": records, "research": research}, indent=2, ensure_ascii=False))
         return 0
     print(board_head(home, view, records) + ("" if saved or view["all"] else
                                              f" (not saved: {stale})" if stale else
                                              " (board.json holds a newer board)"))
     print("\n".join(board_lines(records, owners=view["several"], column=view["all"])))
+    if limit.get("error"):
+        print(f"\nReview round limit {limit['limit']} (the default): {limit['error']}")
     if research:
         print(f"\nOpen research ({len(research)}, no RESEARCH DONE line yet):")
         for r in research:
@@ -6663,7 +6825,12 @@ def build_parser() -> argparse.ArgumentParser:
                        description="Reads herdr, git and gh like sweep, and saves the board to the orch's "
                                    "board.json in the project home. It never moves the digest. In a project with "
                                    "several orchs, an orch's board holds its own lanes and the unowned ones; --all "
-                                   "(and a caller that is no orch) shows every lane with an ORCH column.")
+                                   "(and a caller that is no orch) shows every lane with an ORCH column. Two signals: "
+                                   "a lane whose implementer or planner compacted since its last reset or spawn "
+                                   "(`compacted <n>x: fleet reset <pane> at the next commit`), and a lane whose "
+                                   "review round numbers reach the conventions' `- Review round limit: <n>` "
+                                   "(default 4: `<n> review rounds (limit <m>): ask the user first`). The board never "
+                                   "resets a lane and never stops a review.")
     b.add_argument("--project", help="a project name (default: the project of this directory)")
     b.add_argument("--orch", help="the orch whose board this is (default: the caller's orch)")
     b.add_argument("--all", action="store_true", help="every lane of the project, with its orch; saves nothing")

@@ -19,8 +19,9 @@ allowed-tools:
 
 ## 1. Check that the lane is ready
 
-1. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" conventions`. Use its critic rules and stop rule.
+1. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" conventions`. Use its critic rules, its stop rule and its `Review round limit` (default 4).
 2. Find the lane with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" board` (its phase is `ready <n>`; the board shows your orch's lanes and the unowned ones, `board --all` every lane of the project), or with `status`. Round `<n>` is the number on the newest `READY FOR REVIEW: round <n>` line in the lane's STATUS.md.
+   If the lane's note on the board is `<n> review rounds (limit <m>): ask the user first`, stop here: the hard limit applies (section 5). Start no round before the user answers.
 3. Read STATUS.md. Verification results must be real: no `PLACEHOLDER`, nothing "still running". The work must be committed (`git -C <worktree> status --short` is empty). If not, send the implementer one request to finish, and watch again.
 4. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" risk <worktree>`. It lists the lane's changed paths that match a high-risk pattern and who covers each. Put its result in the request. A path that needs the user does not stop the review, but it stops the merge until the user said yes (the finish step in `/fleet:fleet`); tell the user now, so the answer is ready.
 
@@ -31,7 +32,7 @@ Write `<worktree>/.fleet/REVIEW-REQUEST-<n>.md` from the template in `${CLAUDE_P
 - Focus: the acceptance criteria in BRIEF.md, plus the risks you see in the diff.
 - High-risk paths: the matches from `fleet risk`, with their category and what covers them. Ask the critic to look hardest at those paths.
 - The round rule. Apply the stop rule from the conventions here.
-- The output file: `.fleet/REVIEW-<n>.md`. With two critics, give each its own file (`REVIEW-<n>-codex.md`, `REVIEW-<n>-claude.md`). Name every output file in the request by its exact name: `fleet board` counts the round as reviewed only when each named file has a `VERDICT:` line.
+- The output file: `.fleet/REVIEW-<n>.md`. With two critics, give each its own file (`REVIEW-<n>-codex.md`, `REVIEW-<n>-claude.md`). Name every output file in the request by its exact name: `fleet board` counts the round as reviewed only when each named file has a `VERDICT:` line. A round on the pull request takes the next round number too (`REVIEW-<n>-pr.md`): the board counts the review rounds by the distinct numbers of `REVIEW-<n>.md` and `REVIEW-<n>-<name>.md`, each number once, and a file named any other way is not counted.
 
 ## 3. Start the critics
 
@@ -63,9 +64,11 @@ Read each review file yourself. For each finding, decide: fix, decline with a re
   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" send <impl pane> --text "Read .fleet/REVIEW-<n>.md and its Orchestrator rulings. Fix or decline each finding, record each disposition in .fleet/STATUS.md, commit, then add the line READY FOR REVIEW: round <n+1> to STATUS.md and stop."
   ```
   With two critics, name each review file in the pointer: "Read .fleet/REVIEW-<n>-codex.md and .fleet/REVIEW-<n>-claude.md and their Orchestrator rulings. ..." and the rest as above.
-  Watch for `READY FOR REVIEW: round <n+1>` and repeat from step 1.
+  Watch for `READY FOR REVIEW: round <n+1>` and repeat from step 1, which checks the round limit first.
 
 ## 5. Stop
+
+The hard limit: once a lane's review files hold as many round numbers as the conventions' `Review round limit` (default 4), the board notes `<n> review rounds (limit <m>): ask the user first`. Then ask the user before another round: show the open findings and the rounds so far, and offer to merge with follow-ups, to run one more round, or to stop the lane. The helper never stops a review by itself; you do, on this note. A lane whose newest round every critic approved (also after its pull request opened), a merged lane and a removed one show no note.
 
 Enforce the stop rule from the conventions. Once it applies, a finding below the blocking level becomes a follow-up in PROJECT.md (or an issue, if the user wants one), not another round. Each declined finding that the user may want later is a follow-up too. Add each one with the lane and the review file as its source:
 

@@ -20,6 +20,7 @@ Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" conventions` first. Its "Cont
 
 - Yourself: the statusline (`N% (used/total)`), or `/context`.
 - A lane: `herdr pane read <pane> --source recent-unwrapped --lines 300`. The statusline is under the composer. If it shows no percentage, judge by run length and by compactions on screen.
+- Every lane at once: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" board`. A lane whose implementer or planner compacted since its last `reset` (or since its spawn, or a `/clear`) shows the note `compacted <n>x: fleet reset <pane> at the next commit` (`--json`: `compactions` and `compacted_pane`). The count comes from the SessionStart hook's records, so it covers Claude panes only. A note above it in the board's order (the plan warning, a risky diff, a blocked line, the review limit) hides it; `--json` always has the count.
 
 ## Decide
 
@@ -28,7 +29,7 @@ Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" conventions` first. Its "Cont
 | Below the threshold (default 60 %) | Continue. |
 | Above it, at a commit or another boundary, and the lane files are current | `/clear` and re-brief. Best for lanes: the files keep the state, and a summary loses nothing. |
 | Above it, in the middle of a change that cannot stop | `/compact` with a focus. At the next boundary, check that STATUS.md is current. |
-| Auto-compaction already ran, or the agent repeats itself or forgets rules | Treat it as above the threshold: `/clear` and re-brief at the next boundary. |
+| Auto-compaction already ran (the board's `compacted <n>x` note, or a `Compacted` line on screen), or the agent repeats itself or forgets rules | Treat it as above the threshold: reset it (`/clear` and re-brief) at its next commit. Act on the note: the helper never resets a lane by itself. |
 | The account or model must change, or you are the orchestrator and your context is high | Hand off: `/fleet:handoff`. |
 
 For a Codex lane, every `/clear` or `/compact` in this table means a handoff: `fleet reset` supports Claude only (see the next section).
@@ -50,7 +51,7 @@ For a Claude lane:
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" reset <pane> --compact "<what to keep>"
    ```
    `reset` waits for a boundary, confirms the `/clear` (a new session id) or the `/compact` (a `Compacted` line), and sends a resume prompt that reads BRIEF.md, STATUS.md and HANDOFF.md. When the pane was started with `--role`, the SessionStart hook also gives it a re-brief for its role.
-3. Watch the lane again (`/fleet:lane`, step 5).
+3. Watch the lane again (`/fleet:lane`, step 5). After a confirmed `reset` (either form) the board's compaction count of that pane starts again at 0.
 
 A planner is short-lived: it ends at `PLAN READY`. Reset it only as you would an implementer, above the threshold and at a boundary, and give it its own resume prompt, since the default one would make it implement:
 ```bash
