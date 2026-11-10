@@ -3980,6 +3980,27 @@ class DocsTests(FleetTestCase):
         self.assertIn('changed: "nothing"', lane)
         self.assertIn("high-risk pattern", (self.PLUGIN / "defaults" / "conventions.md").read_text())
 
+    def test_docs_say_what_a_decision_is(self):
+        """F19: every place that tells the orchestrator to write decisions says that a decision is a ruling, not a
+        merge record; the templates are the helper's own."""
+        skills = self.PLUGIN / "skills"
+        rule = "not a record of a merge, a review round, a push or a cleanup"
+        self.assertIn(rule, " ".join(self.template("PROJECT.md").split()))
+        self.assertIn(rule, " ".join(fleet.PROJECT_TEMPLATE.split()))
+        self.assertEqual(self.template("ORCH.md") + "\n", fleet.ORCH_TEMPLATE.format(name="<name>", project="<project>"))
+        fleet_skill = (skills / "fleet" / "SKILL.md").read_text()
+        for part in (fleet_skill.split("## Start here", 1)[1].split("## The helper", 1)[0],
+                     fleet_skill.split("5. **Finish**", 1)[1].split("6. **Clean up**", 1)[0],
+                     fleet_skill.split("## Rules", 1)[1]):
+            self.assertRegex(part, r"no merge record|a merge, a review round, a push or a cleanup is no decision|"
+                                   r"never a record of a merge")
+        for doc in ((skills / "context" / "SKILL.md").read_text(), (skills / "handoff" / "SKILL.md").read_text()):
+            self.assertIn("ruling and its reason", doc)
+        readme = (self.PLUGIN.parent.parent / "README.md").read_text()
+        row = next(line for line in readme.splitlines() if line.startswith("| `PROJECT.md` |"))
+        self.assertIn("rulings only", row)
+        self.assertNotIn("decisions go to PROJECT.md", readme)
+
     def test_docs_name_the_lane_signals(self):
         defaults = (self.PLUGIN / "defaults" / "conventions.md").read_text()
         self.assertEqual(fleet.parse_review_limit(defaults), (4, None))
@@ -4122,7 +4143,7 @@ class DocsTests(FleetTestCase):
             for text in ("default branch", "git fetch", "fast-forward", "git merge --ff-only", "in lanes",
                          "each worktree has its own", "its own clone"):
                 self.assertIn(text, doc)
-        self.assertEqual(fleet.VERSION, "0.9.1")
+        self.assertEqual(fleet.VERSION, "0.9.2")
 
 class OrchTests(FleetTestCase):
     """orch, board, digest and the orch re-brief, in a temporary FLEET_HOME. herdr and gh never run."""
@@ -4271,6 +4292,49 @@ class OrchTests(FleetTestCase):
         # A release of the only orch removes the file, as before.
         self.assertEqual(self.main("orch", "release", pane="w1:p1")[0], 0)
         self.assertFalse(orch.exists())
+
+    DECISION_RULE = ("A decision is a ruling and its reason, not a record of a merge, a review round, a push or a "
+                     "cleanup: the event log and git keep those.")
+
+    @staticmethod
+    def one_line(text):
+        return " ".join(text.split())
+
+    def test_new_memory_files_carry_the_decision_rule(self):
+        """A new PROJECT.md and a new ORCH.md say what a decision is (F19); their sections still read as empty."""
+        self.main("orch", "claim", pane="w1:p1")
+        md = (self.project / "PROJECT.md").read_text()
+        self.assertIn(self.DECISION_RULE, self.one_line(md))
+        for title in ("Rules", "Decisions", "Follow-ups", "Notes", "High-risk paths"):
+            self.assertEqual(fleet.section_text(md, title), [], title)
+        self.alive.add("w1:p1")
+        self.assertEqual(self.main("orch", "claim", "--name", "billing", pane="w2:p1")[0], 0)
+        for name in ("default", "billing"):
+            md = (self.project / "orchs" / name / "ORCH.md").read_text()
+            self.assertIn(self.DECISION_RULE, self.one_line(md), name)
+            self.assertEqual(fleet.section_text(md, "Decisions") + fleet.section_text(md, "Notes"), [], name)
+
+    def test_an_existing_project_md_keeps_its_bytes(self):
+        """The rule changes only new files: a PROJECT.md in the 0.9.1 form, with a merge record among its decisions,
+        is byte-identical after a claim, show, list, digest, board, follow-up list and the switch to format 2."""
+        old = ("# Project: app\n\nThe orchestrator's memory for this project. `fleet board` and the event log keep the "
+               "lanes; this file keeps\nwhat nothing else knows. Keep each entry to one line.\n\n## Rules\n- none\n\n"
+               "## Decisions\n- 2026-11-01 merged feat/x after review round 2 (PR #9)\n\n## Follow-ups\n- none\n\n"
+               "## Notes\n- none\n\n## High-risk paths\n- none\n").encode()
+        self.project.mkdir(parents=True, exist_ok=True)
+        md = self.project / "PROJECT.md"
+        md.write_bytes(old)
+        self.main("orch", "claim", pane="w1:p1")
+        self.alive.add("w1:p1")
+        self.digest_and_board("w1:p1")
+        for argv in (("orch", "show"), ("orch", "list"), ("follow-up", "list")):
+            self.assertEqual(self.main(*argv, pane="w1:p1")[0], 0, argv)
+            self.assertEqual(md.read_bytes(), old, argv)
+        self.assertEqual(self.main("orch", "claim", "--name", "billing", pane="w2:p1")[0], 0)
+        self.digest_and_board("w2:p1")
+        self.assertEqual(md.read_bytes(), old)
+        # The ORCH.md files that the switch creates are new, so they carry the rule.
+        self.assertIn(self.DECISION_RULE, self.one_line((self.project / "orchs" / "billing" / "ORCH.md").read_text()))
 
     def test_the_switch_to_format_2(self):
         """The claim of a second name switches orch.json to format 2 once: the root digest.json and board.json move

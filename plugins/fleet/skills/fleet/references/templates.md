@@ -205,17 +205,20 @@ Redact secrets: never copy a key, token or password into a handoff; name where i
 
 `fleet orch claim` creates it when it is missing, with these sections, each holding `- none`. `fleet orch show` prints its path. It holds only what nothing else knows: `fleet board` derives the lanes, and the event log records every command. The SessionStart hook shows its Rules and Follow-ups to each orchestrator pane at each session start. `## High-risk paths` holds the project's own high-risk path patterns. With several orchs (format 2) the file is shared: `## Rules`, `## High-risk paths` and `## Follow-ups` concern every orch, and `## Decisions` and `## Notes` keep only what concerns the whole project; each orch writes the decisions and notes of its theme to its ORCH.md (below). Keep the shared sections short.
 
+`## Decisions` holds rulings only: one line each, the ruling and its reason (and who decided). A merge, a review round, a push or a cleanup is no decision: the event log and git keep those, and `fleet log` shows them. A file that already holds such records keeps them; the helper never rewrites it.
+
 ```markdown
 # Project: <name>
 
 The orchestrator's memory for this project. `fleet board` and the event log keep the lanes; this file keeps
-what nothing else knows. Keep each entry to one line.
+what nothing else knows. Keep each entry to one line. A decision is a ruling and its reason, not a record of a
+merge, a review round, a push or a cleanup: the event log and git keep those.
 
 ## Rules
 - <a rule the user gave for this project, e.g. "never push to main">
 
 ## Decisions
-- <date> <decision and reason; who decided>
+- <date> <ruling and its reason; who decided>
 
 ## Follow-ups
 - <work left for later, one item each, as `fleet follow-up add` writes it: "[F1] text (from source)">
@@ -249,7 +252,8 @@ A project with one orch named `default` has no ORCH.md: that orch keeps its deci
 # Orch: <name> (project <project>)
 
 The memory of orch <name>: the decisions and notes of its theme. The rules, the high-risk paths, the follow-ups
-and what concerns the whole project stay in PROJECT.md. Keep each entry to one line.
+and what concerns the whole project stay in PROJECT.md. Keep each entry to one line. A decision is a ruling and
+its reason, not a record of a merge, a review round, a push or a cleanup: the event log and git keep those.
 
 ## Decisions
 - none

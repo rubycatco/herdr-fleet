@@ -60,7 +60,8 @@ fleet risk           a risky diff you have not approved? you say yes first
 push, open the PR, merge per your rules
   └─ /fleet:cleanup    fleet sweep, you pick, fleet cleanup
                        closes the follow-ups whose work merged
-                       decisions go to PROJECT.md, follow-ups via fleet follow-up
+                       rulings go to PROJECT.md (no merge records: the log keeps
+                       those), follow-ups via fleet follow-up
 
 along the way
   a lane asks or blocks   fleet watch returns; orchestrator answers or asks you
@@ -141,9 +142,9 @@ Each repository is a project. The project is known by its normalized remote URL,
 | `events/YYYY-MM.jsonl` | The event log, one JSON object per line. |
 | `lanes/<branch>-<time>/` | The `.fleet/` files of each lane that `fleet cleanup` removed. |
 | `research/<slug>.md` | One research question each: the orchestrator writes the question and context, a researcher the findings and answer, ending with `RESEARCH DONE`. |
-| `PROJECT.md` | The memory that every orchestrator of the project shares: `## Rules`, `## Decisions`, `## Follow-ups` (one `- [F7] <text>` item each, written by `fleet follow-up`), `## Notes`, and `## High-risk paths`, the project's own high-risk path patterns (`- migration: db/schema.rb`). The orchestrators write it; you can edit it. `fleet orch claim` creates it. Once the project has several orchestrators, each keeps the decisions and notes of its own theme in its `ORCH.md`. |
+| `PROJECT.md` | The memory that every orchestrator of the project shares: `## Rules`, `## Decisions` (rulings only, one line each with the reason; a merge, a review round, a push or a cleanup is no decision, since the event log and git keep those), `## Follow-ups` (one `- [F7] <text>` item each, written by `fleet follow-up`), `## Notes`, and `## High-risk paths`, the project's own high-risk path patterns (`- migration: db/schema.rb`). The orchestrators write it; you can edit it. `fleet orch claim` creates it. Once the project has several orchestrators, each keeps the decisions and notes of its own theme in its `ORCH.md`. |
 | `orch.json` | The project's orchestrators (orchs), by name: the pane, workspace, checkout, session and claim time of each. With one orch named `default` it keeps the shape of 0.8.x, one record; from a second name on it is format 2 (see Orchestrators). Written by `fleet orch claim`, `rename` and `release`. |
-| `orchs/<name>/` | Each orch's own files in format 2: `ORCH.md` (the decisions and notes of its theme), `digest.json` and `board.json`. |
+| `orchs/<name>/` | Each orch's own files in format 2: `ORCH.md` (the decisions and notes of its theme, with the same rule for decisions), `digest.json` and `board.json`. |
 | `follow-ups.json` | The counter of follow-up IDs, `{"next": N}`. It only goes up. Written by `fleet follow-up`. |
 | `board.json` | The newest lane board and when it was made, the cache for the re-brief. Written by `fleet board` and `fleet digest`. The file at the root belongs to the one orch of the legacy shape; in format 2 each orch has its own in `orchs/<name>/`. |
 | `digest.json` | The digest's cursor, how far it read each monthly log (a byte offset), and each lane's phase at that time. Only `fleet digest` moves it. At the root for the legacy shape, else in `orchs/<name>/`. |
