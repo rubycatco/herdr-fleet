@@ -55,7 +55,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" wait --since <seq> --mentions-only
 
 With `--mentions-only`, the orchestrator sleeps through intermediate `impl <-> critic` rounds on `Risk: none` lanes (`fleet post` auto-syncs dual critics and enforces clean git + no `PLACEHOLDER`) and wakes only when a critic or implementer posts `--to orch --done` (`VERDICT: APPROVE`), `--blocked`, dual-critic disagreement (`escalate`), an uncovered high-risk path, or `Review round limit`. Pass `--lanes <branch>` only to isolate one lane, or omit `--mentions-only` for supervised rounds.
 
-A critic from an earlier round can take the re-check instead of a new one: it remembers its findings. Send it the new request with `send <critic pane> --file <worktree>/.fleet/REVIEW-REQUEST-<n>.md` (or `post --to critic --file <worktree>/.fleet/REVIEW-REQUEST-<n>.md --round <n> "..."`).
+A critic from an earlier round can take the re-check instead of a new one: it remembers its findings. Send it the new request with `send <critic pane> --file <worktree>/.fleet/REVIEW-REQUEST-<n>.md` (or `post --to critic --lane <worktree> --file <worktree>/.fleet/REVIEW-REQUEST-<n>.md --round <n> "..."`).
 
 ## 4. Rule on the findings (when escalated or supervised)
 
@@ -64,9 +64,9 @@ On peer-to-peer `Risk: none` rounds, the implementer fixes `CHANGES REQUESTED` f
 When woken with findings to rule on, read each review file yourself. For each finding, decide: fix, decline with a reason, or ask the user (product and design decisions belong to the user). Where two critics disagree, the disagreement is usually a design decision: decide it, or ask. Add your rulings to each review file under `## Orchestrator rulings`.
 
 - `VERDICT: APPROVE` and nothing left to fix: the lane is done. Retire the critics and continue with the finish steps in `/fleet:fleet`.
-- Otherwise, send the implementer one pointer via `post` (or `send`):
+- Otherwise, send the implementer one pointer via `post` (or `send`), passing `--lane <worktree>` from the main checkout:
   ```bash
-  python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" post --to impl --file .fleet/REVIEW-<n>.md --round <n> "Read .fleet/REVIEW-<n>.md and its Orchestrator rulings. Fix or decline each finding, record dispositions in .fleet/STATUS.md, commit, then post round <n+1> to critic."
+  python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" post --to impl --lane <worktree> --file .fleet/REVIEW-<n>.md --round <n> "Read .fleet/REVIEW-<n>.md and its Orchestrator rulings. Fix or decline each finding, record dispositions in .fleet/STATUS.md, commit, then post round <n+1> to critic."
   ```
   With two critics, name each review file in the summary: "Read .fleet/REVIEW-<n>-codex.md and .fleet/REVIEW-<n>-claude.md and their Orchestrator rulings. ..." and the rest as above.
   Then `wait --since <new_seq> --mentions-only` and check the round limit first when woken.

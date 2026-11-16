@@ -112,7 +112,7 @@ The board shows `planning`, `plan ready <n>` and `plan approved <n>` for the lan
 
 When `wait` ends:
 - 0 (board wake): inspect `messages` (fetch referenced `#<seq>` context with `board --seqs ...`). On `READY FOR REVIEW` / `no_critic_pane` (Round 1 when `impl` ran `post --to critic` before critics existed), run `/fleet:review` to spawn critic(s); on `--done` (`VERDICT: APPROVE`), proceed to finish; on `--blocked` / `escalate`, resolve or ask the user.
-- 4 (blocked): read the pane. Cancel an unsafe prompt with `herdr pane send-keys <pane_id> Escape` and re-instruct with `send` or `post --to <pane_id>`. Then `wait --since <new_seq> --mentions-only` again.
+- 4 (blocked): read the pane. Cancel an unsafe prompt with `herdr pane send-keys <pane_id> Escape` and re-instruct with `send` or `post --to <pane_id> --lane <cwd>`. Then `wait --since <new_seq> --mentions-only` again.
 - 6 (stopped): read STATUS.md (`Blocked`) and the pane. Answer with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" send <pane_id> --text "..."`. Then `wait` again.
 - 5: read the `event` field of the result.
   - `agent-exited`: the shell pane stays. Read the pane. Start the agent again in it with `spawn --pane <pane_id> --role impl ...` and a prompt that points at BRIEF.md and STATUS.md.
