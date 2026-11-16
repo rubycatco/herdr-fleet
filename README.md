@@ -14,10 +14,10 @@ You talk to one Claude Code session, the orchestrator. Each project has one, reg
 │  │ orchestrator             │       │ implementer       │ critic           │ │
 │  │ you + Claude Code        │ spawn │ Claude Code       │ Codex or Claude  │ │
 │  │ fleet skills             │──────>│                   │ (review rounds)  │ │
-│  │ fleet helper CLI         │ send  │ reads BRIEF.md    │ reads the diff   │ │
-│  │                          │       │ writes STATUS.md  │ writes REVIEW-n  │ │
-│  │ fleet board, digest      │<──────│                   │                  │ │
-│  │                          │ watch │                   │                  │ │
+│  │ fleet helper CLI         │ post/ │ reads BRIEF.md    │ reads the diff   │ │
+│  │                          │ send  │ writes STATUS.md  │ writes REVIEW-n  │ │
+│  │ fleet board, digest,     │<──────│       <── post ──>│ (peer-to-peer)   │ │
+│  │ wait --since             │ wake  │                   │                  │ │
 │  └──────────────────────────┘       └───────────────────┴──────────────────┘ │
 │                                                                              │
 │                                     workspace: add-export  (another lane)    │
@@ -46,16 +46,15 @@ each orchestrator session
   │    └─ plan first         a planner pane writes PLAN.md, then stops;
   │                          fleet approve-plan (you approve a high-risk plan)
   ├─ fleet spawn       implementer: plan (or PLAN.md) ─> code and commit ─> checks
-  └─ fleet watch       waits for "READY FOR REVIEW: round 1"
-        │
-        ▼              from here on, the orchestrator drives
-/fleet:review <─────────────────────────────────────────────────┐
-  ├─ REVIEW-REQUEST-n  diff range, focus, round rule            │
-  ├─ fleet spawn       critic: reads the diff, writes REVIEW-n  │
-  ├─ rulings           fix / decline / ask you                  │
-  └─ fleet send, watch implementer: fixes, commits, round n+1 ──┘
-        │              repeats until APPROVE or the stop rule
+  └─ fleet wait        single --since waiter across lanes; impl posts --to critic
+        │              (no_critic_pane on Round 1 wakes orch to spawn critics)
         ▼
+/fleet:review <─────────────────────────────────────────────────┐
+  ├─ REVIEW-REQUEST-n  diff range, #seq refs, fleet CLI path    │
+  ├─ fleet spawn       critic: reads the diff, writes REVIEW-n  │
+  ├─ fleet post        Risk: none -> impl <-> critic peer loop ─┘
+  │                    wakes orch on APPROVE, Blocked, split, risk, or limit
+  ▼
 fleet risk           a risky diff you have not approved? you say yes first
 push, open the PR, merge per your rules
   └─ /fleet:cleanup    fleet sweep, you pick, fleet cleanup
@@ -64,9 +63,9 @@ push, open the PR, merge per your rules
                        those), follow-ups via fleet follow-up
 
 along the way
-  a lane asks or blocks   fleet watch returns; orchestrator answers or asks you
+  a lane asks or blocks   fleet wait returns; orchestrator answers or asks you
   a lane's context fills  at ~60 %: fleet reset at a commit, /clear, re-brief
-  your session fills up   /clear: the hook re-briefs you from the project home
+  your session fills up   /clear: the hook re-briefs you (including last_seq)
                           or /fleet:handoff; fleet orch claim --replace moves the role
   an account runs low     /fleet:accounts, then /fleet:handoff self <account>
                           (remuda only; plain mode never switches accounts)
@@ -140,14 +139,15 @@ Each repository is a project. The project is known by its normalized remote URL,
 |---|---|
 | `project.json` | The project's name and keys: the remote URL and the main checkout of each clone. |
 | `events/YYYY-MM.jsonl` | The event log, one JSON object per line. |
+| `events/board.jsonl` | Sequenced `#seq` board log (posts and lifecycle transitions), serialized via `events/board.seq` and blocking `events/board.lock` with zero silent drops. |
 | `lanes/<branch>-<time>/` | The `.fleet/` files of each lane that `fleet cleanup` removed. |
 | `research/<slug>.md` | One research question each: the orchestrator writes the question and context, a researcher the findings and answer, ending with `RESEARCH DONE`. |
 | `PROJECT.md` | The memory that every orchestrator of the project shares: `## Rules`, `## Decisions` (rulings only, one line each with the reason; a merge, a review round, a push or a cleanup is no decision, since the event log and git keep those), `## Follow-ups` (one `- [F7] <text>` item each, written by `fleet follow-up`), `## Notes`, and `## High-risk paths`, the project's own high-risk path patterns (`- migration: db/schema.rb`). The orchestrators write it; you can edit it. `fleet orch claim` creates it. Once the project has several orchestrators, each keeps the decisions and notes of its own theme in its `ORCH.md`. |
 | `orch.json` | The project's orchestrators (orchs), by name: the pane, workspace, checkout, session and claim time of each. With one orch named `default` it keeps the shape of 0.8.x, one record; from a second name on it is format 2 (see Orchestrators). Written by `fleet orch claim`, `rename` and `release`. |
 | `orchs/<name>/` | Each orch's own files in format 2: `ORCH.md` (the decisions and notes of its theme, with the same rule for decisions), `digest.json` and `board.json`. |
 | `follow-ups.json` | The counter of follow-up IDs, `{"next": N}`. It only goes up. Written by `fleet follow-up`. |
-| `board.json` | The newest lane board and when it was made, the cache for the re-brief. Written by `fleet board` and `fleet digest`. The file at the root belongs to the one orch of the legacy shape; in format 2 each orch has its own in `orchs/<name>/`. |
-| `digest.json` | The digest's cursor, how far it read each monthly log (a byte offset), and each lane's phase at that time. Only `fleet digest` moves it. At the root for the legacy shape, else in `orchs/<name>/`. |
+| `board.json` | The newest lane board, `head_seq`, and when it was made, the cache for the re-brief. Written by `fleet board` and `fleet digest`. The file at the root belongs to the one orch of the legacy shape; in format 2 each orch has its own in `orchs/<name>/`. |
+| `digest.json` | The digest's cursor (`last_seq` on the `#seq` board, how far it read each monthly log by byte offset, and each lane's phase at that time). Only `fleet digest` moves it. At the root for the legacy shape, else in `orchs/<name>/`. |
 | `.lock` | Serializes `fleet orch claim`, `release`, `rename`, `fleet adopt`, a digest that consumes, board.json writes, and every follow-up write (`fleet follow-up` and the follow-up step of `fleet cleanup`). `--peek` and the SessionStart hook never take it. |
 
 The helper records each command that changes something: `orch_claim`, `orch_release` and `orch_rename`, `adopt` (a lane's orch set or moved), `phase` (a lane's phase change, recorded by `fleet digest`), `worktree`, `spawn` (agent, account, model, effort, role, prompt, start-up `warnings`; recorded at launch) and `spawn_result` (whether the agent started, its session), `send` (the prompt), `reset`, `retire`, `plan_approved` (round, who approved, risk, the number of files under `## Files`, and the high-risk paths among them), `risk_approved` (the paths of a risky diff that you approved, and the HEAD commit), `cleanup` (the result, the last session of each agent, and the follow-ups it closed or released), `follow_up_added`, `follow_up_taken`, `follow_up_released` and `follow_up_done` (the follow-up's ID and text, its lane, and for `done` the reason), and `handoff` (`prep --handoff`: the path of the handoff file). Each event names its lane (branch, workspace, directory), its orch in the field `orch` (for an event of a lane, the lane's owner when the event was recorded, read from its `lane.json` with no git; for a claim, rename, release, `adopt`, `cleanup` or a digest's `phase`, the orch it concerns), and who ran the command: the Herdr pane and, inside Claude Code, the session. The SessionStart and SessionEnd hooks record each Claude session in a Herdr pane of a checkout that has `.fleet/` (`session_start`, `session_end`): the session id, the transcript path, the role, and why the session ended. Outside Herdr the hooks do not start Python, except to re-brief after /clear or compaction. Events outside a repository go to `~/.fleet/events/`. The log stays on this machine. It can hold prompts, so the helper keeps the home private (mode 0700).
@@ -201,7 +201,9 @@ Your yes for high-risk work holds in the helper, not only in the orchestrator's 
 
 ## Helper CLI
 
-`plugins/fleet/scripts/fleet` does the parts that must be exact: start agents and get past their first-run dialogs, submit prompts and confirm that they landed, wait for markers, confirm `/clear` and `/compact`, refuse to drive the calling pane, remove a lane only when it is clean, and delete its branch only when its merge holds every commit. `python3 plugins/fleet/scripts/fleet --help` lists the commands. `FLEET_NO_REMUDA=1` forces plain mode.
+`plugins/fleet/scripts/fleet` does the parts that must be exact: start agents and get past their first-run dialogs, submit prompts and confirm that they landed, post and route sequenced `#seq` board messages (`fleet post`) with foreground hygiene checks and peer-to-peer review sync, wait on `events/board.jsonl` and pane health (`fleet wait --since <seq>`), wait for markers (`fleet watch`), confirm `/clear` and `/compact`, refuse to drive the calling pane, remove a lane only when it is clean, and delete its branch only when its merge holds every commit. `python3 plugins/fleet/scripts/fleet --help` lists the commands. `FLEET_NO_REMUDA=1` forces plain mode.
+
+- **Sequenced board & zero-copy `#seq` citations.** `fleet post --to <target> [--done | --blocked] [--file <path>] [--refs <seqs>] [--round <n>] "<summary>"` appends a monotonic `#seq` record to `events/board.jsonl`. Targeting `orch` wakes `fleet wait` via the board doorbell without pasting into the orchestrator pane; targeting workers (`impl`, `critic`, etc.) writes `.fleet/inbox/*.md` and submits a verified 1-line pointer (`fleet board --since <seq>` and `--seqs 1,4` read the feed without slow `herdr`/`git`/`gh` scans). On `Risk: none` lanes, `impl <-> critic` run rounds peer-to-peer (Round 1 without a live critic pane auto-escalates `no_critic_pane` to `orch`; dual critics auto-sync and escalate on disagreement; `fleet risk` and `Review round limit` auto-escalate to `orch`). Pass the resolved `scripts/fleet` path in briefs and review requests so Codex/worker panes (which lack `CLAUDE_PLUGIN_ROOT`) can run `fleet post`.
 
 ### Start-up checks
 

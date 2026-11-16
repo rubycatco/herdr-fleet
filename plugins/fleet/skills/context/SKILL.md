@@ -44,14 +44,14 @@ For a Claude lane:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" send <pane> --text "Update .fleet/STATUS.md (log, verification, next step) and commit your work, then stop."
    ```
-   Then wait with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" watch <pane> --idle-grace 30` (no marker: it returns 6 once the lane stops).
+   Then wait with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" wait --pane <pane> --idle-grace 30` (no marker: returns 6 once the lane stops).
 2. Reset it. PANE comes before `--compact`, because `--compact` takes an optional value:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" reset <pane>
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" reset <pane> --compact "<what to keep>"
    ```
    `reset` waits for a boundary, confirms the `/clear` (a new session id) or the `/compact` (a `Compacted` line), and sends a resume prompt that reads BRIEF.md, STATUS.md and HANDOFF.md. When the pane was started with `--role`, the SessionStart hook also gives it a re-brief for its role.
-3. Watch the lane again (`/fleet:lane`, step 5). After a confirmed `reset` (either form) the board's compaction count of that pane starts again at 0.
+3. Wait on the lane again (`wait --since <seq> --mentions-only`, `/fleet:lane` step 5). After a confirmed `reset` (either form) the board's compaction count of that pane starts again at 0.
 
 A planner is short-lived: it ends at `PLAN READY`. Reset it only as you would an implementer, above the threshold and at a boundary, and give it its own resume prompt, since the default one would make it implement:
 ```bash
@@ -66,5 +66,5 @@ The helper refuses to drive its own pane, and you cannot type into your own comp
 
 1. Write down your state first. Orchestrator: PROJECT.md (decisions, each a ruling and its reason in one line, never a merge or review record; follow-ups; the user's rules from this conversation; with several orchs, your theme's decisions and notes go to your ORCH.md); add follow-ups with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" follow-up add "<text>"` and close them with `follow-up done <ID>`, not by hand. The board and the log keep the lanes. An orchestrator with an old FLEET.md updates it. Lane: STATUS.md (log, verification, next step), and commit.
 2. Then either:
-   - ask the user to type `/clear` (or `/compact <focus>`). The hook re-briefs this pane from your files. A registered orch (`orch show`) gets its name, PROJECT.md's rules and follow-ups, its ORCH.md's notes when the project has several orchs, its cached board and the count of new events in its view, so `/clear` loses almost nothing; it then runs `digest`. Compaction keeps the session id that the orch's last digest recorded, so the hook knows the orch by pane and session, without git, even in another project's checkout. An old FLEET.md orchestrator is re-briefed from FLEET.md when its `Orchestrator:` line names this pane, and a lane's implementer from the lane files; or
+   - ask the user to type `/clear` (or `/compact <focus>`). The hook re-briefs this pane from your files. A registered orch (`orch show`) gets its name, PROJECT.md's rules and follow-ups, its ORCH.md's notes when the project has several orchs, its cached board, the board head (`head_seq`) and its `last_seq` cursor, and the count of new events in its view, so `/clear` loses almost nothing; it then runs `digest` and resumes with `fleet wait --since <last_seq> --mentions-only` (no per-lane background watchers to rebuild). Compaction keeps the session id that the orch's last digest recorded, so the hook knows the orch by pane and session, without git, even in another project's checkout. An old FLEET.md orchestrator is re-briefed from FLEET.md when its `Orchestrator:` line names this pane, and a lane's implementer from the lane files; or
    - hand off with `/fleet:handoff`. It needs nothing from the user, and it is the right choice when the account or model also changes.

@@ -48,7 +48,7 @@ Go on only when it prints `ok: true`. Any refusal (exit code 2, for example `hel
 Write `<cwd>/.fleet/BRIEF.md` from the BRIEF template in `${CLAUDE_PLUGIN_ROOT}/skills/fleet/references/templates.md`:
 - Goal, scope, sources, constraints, acceptance, verification and reporting.
 - If the project documents a worktree setup step, put it under Setup.
-- Link to sources instead of copying them. Name exact files and commands. Keep it under about 80 lines.
+- Link to sources instead of copying them, and cite earlier board messages by `#<seq>` (`fleet board --seqs <n>`). Put the resolved helper path (`python3 "<PLUGIN_ROOT>/scripts/fleet"`) in `## Constraints` so worker panes can run `fleet post`. Name exact files and commands. Keep it under about 80 lines.
 - Give the lane the goal and the design points, not a step list. The lane writes its own plan into STATUS.md, or a planner writes PLAN.md (step 4b).
 - Link to research files in the project home instead of copying them.
 - With `--from <ID>`: quote the ID and its text under Sources (`- Follow-up F7 in PROJECT.md: "<text>"`).
@@ -79,7 +79,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --pane <pane_id> --role impl
      --agent <agent> [--model <model>] [--effort <effort>] [--account <account>] --accept-trust \
      --prompt "Read .fleet/BRIEF.md and write the plan in .fleet/PLAN.md. Change no other file. The Risk line is your reading; the paths under ## Files decide, so list every file. End with the line PLAN READY: 1 and stop."
    ```
-3. Watch for the plan, in the background: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" watch <pane_id> --marker "PLAN READY: 1" --file .fleet/PLAN.md`.
+3. Wait for the plan, in the background: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" wait --pane <pane_id> --marker "PLAN READY: 1" --file .fleet/PLAN.md` (or `wait --since <seq> --lanes <branch>`).
 4. Read PLAN.md. To ask for changes, send them to the same planner, and watch for the next number:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" send <pane_id> --text "<changes>. Revise .fleet/PLAN.md, change no other file, and end it with the line PLAN READY: <n+1>."
@@ -103,17 +103,18 @@ The board shows `planning`, `plan ready <n>` and `plan approved <n>` for the lan
 ## 5. Record and watch
 
 1. Nothing to write down for the lane itself: `fleet board` finds it, and the event log holds the spawn with its agent, account, model and prompt. A lane opened `--from <ID>` is already linked: `follow-up take` marked it, and the board shows the ID. Write a decision from step 1 to the project's PROJECT.md (`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" orch show` prints its path); add a follow-up with `follow-up add "<text>" --source "<where>"`. An orchestrator that still keeps the old `.fleet/FLEET.md` adds the lane there.
-2. Start a watcher with the Bash tool and `run_in_background: true`:
+2. Start or join the single background waiter with the Bash tool and `run_in_background: true` (pass the latest `head_seq` from `board --json` or `digest.json`'s `last_seq` as `--since <seq>`; one `wait` covers all active lanes in your view):
    ```bash
-   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" watch <pane_id> --marker "READY FOR REVIEW: round 1"
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" wait --since <seq> --mentions-only
    ```
-3. Tell the user in two or three lines: lane, pane, branch, account, and what happens next. Then wait for the watcher. Do not poll.
+   (Pass `--lanes <branch>` only when isolating a single lane; otherwise omit it so one waiter covers your whole orch.)
+3. Tell the user in two or three lines: lane, pane, branch, account, and what happens next. Then wait for the waiter. Do not poll.
 
-When the watcher ends:
-- 0: run `/fleet:review` for this lane.
-- 4 (blocked): read the pane. Cancel an unsafe prompt with `herdr pane send-keys <pane_id> Escape` and re-instruct with `send`. Then watch again.
-- 6 (stopped): read STATUS.md (`Blocked`) and the pane. Answer with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" send <pane_id> --text "..."`. Then watch again.
-- 5: read the `event` field of the watch result.
+When `wait` ends:
+- 0 (board wake): inspect `messages` (fetch referenced `#<seq>` context with `board --seqs ...`). On `READY FOR REVIEW` / `no_critic_pane` (Round 1 when `impl` ran `post --to critic` before critics existed), run `/fleet:review` to spawn critic(s); on `--done` (`VERDICT: APPROVE`), proceed to finish; on `--blocked` / `escalate`, resolve or ask the user.
+- 4 (blocked): read the pane. Cancel an unsafe prompt with `herdr pane send-keys <pane_id> Escape` and re-instruct with `send` or `post --to <pane_id>`. Then `wait --since <new_seq> --mentions-only` again.
+- 6 (stopped): read STATUS.md (`Blocked`) and the pane. Answer with `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" send <pane_id> --text "..."`. Then `wait` again.
+- 5: read the `event` field of the result.
   - `agent-exited`: the shell pane stays. Read the pane. Start the agent again in it with `spawn --pane <pane_id> --role impl ...` and a prompt that points at BRIEF.md and STATUS.md.
   - `pane-gone`: the pane is closed, but the worktree stays, and so does its owner in `.fleet/lane.json`. Open a new pane in it and start the agent there, with the settings of step 4:
     ```bash
@@ -121,4 +122,4 @@ When the watcher ends:
       --agent <agent> [--model <model>] [--effort <effort>] [--permission-mode <mode>] [--account <account>] --accept-trust \
       --prompt "Read .fleet/BRIEF.md and .fleet/STATUS.md and continue this lane."
     ```
-    Its `pane_id` is the lane's new pane: watch that one.
+    Its `pane_id` is the lane's new pane; re-arm `wait --since <new_seq> --mentions-only`.

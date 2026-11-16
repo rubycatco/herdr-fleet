@@ -26,7 +26,7 @@ You stay small: a researcher pane digs, and you read only its answer. The questi
 
 ## 2. Write the research file
 
-Write `<home>/research/<slug>.md` from the RESEARCH template in `${CLAUDE_PLUGIN_ROOT}/skills/fleet/references/templates.md`. The slug is a few words of the question, such as `auth-session-refresh`. Fill in the title, `Asked:`, Question and Context: what you already know, and where to look (paths, docs, URLs). One question per file. Do not write the done line: the watcher would end at once.
+Write `<home>/research/<slug>.md` from the RESEARCH template in `${CLAUDE_PLUGIN_ROOT}/skills/fleet/references/templates.md`. The slug is a few words of the question, such as `auth-session-refresh`. Fill in the title, `Asked:`, Question, Context (what you already know and where to look, citing `#<seq>` if relevant), and the resolved `scripts/fleet` path (`python3 "<PLUGIN_ROOT>/scripts/fleet"`) so the researcher can run `fleet post`. One question per file. Do not write the done line: the waiter would end at once.
 
 ## 3. Start the researcher
 
@@ -41,16 +41,17 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" spawn --split auto --cwd <checkout
 
 `--task` keeps the file with the pane's role, so after /clear or compaction the SessionStart hook tells the researcher to re-read it. The researcher writes only its research file.
 
-## 4. Watch and read the answer
+## 4. Wait and read the answer
 
-1. Start a watcher with the Bash tool and `run_in_background: true`:
+1. Start a background waiter (`run_in_background: true`):
    ```bash
-   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" watch <pane> --marker "RESEARCH DONE" --file <home>/research/<slug>.md
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" wait --since <seq> --mentions-only
    ```
+   (Or `wait --pane <pane> --marker "RESEARCH DONE" --file <home>/research/<slug>.md` to wait on the file marker directly.)
 2. When it ends:
    - 0: read `## Answer` and `## Open questions`. Then `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fleet" retire <pane> --close`.
-   - 6 (stopped): read the file and the pane. Answer with `send`, then watch again.
-   - 4 (blocked): read the pane. Cancel an unsafe prompt with `herdr pane send-keys <pane> Escape` and re-instruct. Then watch again.
+   - 6 (stopped): read the file and the pane. Answer with `send`, then wait again.
+   - 4 (blocked): read the pane. Cancel an unsafe prompt with `herdr pane send-keys <pane> Escape` and re-instruct. Then wait again.
    - 5 (exited): read the file. Start a new researcher on the same file when the answer is not complete.
 3. When the researcher changed other files, tell the user, and do not keep those changes.
 
