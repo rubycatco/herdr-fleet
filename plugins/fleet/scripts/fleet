@@ -134,6 +134,18 @@ def first_line(text: str) -> str:
     return ""
 
 
+def git_error_line(text: str) -> str:
+    """The fatal/error line of git output, skipping leading warning/hint lines."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    for line in lines:
+        if line.lower().startswith(("fatal:", "error:")):
+            return line
+    for line in lines:
+        if not line.lower().startswith(("warning:", "hint:")):
+            return line
+    return lines[0] if lines else ""
+
+
 def tool_version(path: str | None, args: tuple[str, ...] = ("--version",)) -> str | None:
     if not path:
         return None
@@ -880,25 +892,43 @@ def load_panes(fleet_dir: Path) -> dict:
 def save_panes(fleet_dir: Path, data: dict) -> None:
     path = Path(fleet_dir) / PANES_FILE
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+@contextmanager
+def lane_lock(fleet_dir: Path, wait: float | None = None):
+    """The lane's lock, <fleet_dir>/.lock. Waits up to LOCK_WAIT seconds for it."""
+    with file_lock(Path(fleet_dir) / LOCK_FILE, f"lane {Path(fleet_dir).parent.name}", wait):
+        yield
 
 
 def register_pane(cwd: str, pane: str, record: dict) -> str:
     fleet_dir = Path(prep_dir(cwd)["fleet_dir"])
-    data = load_panes(fleet_dir)
-    data[pane] = record
-    save_panes(fleet_dir, data)
+    with lane_lock(fleet_dir):
+        data = load_panes(fleet_dir)
+        data[pane] = record
+        save_panes(fleet_dir, data)
     return str(fleet_dir / PANES_FILE)
 
 
 def unregister_pane(cwd: str, pane: str) -> bool:
     fleet_dir = Path(git_toplevel(cwd) or cwd) / FLEET_DIR
-    data = load_panes(fleet_dir)
-    if pane not in data:
+    if not (fleet_dir / PANES_FILE).is_file():
         return False
-    del data[pane]
-    save_panes(fleet_dir, data)
+    with lane_lock(fleet_dir):
+        data = load_panes(fleet_dir)
+        if pane not in data:
+            return False
+        del data[pane]
+        save_panes(fleet_dir, data)
     return True
 
 
@@ -1708,7 +1738,7 @@ class HookRun:
             cp = self.git(path, "rev-parse", "--git-common-dir", "--show-toplevel")
             lines = cp.stdout.strip().splitlines()
             if cp.returncode == 128:
-                raise HookGitFailed(HOOK_NO_REPOSITORY, (cp.stderr.strip().splitlines() or [""])[0])
+                raise HookGitFailed(HOOK_NO_REPOSITORY, git_error_line(cp.stderr))
             if cp.returncode != 0 or len(lines) < 2:
                 raise HookGitFailed(HOOK_GIT_ERROR, f"git rev-parse failed with exit code {cp.returncode}")
             self.tops[path] = lines[1]
@@ -2686,9 +2716,9 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
 
 def archive_lane_files(path: str, repo: str | None, branch: str | None) -> str | None:
-    """Copy the lane's .fleet/ records (not panes.json) to its project's lanes/: removing the worktree deletes them."""
+    """Copy the lane's .fleet/ records (not panes.json or .lock) to its project's lanes/: removing the worktree deletes them."""
     src = Path(path) / FLEET_DIR
-    files = [p for p in sorted(src.rglob("*")) if p.is_file() and p.name != PANES_FILE] if src.is_dir() else []
+    files = [p for p in sorted(src.rglob("*")) if p.is_file() and p.name not in (PANES_FILE, LOCK_FILE)] if src.is_dir() else []
     if not files:
         return None
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", branch or Path(path).name).strip("-.") or "lane"
@@ -2739,7 +2769,8 @@ def finish_branch(f: dict) -> str:
         return f"kept {branch}: it moved after the check"
     cp = run_git(f["main_root"], "branch", "-D", branch)
     if cp is None or cp.returncode != 0:
-        return f"kept {branch}: " + (first_line(cp.stderr or cp.stdout) if cp is not None else "git branch -D failed")
+        return f"kept {branch}: " + (git_error_line(cp.stderr or cp.stdout) or "git branch -D failed"
+                                    if cp is not None else "git branch -D failed")
     return f"deleted {branch}"
 
 
@@ -2809,7 +2840,7 @@ def clean_lane(f: dict, timeout: float) -> dict:
         else:
             cp = run(remove, timeout=120)
             if cp.returncode != 0:
-                out["error"] = first_line(cp.stderr or cp.stdout) or "git worktree remove failed"
+                out["error"] = git_error_line(cp.stderr or cp.stdout) or "git worktree remove failed"
                 return out
         out["removed"] = True
         parent = os.path.dirname(os.path.realpath(f["path"]))
@@ -4330,10 +4361,9 @@ def save_board(home: Path, records: list[dict], made: str, path: Path | None = N
 
 
 @contextmanager
-def project_lock(home: Path, wait: float | None = None):
-    """The project's lock, <home>/.lock. Waits up to LOCK_WAIT seconds for it."""
+def file_lock(path: Path, busy_label: str, wait: float | None = None):
+    """Acquire an exclusive flock on `path`, waiting up to `wait` seconds (default LOCK_WAIT)."""
     wait = LOCK_WAIT if wait is None else wait
-    path = home / LOCK_FILE
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         deadline = time.monotonic() + wait
@@ -4343,12 +4373,19 @@ def project_lock(home: Path, wait: float | None = None):
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    raise FleetError(f"project {home.name} is busy: another fleet command has held {path} for "
+                    raise FleetError(f"{busy_label} is busy: another fleet command has held {path} for "
                                      f"{wait:g}s; try again")
                 time.sleep(0.1)
         yield
     finally:
         os.close(fd)
+
+
+@contextmanager
+def project_lock(home: Path, wait: float | None = None):
+    """The project's lock, <home>/.lock. Waits up to LOCK_WAIT seconds for it."""
+    with file_lock(home / LOCK_FILE, f"project {home.name}", wait):
+        yield
 
 
 def clip(text: str, width: int) -> str:

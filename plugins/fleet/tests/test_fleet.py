@@ -987,7 +987,14 @@ def process_state(pid):
         return "gone"
     except PermissionError:
         pass  # it exists (as another user's process could): ps tells whether it is a zombie
-    cp = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+    try:
+        cp = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+    except OSError as e:
+        try:
+            waited, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            raise AssertionError(f"cannot inspect process {pid}: ps failed: {e}") from e
+        return "alive" if waited == 0 else "gone"
     stat = cp.stdout.strip()
     if cp.returncode == 0 and stat:
         return "gone" if stat.startswith("Z") else "alive"
@@ -1182,6 +1189,10 @@ class CodexHooksDoctorTests(ProjectHookCase):
         self.assertEqual(process_state(child.pid), "alive")
         failed = subprocess.CompletedProcess(["ps"], 1, "", "ps: Operation not permitted\n")
         with mock.patch.object(subprocess, "run", return_value=failed):
+            with self.assertRaises(AssertionError):
+                gone(child.pid)
+        with mock.patch.object(subprocess, "run", side_effect=PermissionError(1, "Operation not permitted")), \
+                mock.patch.object(os, "waitpid", side_effect=ChildProcessError()):
             with self.assertRaises(AssertionError):
                 gone(child.pid)
         child.kill()
@@ -1919,6 +1930,7 @@ class SweepTests(FleetTestCase):
             (lane / ".fleet" / "STATUS.md").write_text("log")
             (lane / ".fleet" / "inbox" / "1.md").write_text("task")
             (lane / ".fleet" / "panes.json").write_text("{}")
+            (lane / ".fleet" / ".lock").write_text("")
             dest = Path(fleet.archive_lane_files(str(lane), "repo", "fix/a b"))
             # Outside a repository there is no project: the archive goes under the home.
             self.assertEqual(dest.parent, Path(tmp) / "home" / "archive" / "repo")
@@ -2922,6 +2934,47 @@ class LaneOwnerTests(FleetTestCase):
         self.assertEqual((code, out["lanes"][0]["removed"]), (0, True), out)
         self.assertFalse(mine.exists())
 
+    def test_git_error_line_skips_warnings_in_cleanup_and_branch(self):
+        self.assertEqual(fleet.git_error_line(
+            "warning: unable to access '/x/.gitignore_global': Operation not permitted\n"
+            "fatal: '/tmp/wt' contains modified or untracked files, use --force to delete it\n"
+        ), "fatal: '/tmp/wt' contains modified or untracked files, use --force to delete it")
+        self.assertEqual(fleet.git_error_line(
+            "hint: something\nwarning: minor\nerror: Cannot delete branch 'feat/x'\n"
+        ), "error: Cannot delete branch 'feat/x'")
+        self.assertEqual(fleet.git_error_line("warning: only warning\n"), "warning: only warning")
+        self.assertEqual(fleet.git_error_line(""), "")
+        self.claim("w1:p1")
+        mine = self.worktree("feat/warn")
+        self.workspaces = [w for w in self.workspaces if w[1] != str(mine)]
+        real_run = fleet.run
+
+        def warn_fail(cmd, *a, **k):
+            if cmd[:1] == ["git"] and "worktree" in cmd and "remove" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 128, "",
+                    "warning: unable to access '/x/.gitignore_global': Operation not permitted\n"
+                    f"fatal: '{mine}' contains untracked files\n",
+                )
+            return real_run(cmd, *a, **k)
+
+        with mock.patch.object(fleet, "run", side_effect=warn_fail):
+            code, out = self.cleanup(str(mine))
+        [lane] = out["lanes"]
+        self.assertEqual((code, lane.get("removed")), (2, None), out)
+        self.assertIn("fatal:", lane["error"])
+        self.assertNotIn("warning:", lane["error"])
+        branch_warn = subprocess.CompletedProcess(
+            ["git"], 1, "",
+            "warning: unable to access '/x/.gitignore_global': Operation not permitted\n"
+            "error: Cannot delete branch 'feat/warn'\n",
+        )
+        with mock.patch.object(fleet, "git_out", return_value="abc"), \
+                mock.patch.object(fleet, "run_git", return_value=branch_warn):
+            msg = fleet.finish_branch({"main_root": str(self.repo), "branch": "feat/warn",
+                                       "delete_branch": True, "head": "abc"})
+        self.assertEqual(msg, "kept feat/warn: error: Cannot delete branch 'feat/warn'")
+
 
 class OwnerRaceTests(FleetTestCase):
     """The owner of a lane under commands that run at the same time, each in its own process (patient_fleet.py with
@@ -3139,6 +3192,40 @@ class OwnerRaceTests(FleetTestCase):
         self.assertTrue(self.lane.is_dir())
         self.assertEqual(fleet.read_json(self.lane / ".fleet" / "lane.json")["orch"], "billing")
         self.assertTrue(failed.exists())  # the injection fired (the cleanup event's own lookup, after the mark)
+
+    def test_parallel_register_and_unregister_pane_lock_panes_json(self):
+        """Concurrent register_pane and unregister_pane calls serialize via .fleet/.lock instead of clobbering."""
+        # Two parallel register_pane calls (e.g. dual Claude+Codex critics): a holds lane_lock while paused in
+        # save_panes; b reaches lane_lock but cannot enter load_panes until a releases the lock.
+        a = self.child("a", [], "w1:p1", pause="save_panes",
+                       call=["register_pane", [str(self.lane), "w2:p1", {"role": "critic", "agent": "claude"}]])
+        self.wait_until(lambda: self.flag("a.ready"), "a paused in save_panes")
+        b = self.child("b", [], "w1:p1", notes="lane_lock,load_panes",
+                       call=["register_pane", [str(self.lane), "w2:p2", {"role": "critic", "agent": "codex"}]])
+        self.wait_until(lambda: self.flag("b.lane_lock"), "b waiting on lane_lock")
+        self.assertFalse(self.flag("b.load_panes"))
+        self.go("a")
+        a_code, _, a_err = self.done(a)
+        b_code, _, b_err = self.done(b)
+        self.assertEqual((a_code, b_code), (0, 0), (a_err, b_err))
+        panes = fleet.load_panes(self.lane / ".fleet")
+        self.assertEqual(sorted(panes), ["w2:p1", "w2:p2"])
+        self.assertEqual((panes["w2:p1"]["agent"], panes["w2:p2"]["agent"]), ("claude", "codex"))
+        # Concurrent register_pane and unregister_pane: neither loses its mutation.
+        for f in self.sync.iterdir():
+            f.unlink()
+        c = self.child("c", [], "w1:p1", pause="save_panes",
+                       call=["register_pane", [str(self.lane), "w2:p3", {"role": "helper"}]])
+        self.wait_until(lambda: self.flag("c.ready"), "c paused in save_panes")
+        d = self.child("d", [], "w1:p1", notes="lane_lock,load_panes",
+                       call=["unregister_pane", [str(self.lane), "w2:p1"]])
+        self.wait_until(lambda: self.flag("d.lane_lock"), "d waiting on lane_lock")
+        self.assertFalse(self.flag("d.load_panes"))
+        self.go("c")
+        c_code, _, c_err = self.done(c)
+        d_code, d_out, d_err = self.done(d)
+        self.assertEqual((c_code, d_code, d_out), (0, 0, True), (c_err, d_err))
+        self.assertEqual(sorted(fleet.load_panes(self.lane / ".fleet")), ["w2:p2", "w2:p3"])
 
 
 def git_out(*args, cwd):
@@ -3621,9 +3708,15 @@ class FilesTests(FleetTestCase):
         self.assertEqual(fleet.handoff_path(d), d / "HANDOFF.md")
 
     def test_register_and_unregister_pane(self):
+        self.assertFalse(fleet.unregister_pane(str(self.repo), "w1:p4"))
+        self.assertFalse((self.repo / ".fleet").exists())
         path = fleet.register_pane(str(self.repo), "w1:p4", {"role": "impl"})
         self.assertTrue(path.endswith(".fleet/panes.json"))
         self.assertEqual(fleet.load_panes(self.repo / ".fleet")["w1:p4"]["role"], "impl")
+        with fleet.lane_lock(self.repo / ".fleet"):
+            with self.assertRaisesRegex(fleet.FleetError, "is busy"):
+                with fleet.lane_lock(self.repo / ".fleet", wait=0):
+                    pass
         self.assertTrue(fleet.unregister_pane(str(self.repo), "w1:p4"))
         self.assertFalse(fleet.unregister_pane(str(self.repo), "w1:p4"))
         self.assertEqual(fleet.load_panes(self.repo / ".fleet"), {})
@@ -5129,7 +5222,8 @@ class OrchTests(FleetTestCase):
         self.assertEqual(refused("orch", "claim", pane="w2:p1"),
                          "pane w1:p1 is the orch of project app, and herdr cannot tell whether it is alive; check "
                          "that pane, then `fleet orch claim --force` takes over")
-        with mock.patch.object(fleet, "collect_lanes", return_value=([], [], [])):
+        with mock.patch.object(fleet, "collect_lanes", return_value=([], [], [])), \
+                mock.patch.object(fleet.shutil, "which", return_value="/usr/bin/herdr"):
             data = json.loads(self.main("digest", "--json", pane="w2:p1")[1])
             self.assertEqual(data["why"], "pane w1:p1 is the orch of this project; herdr cannot tell whether it is alive")
             self.unknown.discard("w1:p1")
@@ -5145,7 +5239,8 @@ class OrchTests(FleetTestCase):
                          "--pane <new pane> --replace` hands it over")
         self.assertEqual(refused("orch", "release", pane="w2:p1"),
                          "pane w1:p1 is orch billing of project app, not this pane; --force releases it")
-        with mock.patch.object(fleet, "collect_lanes", return_value=([], [], [])):
+        with mock.patch.object(fleet, "collect_lanes", return_value=([], [], [])), \
+                mock.patch.object(fleet.shutil, "which", return_value="/usr/bin/herdr"):
             self.assertEqual(json.loads(self.main("digest", "--json", pane="w2:p1")[1])["why"],
                              "pane w1:p1 is orch billing of this project")
 
