@@ -3227,6 +3227,28 @@ class OwnerRaceTests(FleetTestCase):
         self.assertEqual((c_code, d_code, d_out), (0, 0, True), (c_err, d_err))
         self.assertEqual(sorted(fleet.load_panes(self.lane / ".fleet")), ["w2:p2", "w2:p3"])
 
+    def test_parallel_post_record_board_seq_and_lock(self):
+        """Two concurrent `fleet post` processes serialize on board.lock and receive distinct monotonic #seq IDs."""
+        for f in self.sync.iterdir():
+            f.unlink()
+        a = self.child("a", ["post", "--to", "orch", "--lane", str(self.lane), "first post"],
+                       "w2:p1", pause="write_board_seq", notes="record_board,read_board_seq")
+        self.wait_until(lambda: self.flag("a.ready"), "a paused in write_board_seq")
+        b = self.child("b", ["post", "--to", "orch", "--lane", str(self.lane), "second post"],
+                       "w2:p2", notes="record_board,read_board_seq")
+        self.wait_until(lambda: self.flag("b.record_board"), "b waiting on board.lock inside record_board")
+        self.assertFalse(self.flag("b.read_board_seq"))
+        self.go("a")
+        a_code, a_out, a_err = self.done(a)
+        b_code, b_out, b_err = self.done(b)
+        self.assertEqual((a_code, b_code), (0, 0), (a_err, b_err))
+        self.assertEqual(a_out["seq"], 1)
+        self.assertEqual(b_out["seq"], 2)
+        entries = fleet.read_board_entries(self.project)
+        self.assertEqual([e["seq"] for e in entries], [1, 2])
+        self.assertEqual([e["text"] for e in entries], ["first post", "second post"])
+        self.assertEqual(fleet.board_head_seq(self.project), 2)
+
 
 def git_out(*args, cwd):
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
@@ -3697,6 +3719,23 @@ class FilesTests(FleetTestCase):
         self.assertIsNone(fleet.session_start_context({"source": "clear", "cwd": str(self.repo)}, env={}))
         (self.repo / ".fleet").mkdir()
         self.assertIsNone(fleet.session_start_context({"source": "clear", "cwd": str(self.repo)}, env={}))
+
+    def test_session_start_lane_context_includes_fleet_cli_for_lane_json_or_post_brief(self):
+        d = self.repo / ".fleet"
+        d.mkdir()
+        (d / "BRIEF.md").write_text("# Brief\n")
+        (d / "STATUS.md").write_text("# Status\n")
+        fleet.save_panes(d, {"w1:p1": {"role": "impl"}})
+        env = {"HERDR_PANE_ID": "w1:p1", "CLAUDE_PLUGIN_ROOT": "/plugins/fleet"}
+        plain = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)}, env=env)
+        self.assertNotIn("Fleet CLI:", plain)
+        (d / "BRIEF.md").write_text("# Brief\nPost updates via `fleet post`.\n")
+        with_brief = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)}, env=env)
+        self.assertIn('Fleet CLI: `python3 "/plugins/fleet/scripts/fleet"`.', with_brief)
+        (d / "BRIEF.md").write_text("# Brief\n")
+        (d / "lane.json").write_text("{}")
+        with_lane = fleet.session_start_context({"source": "clear", "cwd": str(self.repo)}, env=env)
+        self.assertIn('Fleet CLI: `python3 "/plugins/fleet/scripts/fleet"`.', with_lane)
 
     def test_handoff_path_lane_and_shared_checkout(self):
         d = self.repo / ".fleet"
@@ -7769,6 +7808,285 @@ class OrchTests(FleetTestCase):
         with chdir(plain), redirect_stdout(buf):
             self.assertEqual(fleet.main(["follow-up", "list"]), 2)
         self.assertEqual(json.loads(buf.getvalue())["refused"], no_repo)
+
+    def test_board_seq_feed_digest_last_seq_and_rebrief_cursor(self):
+        """`board --since/--seqs/--limit/--lanes` reads only board.jsonl; `digest` tracks last_seq and unread
+        messages; `orch_rebrief` prints the board cursor before its final line."""
+        lanes = self.two_orchs()
+        lane_a, lane_b = lanes["a"], lanes["b"]
+        base_seq = fleet.board_head_seq(self.project)
+        e1 = fleet.record_board(
+            self.project, "post", orch="default", lane=str(lane_a), branch="feat/a",
+            from_info={"pane": "w1:p2", "role": "impl"}, to=["critic"], mentions=["@critic"],
+            text="ready on a",
+        )
+        e2 = fleet.record_board(
+            self.project, "post", orch="billing", lane=str(lane_b), branch="feat/b",
+            from_info={"pane": "w2:p2", "role": "impl"}, to=["orch"], mentions=["@orch"],
+            text="ready on b",
+        )
+        e3 = fleet.record_board(
+            self.project, "post", orch="default", lane=str(lane_a), branch="feat/a",
+            from_info={"pane": "w1:p3", "role": "critic"}, to=["orch"], mentions=["@orch"],
+            tag="done", text="approved a",
+        )
+        self.assertEqual([e1["seq"], e2["seq"], e3["seq"]], [base_seq + 1, base_seq + 2, base_seq + 3])
+        with mock.patch.object(fleet, "collect_lanes", side_effect=AssertionError("no pane scan")):
+            code, out = self.main("board", "--since", str(e1["seq"]), "--json", pane="w1:p1")
+            self.assertEqual(code, 0)
+            feed = json.loads(out)
+            self.assertEqual(feed["head_seq"], e3["seq"])
+            self.assertEqual([m["seq"] for m in feed["messages"]], [e3["seq"]])
+            code, out = self.main("board", "--seqs", f"{e1['seq']},{e3['seq']}", "--json", pane="w1:p1")
+            self.assertEqual(code, 0)
+            self.assertEqual([m["seq"] for m in json.loads(out)["messages"]], [e1["seq"], e3["seq"]])
+            code, out = self.main("board", "--limit", "1", "--json", pane="w1:p1")
+            self.assertEqual(code, 0)
+            self.assertEqual([m["seq"] for m in json.loads(out)["messages"]], [e3["seq"]])
+            plain = self.main("board", "--since", str(base_seq), pane="w1:p1")[1]
+            self.assertIn(f"#{e1['seq']}", plain)
+            self.assertNotIn(f"#{e2['seq']}", plain)
+            self.assertIn(f"#{e3['seq']}", plain)
+        # --lanes includes lane records alongside messages in feed mode
+        code, out, _ = self.views(lanes.values(), "board", "--since", str(base_seq), "--lanes", "--json", pane="w1:p1")
+        self.assertEqual(code, 0)
+        both = json.loads(out)
+        self.assertIn("lanes", both)
+        self.assertEqual([m["seq"] for m in both["messages"]], [e1["seq"], e3["seq"]])
+
+        # digest records last_seq and exposes unread messages for default view (excludes billing's e2)
+        code, out, _ = self.views(lanes.values(), "digest", "--json", pane="w1:p1")
+        self.assertEqual(code, 0)
+        ddata = json.loads(out)
+        self.assertEqual(ddata["head_seq"], e3["seq"])
+        self.assertEqual(ddata["last_seq"], 0)
+        msg_seqs = [m["seq"] for m in ddata["messages"]]
+        self.assertIn(e1["seq"], msg_seqs)
+        self.assertNotIn(e2["seq"], msg_seqs)
+        self.assertIn(e3["seq"], msg_seqs)
+        digest_file = fleet.orch_files(self.project, "default")["digest"]
+        self.assertEqual(fleet.digest_last_seq(digest_file), e3["seq"])
+
+        # A subsequent entry appears in orch_rebrief before the final digest hint line.
+        e4 = fleet.record_board(
+            self.project, "post", orch="default", lane=str(lane_a), branch="feat/a",
+            from_info={"pane": "w1:p2", "role": "impl"}, to=["orch"], mentions=["@orch"],
+            text="follow up note",
+        )
+        with mock.patch.object(fleet, "collect_lanes", side_effect=AssertionError("no scan")):
+            text = fleet.orch_rebrief(self.cands()[0], "w1:p1", {"source": "clear"}, {})
+        lines = text.splitlines()
+        self.assertRegex(lines[-1], r"^Run `.* digest --project app`.*then load the fleet:fleet skill\.$")
+        self.assertTrue(
+            any(l.startswith(f"Board head: #{e4['seq']}; digest cursor: #{e3['seq']} (1 unread board posts).")
+                and "wait --since" in l for l in lines),
+            lines,
+        )
+
+    def test_wait_board_mentions_lanes_and_pane_exit_codes(self):
+        """`fleet wait` wakes on board #seq, filters `--mentions-only` and `--lanes`, checks markers, and returns
+        4/5/6/7 for blocked/dead/stopped-without-post/timeout while suppressing false stopped after a post."""
+        self.orch_setup()
+        lane_a = self.add_lane("a")
+        (lane_a / ".fleet" / "lane.json").write_text(json.dumps({"orch": "default"}))
+        fleet.save_panes(lane_a / ".fleet", {"w1:p2": {"role": "impl", "agent": "claude"}})
+        self.alive.update({"w1:p1", "w1:p2"})
+        base_seq = fleet.board_head_seq(self.project)
+
+        p1 = fleet.record_board(
+            self.project, "post", orch="default", lane=str(lane_a), branch="feat/a",
+            from_info={"pane": "w1:p2", "role": "impl"}, to=["critic"], mentions=["@critic"],
+            text="only for critic",
+        )
+        # --mentions-only does not match @critic when caller is orch; times out with 7
+        code, out = self.main("wait", "--since", str(base_seq), "--mentions-only", "--interval", "0.01", "--timeout", "0.02",
+                              pane="w1:p1")
+        self.assertEqual((code, json.loads(out)["event"]), (7, "timeout"))
+        # Without --mentions-only, orch wakes immediately with p1
+        code, out = self.main("wait", "--since", str(base_seq), "--lanes", "feat/a", "--interval", "0.01", "--timeout", "0.2",
+                              pane="w1:p1")
+        payload = json.loads(out)
+        self.assertEqual((code, payload["event"], payload["seq"]), (0, "board", p1["seq"]))
+        self.assertEqual(payload["head_seq"], p1["seq"])
+
+        # @orch mention wakes --mentions-only
+        p2 = fleet.record_board(
+            self.project, "post", orch="default", lane=str(lane_a), branch="feat/a",
+            from_info={"pane": "w1:p2", "role": "impl"}, to=["orch"], mentions=["@orch"],
+            text="wake orch",
+        )
+        code, out = self.main("wait", "--since", str(p1["seq"]), "--mentions-only", "--interval", "0.01", "--timeout", "0.2",
+                              pane="w1:p1")
+        self.assertEqual((code, json.loads(out)["seq"]), (0, p2["seq"]))
+
+        # File marker on --pane exits 0; Blocked -> 4, Dead -> 5, Stopped without post -> 6, Stopped AFTER post -> 7
+        (lane_a / ".fleet" / "STATUS.md").write_text("READY FOR REVIEW: round 1\n")
+        with mock.patch.object(fleet.shutil, "which", return_value="/usr/bin/herdr"), \
+                mock.patch.object(fleet, "screen_tail", return_value="Allow tool?"):
+            with mock.patch.object(fleet, "pane_info", return_value={"pane_id": "w1:p2", "cwd": str(lane_a), "agent": "claude"}):
+                code, out = self.main("wait", "--pane", "w1:p2", "--marker", "READY FOR REVIEW: round 1",
+                                      "--interval", "0.01", "--timeout", "0.1", pane="w1:p1")
+            self.assertEqual((code, json.loads(out)["event"]), (0, "marker"))
+
+            with mock.patch.object(fleet, "pane_info", return_value={"pane_id": "w1:p2", "cwd": str(lane_a),
+                                                                     "agent": "claude", "agent_status": "blocked"}):
+                code, out = self.main("wait", "--pane", "w1:p2", "--since", str(p2["seq"]), "--blocked-grace", "0",
+                                      "--interval", "0.01", "--timeout", "0.2", pane="w1:p1")
+            self.assertEqual((code, json.loads(out)["event"]), (4, "blocked"))
+
+            with mock.patch.object(fleet, "pane_info", side_effect=fleet.FleetError("gone")):
+                code, out = self.main("wait", "--pane", "w1:p2", "--since", str(p2["seq"]),
+                                      "--interval", "0.01", "--timeout", "0.2", pane="w1:p1")
+            self.assertEqual((code, json.loads(out)["event"]), (5, "pane-gone"))
+
+            # Since a newer send after p2, pane stopped without posting -> 6
+            fleet.record("send", str(lane_a), pane="w1:p2", branch="feat/a", text="next task")
+            with mock.patch.object(fleet, "pane_info", return_value={"pane_id": "w1:p2", "cwd": str(lane_a),
+                                                                     "agent": "claude", "agent_status": "idle"}):
+                code, out = self.main("wait", "--pane", "w1:p2", "--since", str(p2["seq"]), "--idle-grace", "0",
+                                      "--interval", "0.01", "--timeout", "0.2", pane="w1:p1")
+            self.assertEqual((code, json.loads(out)["event"]), (6, "stopped"))
+
+            # If the pane already posted after its last send, idle does NOT trigger stopped (times out with 7)
+            p3 = fleet.record_board(
+                self.project, "post", orch="default", lane=str(lane_a), branch="feat/a",
+                from_info={"pane": "w1:p2", "role": "impl"}, to=["orch"], mentions=["@orch"],
+                text="posted after send",
+            )
+            with mock.patch.object(fleet, "pane_info", return_value={"pane_id": "w1:p2", "cwd": str(lane_a),
+                                                                     "agent": "claude", "agent_status": "idle"}):
+                code, out = self.main("wait", "--pane", "w1:p2", "--since", str(p3["seq"]), "--idle-grace", "0",
+                                      "--interval", "0.01", "--timeout", "0.03", pane="w1:p1")
+            self.assertEqual((code, json.loads(out)["event"]), (7, "timeout"))
+
+    def test_post_hygiene_gates_escalation_and_inbox_delivery(self):
+        """`fleet post` enforces PLACEHOLDER and clean-tree gates, refuses dead explicit pane IDs, escalates
+        missing critic pane to orch without failing, delivers peer work via .fleet/inbox/, and never submits
+        prompts into orch."""
+        self.orch_setup()
+        lane_a = self.add_lane("a")
+        fleet.save_panes(lane_a / ".fleet", {
+            "w1:p2": {"role": "impl", "agent": "claude"},
+            "w1:p3": {"role": "researcher", "agent": "codex"},
+        })
+        (lane_a / ".fleet" / "STATUS.md").write_text("Tests: PLACEHOLDER\n")
+
+        # Refuses PLACEHOLDER in STATUS.md for --done / impl->critic
+        code, out = self.main("post", "--to", "orch", "--done", "--lane", str(lane_a), "all good", pane="w1:p2")
+        self.assertEqual(code, 2)
+        self.assertIn("PLACEHOLDER", json.loads(out)["reason"])
+
+        (lane_a / ".fleet" / "STATUS.md").write_text("Tests: 5 passed\n")
+        (lane_a / "dirty.txt").write_text("uncommitted")
+        code, out = self.main("post", "--to", "critic", "--lane", str(lane_a), "please review", pane="w1:p2")
+        self.assertEqual(code, 2)
+        self.assertIn("uncommitted change", json.loads(out)["reason"])
+        (lane_a / "dirty.txt").unlink()
+
+        # Refuses dead explicit pane ID
+        code, out = self.main("post", "--to", "w9:p9", "--lane", str(lane_a), "ping", pane="w1:p2")
+        self.assertEqual(code, 2)
+        self.assertIn("dead", json.loads(out)["reason"])
+
+        # Missing critic pane auto-escalates to @orch (tag=escalate, no_critic_pane, exit 0)
+        self.alive.update({"w1:p1", "w1:p2", "w1:p3"})
+        calls = []
+        with mock.patch.object(fleet, "submit_prompt", side_effect=lambda *a, **kw: calls.append((a, kw)) or {"ok": True}):
+            code, out = self.main("post", "--to", "critic", "--lane", str(lane_a), "ready for critic", pane="w1:p2")
+        self.assertEqual(code, 0)
+        res = json.loads(out)
+        self.assertEqual((res["entry"]["tag"], res["entry"]["escalated_reason"]), ("escalate", "no_critic_pane"))
+        self.assertIn("orch", res["entry"]["to"])
+        self.assertEqual(calls, [])
+
+        # Peer delivery writes .fleet/inbox/*.md and sends a 1-line pointer to worker pane, never to orch
+        (lane_a / ".fleet" / "FINDINGS.md").write_text("# Findings\nok\n")
+        self.alive.add("w1:p3")
+        with mock.patch.object(fleet, "wait_not_working", return_value=True), \
+                mock.patch.object(fleet, "submit_prompt",
+                                   side_effect=lambda p, ag, txt: calls.append((p, ag, txt)) or {"ok": True, "pane_id": p}):
+            code, out = self.main(
+                "post", "--to", "researcher", "--to", "orch", "--file", ".fleet/FINDINGS.md",
+                "--refs", "1", "--lane", str(lane_a), "please check findings", pane="w1:p2",
+            )
+        self.assertEqual(code, 0)
+        res = json.loads(out)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "w1:p3")
+        self.assertEqual(calls[0][1], "codex")
+        self.assertIn(".fleet/inbox/", calls[0][2])
+        self.assertNotIn("\n", calls[0][2])
+        inbox_file = Path(res["delivered"][0]["inbox_file"])
+        self.assertTrue(inbox_file.is_file())
+        inbox_text = inbox_file.read_text()
+        self.assertIn("Refs: #1", inbox_text)
+        self.assertIn("please check findings", inbox_text)
+
+    def test_post_dual_critic_hold_approve_split_round_limit_and_risk(self):
+        """Dual critics hold first review until peer finishes, resolve consensus vs split verdict, escalate
+        at review_round_limit, and enforce risk gates on impl `--done` and critic changes."""
+        self.orch_setup()
+        lane_a = self.add_lane("a")
+        d = lane_a / ".fleet"
+        (d / "STATUS.md").write_text("Tests: pass\n")
+        fleet.save_panes(d, {
+            "w1:p2": {"role": "impl", "agent": "claude"},
+            "w1:p3": {"role": "critic", "agent": "codex"},
+            "w1:p4": {"role": "critic", "agent": "claude"},
+        })
+        self.alive.update({"w1:p1", "w1:p2", "w1:p3", "w1:p4"})
+
+        # Round 1 dual critic request + first review (claude) -> held while codex pending
+        (d / "REVIEW-REQUEST-1.md").write_text("Write findings to .fleet/REVIEW-1-codex.md and .fleet/REVIEW-1-claude.md.\n")
+        (d / "REVIEW-1-claude.md").write_text("VERDICT: APPROVE\n\nLooks good.\n")
+        delivered = []
+        with mock.patch.object(fleet, "wait_not_working", return_value=True), \
+                mock.patch.object(fleet, "submit_prompt",
+                                   side_effect=lambda p, ag, txt: delivered.append(p) or {"ok": True, "pane_id": p}):
+            code1, out1 = self.main("post", "--to", "impl", "--round", "1", "--file", ".fleet/REVIEW-1-claude.md",
+                                    "--lane", str(lane_a), "claude approved", pane="w1:p4")
+        res1 = json.loads(out1)
+        self.assertEqual((code1, res1["held"], res1["pending_peers"]), (0, True, ["REVIEW-1-codex.md"]))
+        self.assertEqual(delivered, [])
+
+        # Second review APPROVE -> consensus APPROVE routed to @orch with tag=done (no submit_prompt)
+        (d / "REVIEW-1-codex.md").write_text("VERDICT: APPROVE\n\nAgree.\n")
+        with mock.patch.object(fleet, "wait_not_working", return_value=True), \
+                mock.patch.object(fleet, "submit_prompt",
+                                   side_effect=lambda p, ag, txt: delivered.append(p) or {"ok": True, "pane_id": p}):
+            code2, out2 = self.main("post", "--to", "impl", "--round", "1", "--file", ".fleet/REVIEW-1-codex.md",
+                                    "--lane", str(lane_a), "codex approved", pane="w1:p3")
+        res2 = json.loads(out2)
+        self.assertEqual((code2, res2["entry"]["tag"], res2["entry"]["verdict"]), (0, "done", "APPROVE"))
+        self.assertEqual(res2["entry"]["to"], ["orch"])
+        self.assertEqual(delivered, [])
+
+        # Split verdict in Round 2 -> escalate dual_critic_split to @orch
+        (d / "REVIEW-REQUEST-2.md").write_text("Write findings to .fleet/REVIEW-2-codex.md and .fleet/REVIEW-2-claude.md.\n")
+        (d / "REVIEW-2-claude.md").write_text("VERDICT: APPROVE\n")
+        (d / "REVIEW-2-codex.md").write_text("VERDICT: CHANGES REQUESTED\n")
+        code3, out3 = self.main("post", "--to", "impl", "--round", "2", "--file", ".fleet/REVIEW-2-codex.md",
+                                "--lane", str(lane_a), "split verdict", pane="w1:p3")
+        res3 = json.loads(out3)
+        self.assertEqual((code3, res3["entry"]["tag"], res3["entry"]["escalated_reason"]),
+                         (0, "escalate", "dual_critic_split"))
+
+        # Single critic hitting review_round_limit -> escalate review_round_limit to @orch
+        self.alive.discard("w1:p4")
+        (d / "REVIEW-3.md").write_text("VERDICT: CHANGES REQUESTED\n")
+        with mock.patch.object(fleet, "review_round_limit", return_value={"limit": 3, "source": "test"}):
+            code4, out4 = self.main("post", "--to", "impl", "--round", "3", "--file", ".fleet/REVIEW-3.md",
+                                    "--lane", str(lane_a), "round limit reached", pane="w1:p3")
+        res4 = json.loads(out4)
+        self.assertEqual((code4, res4["entry"]["tag"], res4["entry"]["escalated_reason"]),
+                         (0, "escalate", "review_round_limit"))
+
+        # High-risk uncovered diff blocks impl --done with exit 2
+        risky = {"needs_user": [{"category": "migration", "path": "db/001.sql"}], "error": None}
+        with mock.patch.object(fleet, "risk_state", return_value=risky):
+            code5, out5 = self.main("post", "--to", "orch", "--done", "--lane", str(lane_a), "trying done", pane="w1:p2")
+        self.assertEqual(code5, 2)
+        self.assertIn("high-risk diff", json.loads(out5)["reason"])
 
 
 class PatientFleetTests(FleetTestCase):
