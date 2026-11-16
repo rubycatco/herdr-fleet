@@ -5863,6 +5863,21 @@ def discover_wait_panes(home: Path, view: dict | None, me_pane: str | None,
     for p, a in live.items():
         if a.get("cwd"):
             check_top(a["cwd"])
+    try:
+        panes_resp = herdr("pane", "list")
+        for p in panes_resp.get("panes") or []:
+            if isinstance(p, dict) and p.get("cwd"):
+                check_top(p["cwd"])
+    except FleetError:
+        pass
+    board_path = (view or {}).get("files", {}).get("board")
+    if board_path:
+        for r in read_json(board_path).get("lanes") or []:
+            if not isinstance(r, dict) or r.get("phase") == "removed":
+                continue
+            lane_path = r.get("path")
+            if isinstance(lane_path, str) and (Path(lane_path) / FLEET_DIR / PANES_FILE).is_file():
+                check_top(lane_path)
     return live, tracked
 
 
@@ -6053,7 +6068,17 @@ def write_post_inbox(cwd: str, entry: dict, body_files: list[str]) -> Path:
 
 def resolve_post_sender(args: argparse.Namespace) -> dict:
     """Resolve sender workspace, project home, role, branch, and pane metadata for `cmd_post`."""
-    cwd = os.path.abspath(os.path.expanduser(args.lane)) if args.lane else os.getcwd()
+    if args.lane:
+        cwd = os.path.abspath(os.path.expanduser(args.lane))
+    else:
+        cwd = os.getcwd()
+        if getattr(args, "file", None):
+            raw_f = Path(args.file).expanduser()
+            cand = raw_f if raw_f.is_absolute() else Path(os.path.abspath(Path(cwd) / raw_f))
+            for parent in cand.parents:
+                if parent.name == FLEET_DIR and parent.parent.is_dir():
+                    cwd = str(parent.parent)
+                    break
     top = git_toplevel(cwd) or (cwd if os.path.isdir(cwd) else None)
     git_top = git_toplevel(cwd)
     if getattr(args, "project", None):
@@ -6116,7 +6141,13 @@ def cmd_post(args: argparse.Namespace) -> int:
     file_display: str | None = None
     if args.file:
         raw_f = Path(args.file).expanduser()
-        file_path = raw_f if raw_f.is_absolute() else Path(top or ctx["cwd"]) / raw_f
+        if raw_f.is_absolute():
+            file_path = raw_f
+        elif not args.lane:
+            cand = Path(os.path.abspath(Path(os.getcwd()) / raw_f))
+            file_path = cand if cand.is_file() else Path(top or ctx["cwd"]) / raw_f
+        else:
+            file_path = Path(top or ctx["cwd"]) / raw_f
         if not file_path.is_file():
             return refuse(reason=f"--file: no such file: {file_path}")
         try:

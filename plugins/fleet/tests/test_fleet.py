@@ -8088,6 +8088,82 @@ class OrchTests(FleetTestCase):
         self.assertEqual(code5, 2)
         self.assertIn("high-risk diff", json.loads(out5)["reason"])
 
+    def test_wait_without_pane_detects_single_pane_exit_and_pane_gone(self):
+        """`fleet wait` without `--pane` scans `herdr pane list` and active `board.json` lanes so single-pane
+        worktree crashes return exit 5 (`agent-exited` or `pane-gone`)."""
+        self.orch_setup()
+        lane_a = self.add_lane("a")
+        (lane_a / ".fleet" / "lane.json").write_text(json.dumps({"orch": "default"}))
+        fleet.save_panes(lane_a / ".fleet", {"w2:p1": {"role": "impl", "agent": "claude"}})
+        fleet.save_board(
+            self.project,
+            [{"lane": "feat/a", "path": str(lane_a), "phase": "implementing", "panes": [],
+              "pr": None, "last_event": None, "blocked": None, "next": None}],
+            fleet.precise_now(),
+            fleet.orch_files(self.project, "default")["board"],
+        )
+        base_seq = fleet.board_head_seq(self.project)
+
+        def fake_herdr_exited(*cmd):
+            if cmd == ("agent", "list"):
+                return {"agents": []}
+            if cmd == ("pane", "list"):
+                return {"panes": [{"pane_id": "w2:p1", "cwd": str(lane_a), "agent": None}]}
+            return {}
+
+        with mock.patch.object(fleet.shutil, "which", return_value="/usr/bin/herdr"), \
+                mock.patch.object(fleet, "herdr", side_effect=fake_herdr_exited), \
+                mock.patch.object(fleet, "pane_info", return_value={"pane_id": "w2:p1", "cwd": str(lane_a), "agent": None}), \
+                mock.patch.object(fleet, "screen_tail", return_value="shell$ "):
+            code, out = self.main("wait", "--since", str(base_seq), "--interval", "0.01", "--timeout", "0.2", pane="w1:p1")
+        res = json.loads(out)
+        self.assertEqual((code, res["event"], res["pane_id"]), (5, "agent-exited", "w2:p1"))
+
+        def fake_herdr_gone(*cmd):
+            if cmd == ("agent", "list"):
+                return {"agents": []}
+            if cmd == ("pane", "list"):
+                return {"panes": []}
+            return {}
+
+        with mock.patch.object(fleet.shutil, "which", return_value="/usr/bin/herdr"), \
+                mock.patch.object(fleet, "herdr", side_effect=fake_herdr_gone), \
+                mock.patch.object(fleet, "pane_info", side_effect=fleet.FleetError("pane_not_found")):
+            code, out = self.main("wait", "--since", str(base_seq), "--interval", "0.01", "--timeout", "0.2", pane="w1:p1")
+        res = json.loads(out)
+        self.assertEqual((code, res["event"], res["pane_id"]), (5, "pane-gone", "w2:p1"))
+
+    def test_post_infers_lane_from_file_inside_dot_fleet(self):
+        """Running `fleet post --to critic --file <worktree>/.fleet/...` from the main checkout without `--lane`
+        infers the worktree, resolves its `.fleet/panes.json`, and delivers to its critic without `no_critic_pane`."""
+        self.orch_setup()
+        lane_a = self.add_lane("a")
+        d = lane_a / ".fleet"
+        req = d / "REVIEW-REQUEST-1.md"
+        req.write_text("# Request 1\nCheck feat/a.\n")
+        fleet.save_panes(d, {
+            "w2:p1": {"role": "impl", "agent": "claude"},
+            "w2:p2": {"role": "critic", "agent": "codex"},
+        })
+        self.alive.update({"w1:p1", "w2:p1", "w2:p2"})
+        calls = []
+        with mock.patch.object(fleet, "wait_not_working", return_value=True), \
+                mock.patch.object(fleet, "submit_prompt",
+                                   side_effect=lambda p, ag, txt: calls.append((p, ag, txt)) or {"ok": True, "pane_id": p}):
+            code1, out1 = self.main("post", "--to", "critic", "--file", str(req), "review round 1", pane="w1:p1")
+            rel_req = os.path.relpath(req, self.repo)
+            code2, out2 = self.main("post", "--to", "critic", "--file", rel_req, "review round 1 rel", pane="w1:p1")
+        for code, out in ((code1, out1), (code2, out2)):
+            res = json.loads(out)
+            self.assertEqual(code, 0, res)
+            self.assertEqual(res["entry"]["lane"], str(lane_a))
+            self.assertEqual(res["entry"]["branch"], "feat/a")
+            self.assertEqual(res["entry"]["from"]["role"], "orch")
+            self.assertIsNone(res["entry"].get("escalated_reason"))
+            self.assertEqual(res["entry"]["to_panes"], ["w2:p2"])
+            self.assertEqual(res["entry"]["file"], ".fleet/REVIEW-REQUEST-1.md")
+        self.assertEqual([(c[0], c[1]) for c in calls], [("w2:p2", "codex"), ("w2:p2", "codex")])
+
 
 class PatientFleetTests(FleetTestCase):
     """The test harness's boundary (patient_fleet.py): its scopes nest, and a broken git limit expires at once."""
