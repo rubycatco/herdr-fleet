@@ -1681,11 +1681,41 @@ def write_board_seq(events_dir: Path, seq: int) -> None:
         raise
 
 
+@contextmanager
+def board_lock(home: Path):
+    """Acquire blocking exclusive flock on `<home>/events/board.lock`."""
+    events_dir = Path(home) / EVENTS_DIR
+    events_dir.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(events_dir / BOARD_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield events_dir
+    finally:
+        os.close(lock_fd)
+
+
+def board_snapshot(home: Path | None) -> tuple[list[dict], int]:
+    """Read `(board_entries, head_seq)` atomically under blocking `events/board.lock`."""
+    if home is None:
+        return [], 0
+    events_dir = Path(home) / EVENTS_DIR
+    if not events_dir.is_dir():
+        return [], 0
+    with board_lock(home):
+        entries = read_board_entries(home)
+        head_seq = max(read_board_seq(home), max((e["seq"] for e in entries), default=0))
+        return entries, head_seq
+
+
 def board_head_seq(home: Path | None) -> int:
     """Return the current head sequence number of `home`'s board log (0 if None or absent)."""
     if home is None:
         return 0
-    return read_board_seq(home)
+    events_dir = Path(home) / EVENTS_DIR
+    if not events_dir.is_dir():
+        return 0
+    with board_lock(home):
+        return read_board_seq(home)
 
 
 def record_board(home: Path, kind: str, *, orch: str | None = None, lane: str | None = None,
@@ -1694,11 +1724,7 @@ def record_board(home: Path, kind: str, *, orch: str | None = None, lane: str | 
                  file: str | None = None, round_num: int | None = None, refs: list[int] | None = None,
                  text: str = "", **extra) -> dict:
     """Append one sequenced entry to `<home>/events/board.jsonl` under blocking flock on `events/board.lock`."""
-    events_dir = Path(home) / EVENTS_DIR
-    events_dir.mkdir(parents=True, exist_ok=True)
-    lock_fd = os.open(events_dir / BOARD_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    with board_lock(home) as events_dir:
         seq = read_board_seq(home) + 1
         clean_from = {k: v for k, v in (from_info or {}).items() if v is not None}
         entry: dict = {
@@ -1732,8 +1758,6 @@ def record_board(home: Path, kind: str, *, orch: str | None = None, lane: str | 
             os.close(log_fd)
         write_board_seq(events_dir, seq)
         return entry
-    finally:
-        os.close(lock_fd)
 
 
 def board_entry_line(e: dict) -> str:
@@ -5253,8 +5277,7 @@ def board_entry_visible(entry: dict, view: dict | None) -> bool:
 def board_feed(home: Path, view: dict | None, *, since: int | None = None,
                seqs: list[int] | None = None, limit: int | None = None) -> tuple[list[dict], int]:
     """Read `board.jsonl` messages in fast feed mode; returns `(messages, head_seq)`."""
-    entries = read_board_entries(home)
-    head_seq = max(board_head_seq(home), max((e["seq"] for e in entries), default=0))
+    entries, head_seq = board_snapshot(home)
     if seqs is not None:
         by_seq = {e["seq"]: e for e in entries}
         return [by_seq[s] for s in seqs if s in by_seq], head_seq
@@ -5294,7 +5317,11 @@ def cmd_board(args: argparse.Namespace) -> int:
     cursor, base, _ = digest_base(files["digest"])
     limit = review_round_limit()
     records = make_board(home, cursor, {p: b.get("lane") for p, b in base.items() if b.get("lane")}, view, limit)
-    head_seq = board_head_seq(home)
+    messages = None
+    if feed_mode:
+        messages, head_seq = board_feed(home, view, since=since, seqs=seqs, limit=limit_arg)
+    else:
+        _, head_seq = board_snapshot(home)
     saved, stale = False, None
     if not view["all"]:
         with project_lock(home):
@@ -5302,9 +5329,6 @@ def cmd_board(args: argparse.Namespace) -> int:
             if not stale:
                 saved = save_board(home, records, made, files["board"], head_seq=head_seq)
     research = open_research(home)
-    messages = None
-    if feed_mode:
-        messages, head_seq = board_feed(home, view, since=since, seqs=seqs, limit=limit_arg)
     if args.json:
         payload = {"project": home.name, "orch": view["name"], "all": view["all"],
                    "board": str(files["board"]) if not view["all"] else None, "saved": saved,
@@ -5363,8 +5387,8 @@ def cmd_digest(args: argparse.Namespace) -> int:
                               view if view["filtered"] else None)
         omitted = max(0, len(shown) - DIGEST_EVENTS_MAX)
         shown = shown[-DIGEST_EVENTS_MAX:]
-        board_entries = read_board_entries(home)
-        head_seq = max(board_head_seq(home), max((e["seq"] for e in board_entries), default=0))
+        board_entries, head_seq = board_snapshot(home)
+        consumed_seq = max(last_seq, max((e["seq"] for e in board_entries), default=0))
         unread_posts = [
             e for e in board_entries
             if e.get("kind") == "post" and e["seq"] > last_seq
@@ -5378,8 +5402,8 @@ def cmd_digest(args: argparse.Namespace) -> int:
             save_board(home, records, made, files["board"], head_seq=head_seq)
             digest_payload = {"cursor": now_iso(), "read": offsets, "lanes": {
                 r["path"]: {"lane": r["lane"], "branch": r.get("branch"), "phase": r["phase"]} for r in records}}
-            if head_seq > 0 or last_seq > 0:
-                digest_payload["last_seq"] = head_seq
+            if consumed_seq > 0:
+                digest_payload["last_seq"] = consumed_seq
             write_json(files["digest"], digest_payload)
             session = text_or_none(os.environ.get("CLAUDE_CODE_SESSION_ID"))
             if rec and me and rec.get("pane") == me and session and rec.get("session") != session:
@@ -5600,7 +5624,7 @@ def orch_rebrief(cand: tuple[Path, str, dict], pane: str, data: dict, env) -> st
         body.append("No board yet.")
     cursor, _, read = digest_base(files["digest"])
     last_seq = digest_last_seq(files["digest"])
-    head_seq = board_head_seq(home)
+    board_entries, head_seq = board_snapshot(home)
     if cursor is None:
         tail = ["No digest yet."]
     else:
@@ -5611,7 +5635,7 @@ def orch_rebrief(cand: tuple[Path, str, dict], pane: str, data: dict, env) -> st
     if head_seq > 0 or last_seq > 0:
         view_filter = cached_view(home, name, orchs, is2)
         unread_posts = sum(
-            1 for e in read_board_entries(home)
+            1 for e in board_entries
             if e.get("kind") == "post" and e["seq"] > last_seq
             and board_entry_visible(e, {**(view_filter or {}), "filtered": bool(view_filter)})
             and (e.get("from") or {}).get("pane") != pane
@@ -5937,13 +5961,15 @@ def cmd_wait(args: argparse.Namespace) -> int:
     board_path = (home / EVENTS_DIR / BOARD_LOG) if home else None
     last_stat: tuple[int, int] | None = None
     cached_entries: list[dict] = []
+    cached_head_seq = 0
     pane_states: dict[str, dict] = {}
     last_health_check = 0.0
     health_interval = args.interval if args.pane else max(float(args.interval), 10.0)
     start = time.time()
 
-    def emit(payload: dict, code: int) -> int:
-        out = {**payload, "head_seq": board_head_seq(home), "elapsed_s": int(time.time() - start)}
+    def emit(payload: dict, code: int, head_seq: int | None = None) -> int:
+        seq_val = board_head_seq(home) if head_seq is None else head_seq
+        out = {**payload, "head_seq": seq_val, "elapsed_s": int(time.time() - start)}
         print(json.dumps(out, indent=2, ensure_ascii=False))
         return code
 
@@ -5959,10 +5985,11 @@ def cmd_wait(args: argparse.Namespace) -> int:
             except OSError:
                 sig = None
             if sig is not None and sig != last_stat:
-                cached_entries = read_board_entries(home)
+                cached_entries, cached_head_seq = board_snapshot(home)
                 last_stat = sig
             elif sig is None:
                 cached_entries = []
+                cached_head_seq = 0
                 last_stat = None
             matched = [
                 e for e in cached_entries
@@ -5971,7 +5998,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
             ]
             if matched:
                 return emit({"ok": True, "event": "board", "seq": max(e["seq"] for e in matched),
-                             "messages": matched}, 0)
+                             "messages": matched}, 0, head_seq=cached_head_seq)
 
         now = time.time()
         if args.pane:
@@ -6027,6 +6054,13 @@ PANE_ID_RE = re.compile(r"^[A-Za-z0-9]+:[A-Za-z0-9]+$")
 ORCH_TARGET_RE = re.compile(r"^orch:([a-z0-9][a-z0-9._-]{0,39})$")
 
 
+def is_explicit_pane_target(target: str) -> bool:
+    """Return True when `target` is an explicit pane ID (`wN:pM`), excluding `orch`, `all`, roles, and `orch:*`."""
+    if target in ("orch", "all") or target in ROLES or target.startswith("orch:") or ORCH_TARGET_RE.fullmatch(target):
+        return False
+    return bool(PANE_ID_RE.fullmatch(target))
+
+
 def normalize_post_targets(raw_targets: list[str]) -> list[str]:
     """Validate and deduplicate `--to` targets (`role`, `orch`, `orch:<name>`, `all`, or `wN:pM`)."""
     out: list[str] = []
@@ -6035,7 +6069,7 @@ def normalize_post_targets(raw_targets: list[str]) -> list[str]:
         t = (raw or "").strip().lstrip("@")
         if t == "orchestrator":
             t = "orch"
-        if t in valid_roles or ORCH_TARGET_RE.fullmatch(t) or PANE_ID_RE.fullmatch(t):
+        if t in valid_roles or ORCH_TARGET_RE.fullmatch(t) or is_explicit_pane_target(t):
             if t not in out:
                 out.append(t)
         else:
@@ -6135,6 +6169,12 @@ def cmd_post(args: argparse.Namespace) -> int:
     top, git_top, fleet_dir = ctx["top"], ctx["git_top"], ctx["fleet_dir"]
     panes: dict = ctx["panes"]
     sender_role, me_pane = ctx["sender_role"], ctx["me_pane"]
+    orchs = read_orchs(home)
+    orch_panes = {
+        rec["pane"]: oname
+        for oname, rec in orchs.items()
+        if isinstance(rec.get("pane"), str) and rec.get("pane")
+    }
 
     # Validate --file
     file_path: Path | None = None
@@ -6172,9 +6212,9 @@ def cmd_post(args: argparse.Namespace) -> int:
                 return refuse(reason=f"worktree has {plural(dirty, 'uncommitted change')} outside .fleet/; "
                                      "commit work before requesting review or posting --done")
 
-    # Explicit pane IDs must be alive before mutating anything
+    # Explicit worker pane IDs must be alive before mutating anything; orch panes and orch:<name> are board-only
     for t in to_list:
-        if PANE_ID_RE.fullmatch(t):
+        if is_explicit_pane_target(t) and t not in orch_panes:
             st = pane_state(t)
             if st != "alive":
                 return refuse(reason=f"target pane {t} is {st} (not alive)", pane=t)
@@ -6226,7 +6266,7 @@ def cmd_post(args: argparse.Namespace) -> int:
         else:
             if len(live_critics) > 1 and round_num is not None:
                 posted_panes = {
-                    (e.get("from") or {}).get("pane") for e in read_board_entries(home)
+                    (e.get("from") or {}).get("pane") for e in board_snapshot(home)[0]
                     if e.get("kind") == "post" and e.get("round") == round_num
                     and (e.get("from") or {}).get("role") == "critic"
                 }
@@ -6294,14 +6334,36 @@ def cmd_post(args: argparse.Namespace) -> int:
     worker_roles = {"impl", "critic", "planner", "researcher", "helper"}
     target_panes: list[tuple[str, str]] = []
     seen_p: set[str] = set()
+    board_to: list[str] = []
+    board_to_panes: list[str] = []
+    seen_board_p: set[str] = set()
+
+    def add_board_to(tok: str) -> None:
+        if tok not in board_to:
+            board_to.append(tok)
+
+    def add_board_pane(p: str) -> None:
+        if p not in seen_board_p:
+            seen_board_p.add(p)
+            board_to_panes.append(p)
+
     for t in to_list:
+        add_board_to(t)
         if t == "orch" or t == "all" or ORCH_TARGET_RE.fullmatch(t):
             continue
-        if PANE_ID_RE.fullmatch(t):
+        if is_explicit_pane_target(t):
+            if t in orch_panes:
+                oname = orch_panes[t]
+                add_board_to(f"orch:{oname}")
+                if len(orchs) <= 1:
+                    add_board_to("orch")
+                add_board_pane(t)
+                continue
             agent_name = (panes.get(t) or {}).get("agent") or (pane_info(t).get("agent") or "claude")
             if t not in seen_p:
                 seen_p.add(t)
                 target_panes.append((t, agent_name))
+            add_board_pane(t)
             continue
         if t in worker_roles:
             if t == "critic" and escalated_reason == "no_critic_pane":
@@ -6317,6 +6379,7 @@ def cmd_post(args: argparse.Namespace) -> int:
                 if p not in seen_p:
                     seen_p.add(p)
                     target_panes.append((p, ag))
+                add_board_pane(p)
 
     if target_panes and not args.queue:
         for p, _ in target_panes:
@@ -6326,11 +6389,11 @@ def cmd_post(args: argparse.Namespace) -> int:
                                  indent=2, ensure_ascii=False))
                 return 3
 
-    mentions = format_post_mentions(to_list)
+    mentions = format_post_mentions(board_to)
     entry = record_board(
         home, "post", orch=ctx["orch"], lane=top, branch=ctx["branch"],
         from_info={"pane": me_pane, "role": sender_role, "name": ctx["sender_label"], "agent": ctx["sender_agent"]},
-        to=to_list, to_panes=[p for p, _ in target_panes], mentions=mentions, tag=tag,
+        to=board_to, to_panes=board_to_panes, mentions=mentions, tag=tag,
         file=file_display, round_num=round_num, refs=refs, text=summary,
         escalated_reason=escalated_reason, verdict=verdict_summary,
     )
