@@ -134,6 +134,18 @@ def first_line(text: str) -> str:
     return ""
 
 
+def git_error_line(text: str) -> str:
+    """The fatal/error line of git output, skipping leading warning/hint lines."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    for line in lines:
+        if line.lower().startswith(("fatal:", "error:")):
+            return line
+    for line in lines:
+        if not line.lower().startswith(("warning:", "hint:")):
+            return line
+    return lines[0] if lines else ""
+
+
 def tool_version(path: str | None, args: tuple[str, ...] = ("--version",)) -> str | None:
     if not path:
         return None
@@ -880,25 +892,43 @@ def load_panes(fleet_dir: Path) -> dict:
 def save_panes(fleet_dir: Path, data: dict) -> None:
     path = Path(fleet_dir) / PANES_FILE
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+@contextmanager
+def lane_lock(fleet_dir: Path, wait: float | None = None):
+    """The lane's lock, <fleet_dir>/.lock. Waits up to LOCK_WAIT seconds for it."""
+    with file_lock(Path(fleet_dir) / LOCK_FILE, f"lane {Path(fleet_dir).parent.name}", wait):
+        yield
 
 
 def register_pane(cwd: str, pane: str, record: dict) -> str:
     fleet_dir = Path(prep_dir(cwd)["fleet_dir"])
-    data = load_panes(fleet_dir)
-    data[pane] = record
-    save_panes(fleet_dir, data)
+    with lane_lock(fleet_dir):
+        data = load_panes(fleet_dir)
+        data[pane] = record
+        save_panes(fleet_dir, data)
     return str(fleet_dir / PANES_FILE)
 
 
 def unregister_pane(cwd: str, pane: str) -> bool:
     fleet_dir = Path(git_toplevel(cwd) or cwd) / FLEET_DIR
-    data = load_panes(fleet_dir)
-    if pane not in data:
+    if not (fleet_dir / PANES_FILE).is_file():
         return False
-    del data[pane]
-    save_panes(fleet_dir, data)
+    with lane_lock(fleet_dir):
+        data = load_panes(fleet_dir)
+        if pane not in data:
+            return False
+        del data[pane]
+        save_panes(fleet_dir, data)
     return True
 
 
@@ -1271,6 +1301,16 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 PROJECTS_DIR = "projects"
 EVENTS_DIR = "events"
+BOARD_LOG = "board.jsonl"
+BOARD_SEQ = "board.seq"
+BOARD_LOCK = "board.lock"
+BOARD_FEED_DEFAULT_LIMIT = 20
+BOARD_TRANSITION_EVENTS = (
+    "spawn", "spawn_result", "retire", "cleanup",
+    "orch_claim", "orch_release", "orch_rename", "adopt",
+    "plan_approved", "risk_approved",
+)
+REF_NUM = re.compile(r"(?<![A-Za-z0-9_])#(\d{1,9})\b")
 PROJECT_FILE = "project.json"
 LOG_EVENTS = ("worktree", "spawn", "spawn_result", "send", "reset", "retire", "cleanup", "handoff",
               "session_start", "session_end", "orch_claim", "orch_release", "orch_rename", "adopt", "phase", "plan_approved", "risk_approved",
@@ -1300,7 +1340,7 @@ HOOK_WAIT_STEP = 0.05  # seconds of each wait in ensure_project and record
 EVENT_FIELD_TYPES = {"ok": bool, "closed": bool, "removed": bool, "replace": bool, "force": bool, "by": dict,
                      "exited": list, "reasons": list, "round": int, "files": int, "high_risk": list, "matches": list,
                      "follow_ups_closed": list, "follow_ups_released": list, "switched": bool, "lanes": list,
-                     "warnings": list}
+                     "warnings": list, "ts_ns": int}
 # `orch` (text) names the orch that an event concerns: the claim's, or the owner of the event's lane.
 DICT_LIST_FIELDS = ("exited", "high_risk", "matches")  # lists of objects with text fields; other lists hold text
 
@@ -1550,13 +1590,203 @@ def record(event: str, where: str | None, by: bool = True, home: Path | None = N
             else:
                 return None
             # The time is taken under the lock, so that the order of the lines is the order of their times.
-            entry = {"ts": now_iso(), **entry}
+            entry = {"ts": now_iso(), **({"ts_ns": time.time_ns()} if event in ("spawn", "send") else {}), **entry}
             os.write(fd, (json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n").encode())
         finally:
             os.close(fd)
+        if home is not None and event in BOARD_TRANSITION_EVENTS:
+            try:
+                from_pane = entry.get("pane") or (entry.get("by") or {}).get("pane")
+                from_info = {
+                    k: v for k, v in (
+                        ("pane", from_pane),
+                        ("role", entry.get("role")),
+                        ("agent", entry.get("agent")),
+                    ) if v
+                }
+                record_board(
+                    home,
+                    "transition",
+                    orch=entry.get("orch"),
+                    lane=entry.get("lane") or entry.get("cwd"),
+                    branch=entry.get("branch"),
+                    from_info=from_info,
+                    text=describe_event(entry),
+                    event=event,
+                )
+            except Exception:
+                pass
         return str(path)
     except Exception:
         return None
+
+
+def parse_refs(text: str | None, extra_refs: list[int] | None = None) -> list[int]:
+    """Return sorted unique positive integer #seq references from `extra_refs` and `#N` tokens in `text`."""
+    refs = {r for r in (extra_refs or []) if isinstance(r, int) and not isinstance(r, bool) and r >= 1}
+    for m in REF_NUM.finditer(text or ""):
+        n = int(m.group(1))
+        if n >= 1:
+            refs.add(n)
+    return sorted(refs)
+
+
+def read_board_entries(home: Path) -> list[dict]:
+    """Read valid sequenced entries from `<home>/events/board.jsonl`, oldest first."""
+    path = Path(home) / EVENTS_DIR / BOARD_LOG
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return []
+    entries: list[dict] = []
+    for line in data.split(b"\n"):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line.decode("utf-8", errors="replace"))
+        except Exception:
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("seq"), int) and not isinstance(obj.get("seq"), bool):
+            entries.append(obj)
+    return entries
+
+
+def read_board_seq(home: Path) -> int:
+    """Return the newest board sequence number for `home` (0 when none yet)."""
+    seq_path = Path(home) / EVENTS_DIR / BOARD_SEQ
+    raw = read_small_bytes(seq_path, 64)
+    if raw is not None:
+        text = raw.decode("utf-8", errors="replace").strip()
+        if text.isdigit():
+            return int(text)
+    entries = read_board_entries(home)
+    return max((e["seq"] for e in entries), default=0)
+
+
+def write_board_seq(events_dir: Path, seq: int) -> None:
+    """Atomically persist `seq` to `<events_dir>/board.seq`."""
+    seq_path = events_dir / BOARD_SEQ
+    tmp = seq_path.with_name(f".{BOARD_SEQ}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w") as fh:
+            fh.write(f"{seq}\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, seq_path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+@contextmanager
+def board_lock(home: Path):
+    """Acquire blocking exclusive flock on `<home>/events/board.lock`."""
+    events_dir = Path(home) / EVENTS_DIR
+    events_dir.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(events_dir / BOARD_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield events_dir
+    finally:
+        os.close(lock_fd)
+
+
+def board_snapshot(home: Path | None) -> tuple[list[dict], int]:
+    """Read `(board_entries, head_seq)` atomically under blocking `events/board.lock`."""
+    if home is None:
+        return [], 0
+    events_dir = Path(home) / EVENTS_DIR
+    if not events_dir.is_dir():
+        return [], 0
+    with board_lock(home):
+        entries = read_board_entries(home)
+        head_seq = max(read_board_seq(home), max((e["seq"] for e in entries), default=0))
+        return entries, head_seq
+
+
+def board_head_seq(home: Path | None) -> int:
+    """Return the current head sequence number of `home`'s board log (0 if None or absent)."""
+    if home is None:
+        return 0
+    events_dir = Path(home) / EVENTS_DIR
+    if not events_dir.is_dir():
+        return 0
+    with board_lock(home):
+        return read_board_seq(home)
+
+
+def record_board(home: Path, kind: str, *, orch: str | None = None, lane: str | None = None,
+                 branch: str | None = None, from_info: dict | None = None, to: list[str] | None = None,
+                 to_panes: list[str] | None = None, mentions: list[str] | None = None, tag: str | None = None,
+                 file: str | None = None, round_num: int | None = None, refs: list[int] | None = None,
+                 text: str = "", **extra) -> dict:
+    """Append one sequenced entry to `<home>/events/board.jsonl` under blocking flock on `events/board.lock`."""
+    with board_lock(home) as events_dir:
+        seq = read_board_seq(home) + 1
+        clean_from = {k: v for k, v in (from_info or {}).items() if v is not None}
+        entry: dict = {
+            "seq": seq,
+            "ts": now_iso(),
+            "ts_ns": time.time_ns(),
+            "kind": kind,
+            "project": Path(home).name,
+            "orch": orch,
+            "lane": lane,
+            "branch": branch,
+            "from": clean_from,
+            "to": list(to or []),
+            "to_panes": list(to_panes or []),
+            "mentions": list(mentions or []),
+            "tag": tag,
+            "file": file,
+            "round": round_num,
+            "refs": parse_refs(text, refs),
+            "text": text,
+        }
+        for k, v in extra.items():
+            if v is not None:
+                entry[k] = v
+        line = (json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        log_fd = os.open(events_dir / BOARD_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(log_fd, line)
+            os.fsync(log_fd)
+        finally:
+            os.close(log_fd)
+        write_board_seq(events_dir, seq)
+        return entry
+
+
+def board_entry_line(e: dict) -> str:
+    """Format one `board.jsonl` entry as a single compact line."""
+    frm = e.get("from") or {}
+    who = frm.get("role") or frm.get("pane") or e.get("kind") or "?"
+    if e.get("branch"):
+        who = f"{who}@{e['branch']}"
+    mentions = " ".join(e.get("mentions") or [])
+    arrow = f" -> {mentions}" if mentions else ""
+    tag = f" [{e['tag']}]" if e.get("tag") else ""
+    return f"#{e['seq']}  {clock(e)}  {who}{arrow}{tag}: {e.get('text') or ''}".rstrip()
+
+
+def parse_seq_list(raw: str) -> list[int]:
+    """Parse a comma-separated list of positive `#seq` integers."""
+    out: list[int] = []
+    for part in (raw or "").split(","):
+        tok = part.strip().lstrip("#")
+        if not tok:
+            continue
+        if not tok.isdigit() or int(tok) < 1:
+            raise FleetError(f"invalid seq id {part!r}: expected positive integer")
+        val = int(tok)
+        if val not in out:
+            out.append(val)
+    if not out:
+        raise FleetError("no sequence IDs given")
+    return out
 
 
 def event_lane_owner(path) -> str | None:
@@ -1708,7 +1938,7 @@ class HookRun:
             cp = self.git(path, "rev-parse", "--git-common-dir", "--show-toplevel")
             lines = cp.stdout.strip().splitlines()
             if cp.returncode == 128:
-                raise HookGitFailed(HOOK_NO_REPOSITORY, (cp.stderr.strip().splitlines() or [""])[0])
+                raise HookGitFailed(HOOK_NO_REPOSITORY, git_error_line(cp.stderr))
             if cp.returncode != 0 or len(lines) < 2:
                 raise HookGitFailed(HOOK_GIT_ERROR, f"git rev-parse failed with exit code {cp.returncode}")
             self.tops[path] = lines[1]
@@ -1826,6 +2056,8 @@ def read_events(dirs: list[Path]) -> list[dict]:
     events = []
     for d in dirs:
         for f in sorted((Path(d) / EVENTS_DIR).glob("*.jsonl")):
+            if f.name == BOARD_LOG:
+                continue
             try:
                 data = f.read_bytes()
             except OSError:
@@ -2686,9 +2918,9 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
 
 def archive_lane_files(path: str, repo: str | None, branch: str | None) -> str | None:
-    """Copy the lane's .fleet/ records (not panes.json) to its project's lanes/: removing the worktree deletes them."""
+    """Copy the lane's .fleet/ records (not panes.json or .lock) to its project's lanes/: removing the worktree deletes them."""
     src = Path(path) / FLEET_DIR
-    files = [p for p in sorted(src.rglob("*")) if p.is_file() and p.name != PANES_FILE] if src.is_dir() else []
+    files = [p for p in sorted(src.rglob("*")) if p.is_file() and p.name not in (PANES_FILE, LOCK_FILE)] if src.is_dir() else []
     if not files:
         return None
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", branch or Path(path).name).strip("-.") or "lane"
@@ -2739,7 +2971,8 @@ def finish_branch(f: dict) -> str:
         return f"kept {branch}: it moved after the check"
     cp = run_git(f["main_root"], "branch", "-D", branch)
     if cp is None or cp.returncode != 0:
-        return f"kept {branch}: " + (first_line(cp.stderr or cp.stdout) if cp is not None else "git branch -D failed")
+        return f"kept {branch}: " + (git_error_line(cp.stderr or cp.stdout) or "git branch -D failed"
+                                    if cp is not None else "git branch -D failed")
     return f"deleted {branch}"
 
 
@@ -2809,7 +3042,7 @@ def clean_lane(f: dict, timeout: float) -> dict:
         else:
             cp = run(remove, timeout=120)
             if cp.returncode != 0:
-                out["error"] = first_line(cp.stderr or cp.stdout) or "git worktree remove failed"
+                out["error"] = git_error_line(cp.stderr or cp.stdout) or "git worktree remove failed"
                 return out
         out["removed"] = True
         parent = os.path.dirname(os.path.realpath(f["path"]))
@@ -3245,7 +3478,7 @@ def logged_follow_up_numbers(home: Path) -> list[int]:
     read: the IDs that it holds would be missed."""
     d = home / EVENTS_DIR
     try:
-        names = sorted(n for n in os.listdir(d) if n.endswith(".jsonl"))
+        names = sorted(n for n in os.listdir(d) if n.endswith(".jsonl") and n != BOARD_LOG)
     except FileNotFoundError:
         return []
     except OSError as e:
@@ -4318,22 +4551,26 @@ def precise_now() -> str:
     return datetime.now().astimezone().isoformat(timespec="microseconds")
 
 
-def save_board(home: Path, records: list[dict], made: str, path: Path | None = None) -> bool:
+def save_board(home: Path, records: list[dict], made: str, path: Path | None = None,
+               head_seq: int | None = None) -> bool:
     """Write board.json (`path`: an orch's own, orch_files; default the root one) unless it already holds a board made
     later. `made` is when the board collection began. The caller holds the project lock."""
     path = path or home / BOARD_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     if event_time({"ts": read_json(path).get("made")}) > event_time({"ts": made}):
         return False
-    write_json(path, {"made": made, "project": home.name, "lanes": records})
+    payload = {"made": made, "project": home.name, "lanes": records}
+    seq = board_head_seq(home) if head_seq is None else head_seq
+    if seq > 0:
+        payload["head_seq"] = seq
+    write_json(path, payload)
     return True
 
 
 @contextmanager
-def project_lock(home: Path, wait: float | None = None):
-    """The project's lock, <home>/.lock. Waits up to LOCK_WAIT seconds for it."""
+def file_lock(path: Path, busy_label: str, wait: float | None = None):
+    """Acquire an exclusive flock on `path`, waiting up to `wait` seconds (default LOCK_WAIT)."""
     wait = LOCK_WAIT if wait is None else wait
-    path = home / LOCK_FILE
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         deadline = time.monotonic() + wait
@@ -4343,12 +4580,19 @@ def project_lock(home: Path, wait: float | None = None):
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    raise FleetError(f"project {home.name} is busy: another fleet command has held {path} for "
+                    raise FleetError(f"{busy_label} is busy: another fleet command has held {path} for "
                                      f"{wait:g}s; try again")
                 time.sleep(0.1)
         yield
     finally:
         os.close(fd)
+
+
+@contextmanager
+def project_lock(home: Path, wait: float | None = None):
+    """The project's lock, <home>/.lock. Waits up to LOCK_WAIT seconds for it."""
+    with file_lock(home / LOCK_FILE, f"project {home.name}", wait):
+        yield
 
 
 def clip(text: str, width: int) -> str:
@@ -4872,6 +5116,12 @@ def digest_base(path: Path) -> tuple[float | None, dict[str, dict], dict[str, in
     return cursor, {k: v for k, v in lanes.items() if isinstance(k, str) and isinstance(v, dict)}, read
 
 
+def digest_last_seq(path: Path) -> int:
+    """Return the last consumed board #seq from `digest.json` (0 when absent or invalid)."""
+    val = read_json(path).get("last_seq")
+    return val if isinstance(val, int) and not isinstance(val, bool) and val >= 0 else 0
+
+
 def read_new_events(home: Path, read: dict[str, int],
                     budget: int | None = None) -> tuple[list[dict], dict[str, int], bool]:
     """The complete lines of each monthly log after the offset in `read` (a file not in it from 0; a file
@@ -4881,6 +5131,8 @@ def read_new_events(home: Path, read: dict[str, int],
     offsets: dict[str, int] = {}
     left = budget
     for f in sorted((home / EVENTS_DIR).glob("*.jsonl")):
+        if f.name == BOARD_LOG:
+            continue
         start = read.get(f.name, 0)
         try:
             size = f.stat().st_size
@@ -5005,31 +5257,94 @@ def board_head(home: Path, view: dict, records: list) -> str:
     return f"project {home.name}{who}: {plural(len(records), 'lane')}"
 
 
+def board_entry_visible(entry: dict, view: dict | None) -> bool:
+    """Whether a board.jsonl entry belongs on `view` (None or unfiltered: every entry)."""
+    if not view or not view.get("filtered"):
+        return True
+    owner = text_or_none(entry.get("orch"))
+    aliases = view.get("aliases") or {}
+    name = view.get("name")
+    if owner is None or aliases.get(owner, owner) == name:
+        return True
+    if entry.get("kind") == "post":
+        if "@all" in (entry.get("mentions") or []) or "all" in (entry.get("to") or []):
+            return True
+        if name and f"orch:{name}" in (entry.get("to") or []):
+            return True
+    return False
+
+
+def board_feed(home: Path, view: dict | None, *, since: int | None = None,
+               seqs: list[int] | None = None, limit: int | None = None) -> tuple[list[dict], int]:
+    """Read `board.jsonl` messages in fast feed mode; returns `(messages, head_seq)`."""
+    entries, head_seq = board_snapshot(home)
+    if seqs is not None:
+        by_seq = {e["seq"]: e for e in entries}
+        return [by_seq[s] for s in seqs if s in by_seq], head_seq
+    filtered = [e for e in entries if (since is None or e["seq"] > since) and board_entry_visible(e, view)]
+    cap = (0 if since is not None else BOARD_FEED_DEFAULT_LIMIT) if limit is None else limit
+    if cap > 0:
+        filtered = filtered[-cap:]
+    return filtered, head_seq
+
+
 def cmd_board(args: argparse.Namespace) -> int:
     home = project_home(args)
     view = orch_view(home, args.orch, args.all)
     files = view["files"]
+    since = getattr(args, "since", None)
+    seqs_raw = getattr(args, "seqs", None)
+    limit_arg = getattr(args, "limit", None)
+    want_lanes = bool(getattr(args, "lanes", False))
+    seqs = parse_seq_list(seqs_raw) if seqs_raw is not None else None
+    feed_mode = since is not None or seqs is not None or limit_arg is not None
+
+    if feed_mode and not want_lanes:
+        messages, head_seq = board_feed(home, view, since=since, seqs=seqs, limit=limit_arg)
+        if args.json:
+            print(json.dumps({"project": home.name, "orch": view["name"], "all": view["all"],
+                              "head_seq": head_seq, "messages": messages}, indent=2, ensure_ascii=False))
+            return 0
+        print(f"project {home.name} (board head #{head_seq}): {plural(len(messages), 'message')}")
+        if not messages:
+            print("no messages")
+        else:
+            for m in messages:
+                print(board_entry_line(m))
+        return 0
+
     made = precise_now()
     cursor, base, _ = digest_base(files["digest"])
     limit = review_round_limit()
     records = make_board(home, cursor, {p: b.get("lane") for p, b in base.items() if b.get("lane")}, view, limit)
+    messages = None
+    if feed_mode:
+        messages, head_seq = board_feed(home, view, since=since, seqs=seqs, limit=limit_arg)
+    else:
+        _, head_seq = board_snapshot(home)
     saved, stale = False, None
     if not view["all"]:
         with project_lock(home):
             stale = view_changed(home, view)
             if not stale:
-                saved = save_board(home, records, made, files["board"])
+                saved = save_board(home, records, made, files["board"], head_seq=head_seq)
     research = open_research(home)
     if args.json:
-        print(json.dumps({"project": home.name, "orch": view["name"], "all": view["all"],
-                          "board": str(files["board"]) if not view["all"] else None, "saved": saved,
-                          **({"stale": stale} if stale else {}),
-                          "review_limit": limit, "lanes": records, "research": research}, indent=2, ensure_ascii=False))
+        payload = {"project": home.name, "orch": view["name"], "all": view["all"],
+                   "board": str(files["board"]) if not view["all"] else None, "saved": saved,
+                   **({"stale": stale} if stale else {}), "head_seq": head_seq,
+                   "review_limit": limit, "lanes": records, "research": research}
+        if messages is not None:
+            payload["messages"] = messages
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
     print(board_head(home, view, records) + ("" if saved or view["all"] else
                                              f" (not saved: {stale})" if stale else
                                              " (board.json holds a newer board)"))
     print("\n".join(board_lines(records, owners=view["several"], column=view["all"])))
+    if messages is not None:
+        print(f"\nBoard messages (head #{head_seq}):")
+        print("\n".join(board_entry_line(m) for m in messages) if messages else "  no messages")
     if limit.get("error"):
         print(f"\nReview round limit {limit['limit']} (the default): {limit['error']}")
     if research:
@@ -5064,6 +5379,7 @@ def cmd_digest(args: argparse.Namespace) -> int:
                 lock.close()
         made = precise_now()
         cursor, base, read = digest_base(files["digest"])
+        last_seq = digest_last_seq(files["digest"])
         records = make_board(home, cursor, {p: b.get("lane") for p, b in base.items() if b.get("lane")}, view)
         changes = phase_changes(records, base)
         events, offsets, _ = read_new_events(home, read)
@@ -5071,21 +5387,33 @@ def cmd_digest(args: argparse.Namespace) -> int:
                               view if view["filtered"] else None)
         omitted = max(0, len(shown) - DIGEST_EVENTS_MAX)
         shown = shown[-DIGEST_EVENTS_MAX:]
+        board_entries, head_seq = board_snapshot(home)
+        consumed_seq = max(last_seq, max((e["seq"] for e in board_entries), default=0))
+        unread_posts = [
+            e for e in board_entries
+            if e.get("kind") == "post" and e["seq"] > last_seq
+            and board_entry_visible(e, view if view["filtered"] else None)
+            and not (orch_pane and (e.get("from") or {}).get("pane") == orch_pane)
+        ]
         if not read_only:
             for c in changes:
                 record("phase", None, home=home, lane=c["path"], name=c["lane"], branch=c.get("branch"),
                        old=c["old"], new=c["new"], orch=name)
-            save_board(home, records, made, files["board"])
-            write_json(files["digest"], {"cursor": now_iso(), "read": offsets, "lanes": {
-                r["path"]: {"lane": r["lane"], "branch": r.get("branch"), "phase": r["phase"]} for r in records}})
+            save_board(home, records, made, files["board"], head_seq=head_seq)
+            digest_payload = {"cursor": now_iso(), "read": offsets, "lanes": {
+                r["path"]: {"lane": r["lane"], "branch": r.get("branch"), "phase": r["phase"]} for r in records}}
+            if consumed_seq > 0:
+                digest_payload["last_seq"] = consumed_seq
+            write_json(files["digest"], digest_payload)
             session = text_or_none(os.environ.get("CLAUDE_CODE_SESSION_ID"))
             if rec and me and rec.get("pane") == me and session and rec.get("session") != session:
                 write_orchs(home, {**view["orchs"], name: {**rec, "session": session}})  # F9: the hook's match
     since = datetime.fromtimestamp(cursor).astimezone().isoformat(timespec="seconds") if cursor else None
     if args.json:
         print(json.dumps({"project": home.name, "orch": name, "since": since, "read_only": bool(read_only),
-                          "why": read_only, "changes": changes, "events": shown, "omitted": omitted,
-                          "lanes": records}, indent=2, ensure_ascii=False))
+                          "why": read_only, "last_seq": last_seq, "head_seq": head_seq,
+                          "changes": changes, "events": shown, "omitted": omitted,
+                          "messages": unread_posts, "lanes": records}, indent=2, ensure_ascii=False))
         return 0
     head = (f"project {home.name}" + (f", orch {name}" if view["several"] and name else "") + ": digest since "
             + (clock({"ts": since}) if since else "the start (no digest yet)"))
@@ -5093,6 +5421,10 @@ def cmd_digest(args: argparse.Namespace) -> int:
     print("\nPhases" if changes else "\nNo phase changes.")
     for c in changes:
         print(f"  {c['lane']}: {c['old'] or 'new'} -> {c['new']}")
+    if unread_posts:
+        print(f"\nMessages ({len(unread_posts)}; board head #{head_seq})")
+        for m in unread_posts:
+            print("  " + board_entry_line(m))
     if shown:
         print(f"\nEvents ({len(shown)}" + (f"; {omitted} earlier not shown: `fleet log`" if omitted else "") + ")")
         for e in shown:
@@ -5291,6 +5623,8 @@ def orch_rebrief(cand: tuple[Path, str, dict], pane: str, data: dict, env) -> st
     else:
         body.append("No board yet.")
     cursor, _, read = digest_base(files["digest"])
+    last_seq = digest_last_seq(files["digest"])
+    board_entries, head_seq = board_snapshot(home)
     if cursor is None:
         tail = ["No digest yet."]
     else:
@@ -5298,6 +5632,18 @@ def orch_rebrief(cand: tuple[Path, str, dict], pane: str, data: dict, env) -> st
         paths = [r["path"] for r in records if isinstance(r.get("path"), str)]
         count = len(digest_events(events, pane, paths, cached_view(home, name, orchs, is2)))
         tail = [("More than " if cut else "") + f"{plural(count, 'event')} since the last digest."]
+    if head_seq > 0 or last_seq > 0:
+        view_filter = cached_view(home, name, orchs, is2)
+        unread_posts = sum(
+            1 for e in board_entries
+            if e.get("kind") == "post" and e["seq"] > last_seq
+            and board_entry_visible(e, {**(view_filter or {}), "filtered": bool(view_filter)})
+            and (e.get("from") or {}).get("pane") != pane
+        )
+        tail.append(
+            f"Board head: #{head_seq}; digest cursor: #{last_seq} ({unread_posts} unread board posts). "
+            f"Wait with `{helper_command(env)} wait --since {last_seq} --mentions-only`."
+        )
     tail.append(f"Run `{helper_command(env)} digest --project {home.name}` first, then load the fleet:fleet skill.")
     room = REBRIEF_LINES_MAX - len(head) - len(tail)
     if len(body) > room:
@@ -5365,7 +5711,43 @@ def cmd_prep(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
-# watch
+# watch / wait
+
+
+def check_file_marker(path: Path | None, pattern: re.Pattern | None, marker: str | None) -> dict | None:
+    """Return marker match metadata when `path` exists and matches `pattern`, else None."""
+    if path is None or pattern is None or not path.is_file():
+        return None
+    text = path.read_text(errors="replace")
+    if not pattern.search(text):
+        return None
+    return {"marker": marker, "placeholders": text.count("PLACEHOLDER"), "file": str(path)}
+
+
+def check_pane_health(pane: str, now: float, state: dict, idle_grace: float, blocked_grace: float,
+                      can_stop: bool = True, info: dict | None = None) -> tuple[str, int, dict] | None:
+    """Inspect one pane and return `(event, exit_code, extra)` on blocked/gone/exited/stopped, else None."""
+    if info is None:
+        try:
+            info = pane_info(pane)
+        except FleetError:
+            return "pane-gone", 5, {}
+    status = info.get("agent_status")
+    if not info.get("agent"):
+        return "agent-exited", 5, {"screen": screen_tail(pane)}
+    if status == "blocked":
+        state["blocked_since"] = state.get("blocked_since") or now
+        if now - state["blocked_since"] >= blocked_grace:
+            return "blocked", 4, {"status": status, "screen": screen_tail(pane)}
+    else:
+        state["blocked_since"] = None
+    if can_stop and status in ("idle", "done"):
+        state["stopped_since"] = state.get("stopped_since") or now
+        if now - state["stopped_since"] >= idle_grace:
+            return "stopped", 6, {"status": status, "screen": screen_tail(pane)}
+    else:
+        state["stopped_since"] = None
+    return None
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
@@ -5384,8 +5766,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         path = f if f.is_absolute() else Path(top) / f
         pattern = re.compile(marker_line(re.escape(args.marker)), re.M)
     start = time.time()
-    stopped_since: float | None = None
-    blocked_since: float | None = None
+    state: dict[str, float | None] = {}
 
     def emit(event: str, code: int, **extra) -> int:
         out = {"event": event, "pane_id": pane, "elapsed_s": int(time.time() - start), **extra}
@@ -5395,27 +5776,654 @@ def cmd_watch(args: argparse.Namespace) -> int:
         return code
 
     while True:
-        if path is not None and path.is_file():
-            text = path.read_text(errors="replace")
-            if pattern.search(text):
-                return emit("marker", 0, marker=args.marker, placeholders=text.count("PLACEHOLDER"))
-        try:
-            info = pane_info(pane)
-        except FleetError:
-            return emit("pane-gone", 5)
-        status = info.get("agent_status")
-        if not info.get("agent"):
-            return emit("agent-exited", 5, screen=screen_tail(pane))
+        hit = check_file_marker(path, pattern, args.marker)
+        if hit:
+            return emit("marker", 0, **hit)
         now = time.time()
-        blocked_since = (blocked_since or now) if status == "blocked" else None
-        if blocked_since and now - blocked_since >= args.blocked_grace:
-            return emit("blocked", 4, status=status, screen=screen_tail(pane))
-        stopped_since = (stopped_since or now) if status in ("idle", "done") else None
-        if stopped_since and now - stopped_since >= args.idle_grace:
-            return emit("stopped", 6, status=status, screen=screen_tail(pane))
+        bad = check_pane_health(pane, now, state, args.idle_grace, args.blocked_grace)
+        if bad:
+            event, code, extra = bad
+            return emit(event, code, **extra)
         if args.timeout and now - start >= args.timeout:
+            status = pane_info(pane).get("agent_status")
             return emit("timeout", 7, status=status)
         time.sleep(args.interval)
+
+
+def wait_lane_matches(entry_or_lane: dict, filters: list[str]) -> bool:
+    """Return True when `filters` is empty or matches `entry_or_lane` by branch, workspace, label, or path."""
+    if not filters:
+        return True
+    for tok in filters:
+        if lane_matches(entry_or_lane, tok):
+            return True
+        path = entry_or_lane.get("lane") or entry_or_lane.get("path") or ""
+        if path and os.path.basename(path) == tok:
+            return True
+    return False
+
+
+def wait_entry_matches(entry: dict, me_pane: str | None, me_role: str | None, orch_name: str | None,
+                       view: dict | None, mentions_only: bool, lane_filters: list[str]) -> bool:
+    """Return True when a `board.jsonl` entry wakes `fleet wait` for the caller."""
+    if not board_entry_visible(entry, view):
+        return False
+    if me_pane and (entry.get("from") or {}).get("pane") == me_pane:
+        return False
+    if lane_filters and not wait_lane_matches(entry, lane_filters):
+        return False
+    if not mentions_only:
+        return True
+    to = entry.get("to") or []
+    to_panes = entry.get("to_panes") or []
+    mentions = entry.get("mentions") or []
+    tag = entry.get("tag")
+    if "@all" in mentions or "all" in to:
+        return True
+    if me_pane and (me_pane in to_panes or f"@{me_pane}" in mentions):
+        return True
+    if me_role and (me_role in to or f"@{me_role}" in mentions):
+        return True
+    if me_role == "orch" or (orch_name and me_pane is None):
+        if orch_name and f"orch:{orch_name}" in to:
+            return True
+        if tag in ("done", "blocked", "escalate"):
+            return True
+    return False
+
+
+def pane_needs_post(pane: str, board_entries: list[dict], monthly_events: list[dict]) -> bool:
+    """True unless `pane` already posted a board message after its most recent dispatch (`spawn`/`send`/`post`)."""
+    last_post = (0.0, 0)
+    last_dispatch = (0.0, 0)
+    for e in board_entries:
+        key = (event_time(e), e.get("ts_ns") or 0)
+        if e.get("kind") == "post":
+            if (e.get("from") or {}).get("pane") == pane:
+                last_post = max(last_post, key)
+            if pane in (e.get("to_panes") or []):
+                last_dispatch = max(last_dispatch, key)
+    for e in monthly_events:
+        if e.get("event") in ("spawn", "send") and e.get("pane") == pane:
+            last_dispatch = max(last_dispatch, (event_time(e), e.get("ts_ns") or 0))
+    return last_post == (0.0, 0) or last_dispatch > last_post
+
+
+def discover_wait_panes(home: Path, view: dict | None, me_pane: str | None,
+                        lane_filters: list[str]) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Return `(live_by_pane, tracked_workers_by_pane)` across project lanes matching `view` and `lane_filters`."""
+    live = {a.get("pane_id"): a for a in (herdr("agent", "list").get("agents") or []) if a.get("pane_id")}
+    tracked: dict[str, dict] = {}
+    seen_tops: dict[str, tuple[bool, str | None, str | None]] = {}
+    want_home = os.path.realpath(home)
+
+    def check_top(cwd: str) -> tuple[bool, str | None, str | None]:
+        top = git_toplevel(cwd) or cwd
+        key = os.path.realpath(top)
+        if key not in seen_tops:
+            ident = repo_identity(top)
+            found = find_project(ident["keys"]) if ident else None
+            belongs = found is not None and os.path.realpath(found) == want_home
+            owner = lane_owner(top) if belongs else None
+            br = git_branch(top) or None if belongs else None
+            seen_tops[key] = (belongs, owner, br)
+            if belongs:
+                d = Path(top) / FLEET_DIR
+                for p, rec in load_panes(d).items():
+                    if not isinstance(rec, dict) or p == me_pane:
+                        continue
+                    role = rec.get("role")
+                    if role not in ("impl", "planner", "researcher", "critic", "helper"):
+                        continue
+                    meta = {"pane": p, "lane": top, "branch": br, "role": role, "orch": owner,
+                            "workspace": (live.get(p) or {}).get("workspace_id"), "label": rec.get("label")}
+                    if view and view.get("filtered") and owner not in (None, view.get("name")):
+                        continue
+                    if not wait_lane_matches(meta, lane_filters):
+                        continue
+                    tracked[p] = meta
+        return seen_tops[key]
+
+    for p, a in live.items():
+        if a.get("cwd"):
+            check_top(a["cwd"])
+    try:
+        panes_resp = herdr("pane", "list")
+        for p in panes_resp.get("panes") or []:
+            if isinstance(p, dict) and p.get("cwd"):
+                check_top(p["cwd"])
+    except FleetError:
+        pass
+    board_path = (view or {}).get("files", {}).get("board")
+    if board_path:
+        for r in read_json(board_path).get("lanes") or []:
+            if not isinstance(r, dict) or r.get("phase") == "removed":
+                continue
+            lane_path = r.get("path")
+            if isinstance(lane_path, str) and (Path(lane_path) / FLEET_DIR / PANES_FILE).is_file():
+                check_top(lane_path)
+    return live, tracked
+
+
+def resolve_wait_context(args: argparse.Namespace, me_pane: str | None) -> tuple[Path | None, dict | None, str | None, str | None]:
+    """Resolve `(home, view, me_role, orch_name)` for `cmd_wait`."""
+    home: Path | None = None
+    if getattr(args, "project", None):
+        home = project_home(args, create=False)
+    else:
+        cwd = os.getcwd()
+        if args.pane:
+            home = project_for(cwd, create=False)
+            if home is None:
+                try:
+                    pane_cwd = pane_info(args.pane).get("cwd")
+                except FleetError:
+                    pane_cwd = None
+                if pane_cwd:
+                    home = project_for(pane_cwd, create=False)
+        else:
+            home = project_home(args, create=False)
+    view = orch_view(home, getattr(args, "orch", None)) if home else None
+    orch_name = view["name"] if view else None
+    me_role = None
+    if view and ((view.get("record") or {}).get("pane") == me_pane or (getattr(args, "orch", None) and orch_name)):
+        me_role = "orch"
+    elif me_pane:
+        top = git_toplevel(os.getcwd()) or os.getcwd()
+        rec = load_panes(Path(top) / FLEET_DIR).get(me_pane) or {}
+        me_role = rec.get("role")
+    elif orch_name:
+        me_role = "orch"
+    return home, view, me_role, orch_name
+
+
+def cmd_wait(args: argparse.Namespace) -> int:
+    """Unified event-driven wait for board #seq messages, file markers, or pane health transitions.
+
+    Exit codes: 0 board message or marker found, 4 blocked, 5 pane-gone/agent-exited, 6 stopped, 7 timeout.
+    """
+    if args.pane:
+        require_herdr()
+    me_pane = os.environ.get("HERDR_PANE_ID") or None
+    home, view, me_role, orch_name = resolve_wait_context(args, me_pane)
+    since = args.since
+    if since is None:
+        since = digest_last_seq(view["files"]["digest"]) if (view and me_role == "orch") else 0
+    lane_filters = [x.strip() for x in (args.lanes or "").split(",") if x.strip()]
+    marker_path = pattern = None
+    if args.pane and args.marker:
+        info0 = pane_info(args.pane)
+        top0 = git_toplevel(info0.get("cwd") or "") or info0.get("cwd") or os.getcwd()
+        f = Path(args.file or f"{FLEET_DIR}/STATUS.md").expanduser()
+        marker_path = f if f.is_absolute() else Path(top0) / f
+        pattern = re.compile(marker_line(re.escape(args.marker)), re.M)
+
+    board_path = (home / EVENTS_DIR / BOARD_LOG) if home else None
+    last_stat: tuple[int, int] | None = None
+    cached_entries: list[dict] = []
+    cached_head_seq = 0
+    pane_states: dict[str, dict] = {}
+    last_health_check = 0.0
+    health_interval = args.interval if args.pane else max(float(args.interval), 10.0)
+    start = time.time()
+
+    def emit(payload: dict, code: int, head_seq: int | None = None) -> int:
+        seq_val = board_head_seq(home) if head_seq is None else head_seq
+        out = {**payload, "head_seq": seq_val, "elapsed_s": int(time.time() - start)}
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return code
+
+    while True:
+        hit = check_file_marker(marker_path, pattern, args.marker)
+        if hit:
+            return emit({"ok": True, "event": "marker", "pane_id": args.pane, **hit}, 0)
+
+        if board_path is not None:
+            try:
+                st = board_path.stat()
+                sig = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                sig = None
+            if sig is not None and sig != last_stat:
+                cached_entries, cached_head_seq = board_snapshot(home)
+                last_stat = sig
+            elif sig is None:
+                cached_entries = []
+                cached_head_seq = 0
+                last_stat = None
+            matched = [
+                e for e in cached_entries
+                if e["seq"] > since
+                and wait_entry_matches(e, me_pane, me_role, orch_name, view, args.mentions_only, lane_filters)
+            ]
+            if matched:
+                return emit({"ok": True, "event": "board", "seq": max(e["seq"] for e in matched),
+                             "messages": matched}, 0, head_seq=cached_head_seq)
+
+        now = time.time()
+        if args.pane:
+            st_map = pane_states.setdefault(args.pane, {})
+            can_stop = pane_needs_post(args.pane, cached_entries, read_events([home]) if home else []) if not args.marker else True
+            bad = check_pane_health(args.pane, now, st_map, args.idle_grace, args.blocked_grace, can_stop=can_stop)
+            if bad:
+                ev, code, extra = bad
+                top_p = None
+                try:
+                    pinfo = pane_info(args.pane)
+                    top_p = git_toplevel(pinfo.get("cwd") or "") or pinfo.get("cwd")
+                except FleetError:
+                    pinfo = {}
+                role_p = (load_panes(Path(top_p) / FLEET_DIR).get(args.pane) or {}).get("role") if top_p else None
+                br_p = git_branch(top_p) or None if top_p else None
+                return emit({"ok": False, "event": ev, "pane_id": args.pane, "lane": top_p,
+                             "branch": br_p, "role": role_p, **extra}, code)
+        elif home and shutil.which("herdr") and now - last_health_check >= health_interval:
+            last_health_check = now
+            try:
+                live, tracked = discover_wait_panes(home, view, me_pane, lane_filters)
+            except FleetError:
+                live, tracked = {}, {}
+            if tracked:
+                monthly = read_events([home])
+                for p, meta in sorted(tracked.items()):
+                    info_p = live.get(p)
+                    bad = check_pane_health(
+                        p,
+                        now,
+                        pane_states.setdefault(p, {}),
+                        args.idle_grace,
+                        args.blocked_grace,
+                        can_stop=pane_needs_post(p, cached_entries, monthly),
+                        info=info_p,
+                    )
+                    if bad:
+                        ev, code, extra = bad
+                        return emit({"ok": False, "event": ev, "pane_id": p, "lane": meta["lane"],
+                                     "branch": meta["branch"], "role": meta["role"], **extra}, code)
+
+        if args.timeout and now - start >= args.timeout:
+            return emit({"ok": False, "event": "timeout"}, 7)
+        time.sleep(args.interval)
+
+
+# --------------------------------------------------------------------------
+# post
+
+
+PANE_ID_RE = re.compile(r"^[A-Za-z0-9]+:[A-Za-z0-9]+$")
+ORCH_TARGET_RE = re.compile(r"^orch:([a-z0-9][a-z0-9._-]{0,39})$")
+
+
+def is_explicit_pane_target(target: str) -> bool:
+    """Return True when `target` is an explicit pane ID (`wN:pM`), excluding `orch`, `all`, roles, and `orch:*`."""
+    if target in ("orch", "all") or target in ROLES or target.startswith("orch:") or ORCH_TARGET_RE.fullmatch(target):
+        return False
+    return bool(PANE_ID_RE.fullmatch(target))
+
+
+def normalize_post_targets(raw_targets: list[str]) -> list[str]:
+    """Validate and deduplicate `--to` targets (`role`, `orch`, `orch:<name>`, `all`, or `wN:pM`)."""
+    out: list[str] = []
+    valid_roles = set(ROLES) | {"orch", "all"}
+    for raw in raw_targets:
+        t = (raw or "").strip().lstrip("@")
+        if t == "orchestrator":
+            t = "orch"
+        if t in valid_roles or ORCH_TARGET_RE.fullmatch(t) or is_explicit_pane_target(t):
+            if t not in out:
+                out.append(t)
+        else:
+            raise FleetError(f"invalid --to target {raw!r}: expected role ({', '.join(ROLES)}, orch, all), "
+                             "orch:<name>, or pane ID")
+    return out
+
+
+def format_post_mentions(targets: list[str]) -> list[str]:
+    return [t if t.startswith("@") else f"@{t}" for t in targets]
+
+
+def write_post_inbox(cwd: str, entry: dict, body_files: list[str]) -> Path:
+    """Write a structured `.fleet/inbox/<ts>-<6hex>.md` delivery note for a worker pane."""
+    lines = [
+        f"# Board #{entry['seq']}",
+        f"From: {(entry.get('from') or {}).get('role') or (entry.get('from') or {}).get('pane') or 'unknown'}"
+        + (f" ({entry['branch']})" if entry.get("branch") else ""),
+        f"To: {' '.join(entry.get('mentions') or [])}",
+    ]
+    if entry.get("tag"):
+        lines.append(f"Tag: {entry['tag']}")
+    if body_files:
+        lines.append("Files: " + ", ".join(body_files))
+    if entry.get("refs"):
+        lines.append("Refs: " + ", ".join(f"#{r}" for r in entry["refs"]))
+    lines += ["", entry.get("text") or ""]
+    return spill_to_file("\n".join(lines), cwd)
+
+
+def resolve_post_sender(args: argparse.Namespace) -> dict:
+    """Resolve sender workspace, project home, role, branch, and pane metadata for `cmd_post`."""
+    if args.lane:
+        cwd = os.path.abspath(os.path.expanduser(args.lane))
+    else:
+        cwd = os.getcwd()
+        if getattr(args, "file", None):
+            raw_f = Path(args.file).expanduser()
+            cand = raw_f if raw_f.is_absolute() else Path(os.path.abspath(Path(cwd) / raw_f))
+            for parent in cand.parents:
+                if parent.name == FLEET_DIR and parent.parent.is_dir():
+                    cwd = str(parent.parent)
+                    break
+    top = git_toplevel(cwd) or (cwd if os.path.isdir(cwd) else None)
+    git_top = git_toplevel(cwd)
+    if getattr(args, "project", None):
+        home = project_home(args, create=False)
+    else:
+        home = project_for(top or cwd, create=True) if (top and os.path.isdir(top)) else None
+    me_pane = os.environ.get("HERDR_PANE_ID") or None
+    fleet_dir = (Path(top) / FLEET_DIR) if top else None
+    panes = load_panes(fleet_dir) if (fleet_dir and fleet_dir.is_dir()) else {}
+    sender_rec = (panes.get(me_pane) or {}) if me_pane else {}
+    sender_role = sender_rec.get("role")
+    if sender_role == "orchestrator":
+        sender_role = "orch"
+    if not sender_role and home and me_pane:
+        for _, rec in read_orchs(home).items():
+            if rec.get("pane") == me_pane:
+                sender_role = "orch"
+                break
+    sender_agent = sender_rec.get("agent") or ("claude" if os.environ.get("CLAUDECODE") == "1" else None)
+    branch = git_branch(git_top) or None if git_top else None
+    owner = lane_owner(top) if top else None
+    orch_name = owner or (current_orch(home, getattr(args, "orch", None))[0] if home else None)
+    return {
+        "cwd": cwd,
+        "top": top,
+        "git_top": git_top,
+        "home": home,
+        "me_pane": me_pane,
+        "fleet_dir": fleet_dir,
+        "panes": panes,
+        "sender_role": sender_role,
+        "sender_agent": sender_agent,
+        "sender_label": sender_rec.get("label") or branch,
+        "branch": branch,
+        "orch": orch_name,
+    }
+
+
+def cmd_post(args: argparse.Namespace) -> int:
+    """Post a #seq board message with hygiene gates, dual-critic sync, escalation, and worker inbox delivery."""
+    summary = " ".join((args.summary or "").split())
+    if not summary:
+        return refuse(reason="post summary cannot be empty")
+    try:
+        to_list = normalize_post_targets(args.to)
+    except FleetError as e:
+        return refuse(reason=str(e))
+    refs = parse_seq_list(args.refs) if args.refs else []
+    ctx = resolve_post_sender(args)
+    home: Path | None = ctx["home"]
+    if home is None:
+        return refuse(reason="cannot resolve fleet project home; run inside a project checkout or pass --project NAME")
+
+    top, git_top, fleet_dir = ctx["top"], ctx["git_top"], ctx["fleet_dir"]
+    panes: dict = ctx["panes"]
+    sender_role, me_pane = ctx["sender_role"], ctx["me_pane"]
+    orchs = read_orchs(home)
+    orch_panes = {
+        rec["pane"]: oname
+        for oname, rec in orchs.items()
+        if isinstance(rec.get("pane"), str) and rec.get("pane")
+    }
+
+    # Validate --file
+    file_path: Path | None = None
+    file_display: str | None = None
+    if args.file:
+        raw_f = Path(args.file).expanduser()
+        if raw_f.is_absolute():
+            file_path = raw_f
+        elif not args.lane:
+            cand = Path(os.path.abspath(Path(os.getcwd()) / raw_f))
+            file_path = cand if cand.is_file() else Path(top or ctx["cwd"]) / raw_f
+        else:
+            file_path = Path(top or ctx["cwd"]) / raw_f
+        if not file_path.is_file():
+            return refuse(reason=f"--file: no such file: {file_path}")
+        try:
+            file_display = str(file_path.relative_to(top)) if top else str(file_path)
+        except ValueError:
+            file_display = str(file_path)
+
+    # Hygiene gates: --done OR impl -> critic
+    review_req = sender_role == "impl" and "critic" in to_list
+    if args.done or review_req:
+        if fleet_dir and (fleet_dir / "STATUS.md").is_file():
+            if "PLACEHOLDER" in read_text(fleet_dir / "STATUS.md"):
+                return refuse(reason=".fleet/STATUS.md still contains PLACEHOLDER; run foreground checks and update it first")
+        if file_path and fleet_dir and inside(str(file_path), str(fleet_dir)):
+            if "PLACEHOLDER" in read_text(file_path):
+                return refuse(reason=f"{file_display} still contains PLACEHOLDER; replace placeholders first")
+        if sender_role == "impl" and git_top:
+            dirty = dirty_count(git_top)
+            if dirty is None:
+                return refuse(reason="git status failed; cannot verify clean working tree")
+            if dirty > 0:
+                return refuse(reason=f"worktree has {plural(dirty, 'uncommitted change')} outside .fleet/; "
+                                     "commit work before requesting review or posting --done")
+
+    # Explicit worker pane IDs must be alive before mutating anything; orch panes and orch:<name> are board-only
+    for t in to_list:
+        if is_explicit_pane_target(t) and t not in orch_panes:
+            st = pane_state(t)
+            if st != "alive":
+                return refuse(reason=f"target pane {t} is {st} (not alive)", pane=t)
+
+    # Determine round number
+    round_num = args.round
+    if round_num is None and file_path:
+        m = REVIEW_REQUEST_FILE.match(file_path.name) or REVIEW_FILE.match(file_path.name)
+        if m:
+            round_num = int(m.group(1))
+    if round_num is None and review_req and fleet_dir and (fleet_dir / "STATUS.md").is_file():
+        ready_rounds = [int(n) for n in READY_LINE.findall(read_text(fleet_dir / "STATUS.md"))]
+        if ready_rounds:
+            round_num = max(ready_rounds)
+
+    # Risk gate
+    risk_needs = False
+    rstate: dict = {}
+    if git_top and not args.blocked and (args.done or review_req or (sender_role == "critic" and "impl" in to_list)):
+        rstate = risk_state(git_top, home)
+        risk_needs = needs_user(rstate)
+        if args.done and sender_role == "impl" and risk_needs:
+            detail = rstate.get("error") or high_risk_text(rstate["needs_user"])
+            return refuse(reason=f"high-risk diff needs user approval before posting --done ({detail})", risk=rstate)
+
+    tag: str | None = None
+    escalated_reason: str | None = None
+    held = False
+    pending_peers: list[str] = []
+    body_files: list[str] = [str(file_path)] if file_path else []
+    verdict_summary: str | None = None
+
+    if args.blocked:
+        tag = "blocked"
+        to_list = ["orch"]
+    elif sender_role == "critic" and ("impl" in to_list or args.done):
+        requests, reviews = review_rounds(fleet_dir) if fleet_dir else ({}, {})
+        if round_num is None and (reviews or requests):
+            round_num = max(reviews or requests)
+        expected_files = round_files(fleet_dir, round_num, requests, reviews) if (fleet_dir and round_num is not None) else []
+        live_critics = [p for p, r in panes.items() if r.get("role") == "critic" and pane_state(p) == "alive"]
+        if len(expected_files) > 1:
+            missing = [f.name for f in expected_files if review_verdict(f) is None]
+            if missing:
+                held, pending_peers = True, missing
+            else:
+                verdicts = [review_verdict(f) for f in expected_files]
+                body_files = [str(f) for f in expected_files]
+        else:
+            if len(live_critics) > 1 and round_num is not None:
+                posted_panes = {
+                    (e.get("from") or {}).get("pane") for e in board_snapshot(home)[0]
+                    if e.get("kind") == "post" and e.get("round") == round_num
+                    and (e.get("from") or {}).get("role") == "critic"
+                }
+                missing_panes = [p for p in live_critics if p != me_pane and p not in posted_panes]
+                if missing_panes:
+                    held, pending_peers = True, missing_panes
+            target_rev = expected_files[0] if expected_files else file_path
+            if target_rev and target_rev.is_file():
+                v = review_verdict(target_rev)
+                verdicts = [v] if v else ([] if not args.done else ["APPROVE"])
+                if str(target_rev) not in body_files:
+                    body_files = [str(target_rev)]
+            else:
+                verdicts = ["APPROVE"] if args.done else []
+
+        if held:
+            entry = record_board(
+                home, "post", orch=ctx["orch"], lane=top, branch=ctx["branch"],
+                from_info={"pane": me_pane, "role": sender_role, "name": ctx["sender_label"], "agent": ctx["sender_agent"]},
+                to=[], to_panes=[], mentions=[], tag=None, file=file_display, round_num=round_num,
+                refs=refs, text=summary, pending_peers=pending_peers,
+            )
+            print(json.dumps({"ok": True, "seq": entry["seq"], "held": True, "pending_peers": pending_peers,
+                              "delivered": [], "entry": entry}, indent=2, ensure_ascii=False))
+            return 0
+
+        unique_v = {v for v in verdicts if v}
+        if unique_v == {"APPROVE"}:
+            tag = "done"
+            verdict_summary = "APPROVE"
+            to_list = ["orch"]
+        elif len(unique_v) > 1:
+            tag = "escalate"
+            verdict_summary = ", ".join(sorted(unique_v))
+            escalated_reason = "dual_critic_split"
+            to_list = ["orch"]
+        else:
+            verdict_summary = next(iter(unique_v), None)
+            limit = review_round_limit()["limit"]
+            if (round_num is not None and round_num >= limit) or len(reviews) >= limit:
+                tag = "escalate"
+                escalated_reason = "review_round_limit"
+                to_list = ["orch"]
+            elif risk_needs:
+                tag = "escalate"
+                escalated_reason = "high_risk_diff"
+                if "orch" not in to_list:
+                    to_list = [*to_list, "orch"]
+    elif args.done:
+        tag = "done"
+    elif "critic" in to_list:
+        live_critics = [p for p, r in panes.items() if r.get("role") == "critic" and pane_state(p) == "alive"]
+        if not live_critics:
+            tag = "escalate"
+            escalated_reason = "no_critic_pane"
+            if "orch" not in to_list:
+                to_list = [*to_list, "orch"]
+        elif risk_needs and sender_role == "impl":
+            tag = "escalate"
+            escalated_reason = "high_risk_diff"
+            if "orch" not in to_list:
+                to_list = [*to_list, "orch"]
+
+    # Resolve target worker panes for inbox delivery (never submit_prompt to orch!)
+    worker_roles = {"impl", "critic", "planner", "researcher", "helper"}
+    target_panes: list[tuple[str, str]] = []
+    seen_p: set[str] = set()
+    board_to: list[str] = []
+    board_to_panes: list[str] = []
+    seen_board_p: set[str] = set()
+
+    def add_board_to(tok: str) -> None:
+        if tok not in board_to:
+            board_to.append(tok)
+
+    def add_board_pane(p: str) -> None:
+        if p not in seen_board_p:
+            seen_board_p.add(p)
+            board_to_panes.append(p)
+
+    for t in to_list:
+        add_board_to(t)
+        if t == "orch" or t == "all" or ORCH_TARGET_RE.fullmatch(t):
+            continue
+        if is_explicit_pane_target(t):
+            if t in orch_panes:
+                oname = orch_panes[t]
+                add_board_to(f"orch:{oname}")
+                if len(orchs) <= 1:
+                    add_board_to("orch")
+                add_board_pane(t)
+                continue
+            agent_name = (panes.get(t) or {}).get("agent") or (pane_info(t).get("agent") or "claude")
+            if t not in seen_p:
+                seen_p.add(t)
+                target_panes.append((t, agent_name))
+            add_board_pane(t)
+            continue
+        if t in worker_roles:
+            if t == "critic" and escalated_reason == "no_critic_pane":
+                continue
+            matches = [
+                (p, (r.get("agent") or "claude"))
+                for p, r in sorted(panes.items())
+                if r.get("role") == t and pane_state(p) == "alive"
+            ]
+            if not matches:
+                return refuse(reason=f"no live {t} pane registered in {(fleet_dir / PANES_FILE) if fleet_dir else '.fleet/panes.json'}")
+            for p, ag in matches:
+                if p not in seen_p:
+                    seen_p.add(p)
+                    target_panes.append((p, ag))
+                add_board_pane(p)
+
+    if target_panes and not args.queue:
+        for p, _ in target_panes:
+            if not wait_not_working(p, args.timeout):
+                print(json.dumps({"ok": False, "changed": "nothing", "pane_id": p, "status": "working",
+                                  "reason": f"target pane {p} still busy after {args.timeout:g}s; rerun with --queue"},
+                                 indent=2, ensure_ascii=False))
+                return 3
+
+    mentions = format_post_mentions(board_to)
+    entry = record_board(
+        home, "post", orch=ctx["orch"], lane=top, branch=ctx["branch"],
+        from_info={"pane": me_pane, "role": sender_role, "name": ctx["sender_label"], "agent": ctx["sender_agent"]},
+        to=board_to, to_panes=board_to_panes, mentions=mentions, tag=tag,
+        file=file_display, round_num=round_num, refs=refs, text=summary,
+        escalated_reason=escalated_reason, verdict=verdict_summary,
+    )
+
+    delivered: list[dict] = []
+    if target_panes:
+        delivery_cwd = top or ctx["cwd"]
+        inbox_path = write_post_inbox(delivery_cwd, entry, body_files)
+        sender_who = sender_role or me_pane or "peer"
+        if ctx["branch"]:
+            sender_who = f"{sender_who}@{ctx['branch']}"
+        pointer = f"Read {inbox_path} (board #{entry['seq']} from {sender_who})."
+        for p, ag in target_panes:
+            res = submit_prompt(p, ag, pointer)
+            res["inbox_file"] = str(inbox_path)
+            delivered.append(res)
+            record("send", delivery_cwd, pane=p, agent=ag, branch=ctx["branch"], text=pointer,
+                   file=str(inbox_path), ok=res["ok"], status=res.get("status"), reason=res.get("reason"))
+
+    ok = all(d["ok"] for d in delivered) if delivered else True
+    out = {
+        "ok": ok,
+        "seq": entry["seq"],
+        "escalated": escalated_reason is not None,
+        **({"escalated_reason": escalated_reason} if escalated_reason else {}),
+        "entry": entry,
+        "delivered": delivered,
+    }
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+    return 0 if ok else 2
 
 
 # --------------------------------------------------------------------------
@@ -7066,6 +8074,10 @@ def lane_context(data: dict, env, run: HookRun) -> str | None:
                 f"This checkout has a fleet record at {fleet_md}. If you orchestrate that fleet, read it before "
                 "you act and load the fleet:fleet skill."
             )
+    if parts and ((d / LANE_FILE).is_file() or (
+        (d / "BRIEF.md").is_file() and "fleet post" in read_text(d / "BRIEF.md")
+    )):
+        parts.append(f"Fleet CLI: `{helper_command(env)}`.")
     return "\n\n".join(parts) or None
 
 
@@ -7198,6 +8210,42 @@ def build_parser() -> argparse.ArgumentParser:
     wa.add_argument("--blocked-grace", type=float, default=30, help="seconds blocked before reporting (default 30)")
     wa.add_argument("--timeout", type=float, default=14400, help="give up after this many seconds (default 4 h)")
     wa.set_defaults(func=cmd_watch)
+
+    wt = sub.add_parser("wait", help="wait for board #seq messages, a file marker, or tracked pane transitions",
+                        description="Exit codes: 0 board message or marker found, 4 blocked, 5 agent exited or pane "
+                                    "gone, 6 stopped without posting, 7 timeout.")
+    wt.add_argument("--since", type=int, help="wake on board entries with seq > N (default: orch digest last_seq, else 0)")
+    wt.add_argument("--project", help="fleet project name (default: current repository)")
+    wt.add_argument("--orch", help="orchestrator identity filter")
+    wt.add_argument("--lanes", help="comma-separated lane/branch filters")
+    wt.add_argument("--mentions-only", action="store_true",
+                    help="wake only when addressed by @role, @pane, @orch:<name>, or @all")
+    wt.add_argument("--pane", help="also monitor a specific pane (or use with --marker/--file)")
+    wt.add_argument("--marker", help="text to wait for at the start of a line in --file (requires --pane)")
+    wt.add_argument("--file", help="file to search with --marker, relative to --pane worktree (default .fleet/STATUS.md)")
+    wt.add_argument("--interval", type=float, default=2, help="seconds between checks (default 2)")
+    wt.add_argument("--idle-grace", type=float, default=180,
+                    help="seconds a pane may sit idle without posting (default 180)")
+    wt.add_argument("--blocked-grace", type=float, default=30, help="seconds blocked before reporting (default 30)")
+    wt.add_argument("--timeout", type=float, default=14400, help="give up after this many seconds (default 4 h)")
+    wt.set_defaults(func=cmd_wait)
+
+    po = sub.add_parser("post", help="post a #seq board message and deliver peer handoffs via .fleet/inbox/")
+    po.add_argument("--to", action="append", required=True,
+                    help="target role (impl, critic, planner, researcher, helper, orch, all), orch:<name>, or pane ID; repeatable")
+    tag_grp = po.add_mutually_exclusive_group()
+    tag_grp.add_argument("--done", action="store_true", help="mark work done (enforces hygiene & risk gates)")
+    tag_grp.add_argument("--blocked", action="store_true", help="escalate a blocker to @orch")
+    po.add_argument("--file", help="artifact file path attached to the post and inbox note")
+    po.add_argument("--refs", help="comma-separated referenced board sequence numbers, e.g. '12,15'")
+    po.add_argument("--round", type=int, help="review round number")
+    po.add_argument("--lane", help="lane worktree path (default: cwd)")
+    po.add_argument("--project", help="fleet project name (default: cwd project)")
+    po.add_argument("--orch", help="orchestrator name (default: lane owner or current orch)")
+    po.add_argument("--queue", action="store_true", help="deliver to busy worker panes immediately instead of waiting")
+    po.add_argument("--timeout", type=float, default=30, help="seconds to wait for busy worker panes (default 30)")
+    po.add_argument("summary", help="short one-line summary for the board message")
+    po.set_defaults(func=cmd_post)
 
     w = sub.add_parser("worktree", help="herdr worktree + workspace for a lane, with .fleet/ ready")
     w.add_argument("branch")
@@ -7347,6 +8395,10 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--project", help="a project name (default: the project of this directory)")
     b.add_argument("--orch", help="the orch whose board this is (default: the caller's orch)")
     b.add_argument("--all", action="store_true", help="every lane of the project, with its orch; saves nothing")
+    b.add_argument("--since", type=int, metavar="SEQ", help="read board messages after SEQ (fast feed mode)")
+    b.add_argument("--seqs", help="comma-separated #seq IDs to fetch (fast feed mode)")
+    b.add_argument("--limit", type=int, metavar="N", help="max messages in feed mode (default 20 without --since; 0 for all)")
+    b.add_argument("--lanes", action="store_true", help="include lane status table even in feed mode")
     b.add_argument("--json", action="store_true")
     b.set_defaults(func=cmd_board)
 

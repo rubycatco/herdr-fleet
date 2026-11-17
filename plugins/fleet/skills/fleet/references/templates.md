@@ -1,6 +1,6 @@
 # Fleet file templates
 
-The orchestrators' own files, PROJECT.md, each orch's ORCH.md and the research files, live in the project home (`~/.fleet/projects/<name>/`). All lane files live in `.fleet/` at the top of the lane's worktree. `fleet prep` and `fleet worktree` create the folder and add `/.fleet/` to the repository's `.git/info/exclude`, so nothing here is committed. `.fleet/lane.json` names the orch that owns the lane (`orch`, `project`, `branch`, `since`, `by`): `fleet worktree` writes it, `fleet spawn` writes it into an unowned lane, and only `fleet adopt` moves it; do not edit it by hand. Keep each file short: link to plans, issues, PRs and specs instead of copying them.
+The orchestrators' own files, PROJECT.md, each orch's ORCH.md and the research files, live in the project home (`~/.fleet/projects/<name>/`). All lane files live in `.fleet/` at the top of the lane's worktree. `fleet prep` and `fleet worktree` create the folder and add `/.fleet/` to the repository's `.git/info/exclude`, so nothing here is committed. `.fleet/lane.json` names the orch that owns the lane (`orch`, `project`, `branch`, `since`, `by`): `fleet worktree` writes it, `fleet spawn` writes it into an unowned lane, and only `fleet adopt` moves it; do not edit it by hand. Keep each file short: link to plans, issues, PRs and specs instead of copying them, and cite earlier board messages by `#<seq>` (`fleet board --seqs <n>`) instead of repeating their text. For worker or Codex panes (where `$CLAUDE_PLUGIN_ROOT` is unset), put the resolved helper path (`python3 "<PLUGIN_ROOT>/scripts/fleet"`) in the file.
 
 ## BRIEF.md (the orchestrator writes it; the lane reads it first)
 
@@ -15,14 +15,15 @@ The orchestrators' own files, PROJECT.md, each orch's ORCH.md and the research f
 - Out: <what it must not touch; other lanes own it>
 
 ## Sources
-- <issue / plan / spec / PR links and paths the lane must read>
+- <issue / plan / spec / PR links, paths, or board #seq refs (`fleet board --seqs <n>`)>
 
 ## Setup (do this first)
 - <project worktree setup, if the project documents one>
 
 ## Constraints
 - <project rules that matter here: tests, style, migrations, flags>
-- Ask the orchestrator (write the question under "Blocked" in STATUS.md and stop) instead of guessing on product or design decisions.
+- Fleet CLI: `<resolved python3 .../scripts/fleet>` (use this exact path for `fleet post` and `fleet board`).
+- Ask the orchestrator (`<fleet> post --to orch --blocked "<question>"`, and note it under "Blocked" in STATUS.md) instead of guessing on product or design decisions.
 
 ## Acceptance
 - <observable checks: behaviour, tests that pass, docs updated>
@@ -35,8 +36,8 @@ The orchestrators' own files, PROJECT.md, each orch's ORCH.md and the research f
   <with an approved .fleet/PLAN.md instead: the Plan section points to PLAN.md and lists only deviations from it>
 - Commit at each working step on branch <branch>. Do not push unless this brief says so.
 - A change to a high-risk path (a migration, auth or payments, deletion logic, a hotfix) that the approved plan did not show needs the user before merge: note it in STATUS.md.
-- When done, add the line `READY FOR REVIEW: round 1` to STATUS.md and stop.
-- <who reviews; critic files are .fleet/REVIEW-<n>.md>
+- When done with checks in the foreground (clean git tree, no `PLACEHOLDER` in STATUS.md), add the line `READY FOR REVIEW: round 1` to STATUS.md and run `<fleet> post --to critic --file .fleet/STATUS.md --round 1 "<1-line summary>"`, then stop. (If no critic pane is open yet, `post` wakes the orchestrator; on later rounds with a live critic pane it hands off directly.)
+- <who reviews; critic files are .fleet/REVIEW-<n>.md; cite #seq instead of copying prose>
 ```
 
 ## PLAN.md (the orchestrator starts it; the planner writes it)
@@ -87,7 +88,7 @@ The orchestrator writes the title, `Asked:`, Question and Context; the researche
 
 Asked: <date>, by pane <orchestrator pane>, for <lane branch | the project>
 
-Researcher: when the answer is complete, the last line of this file says RESEARCH DONE and nothing else. Until then, read code, docs and the web as you need, run only commands that change nothing, change no file except this one, and fill in Findings, Answer and Open questions.
+Researcher: when the answer is complete, the last line of this file says RESEARCH DONE and nothing else, then run `<fleet cmd> post --to orch --done --file <this file> "<1-line answer>"` (or `--blocked "<question>"` if stuck). Until then, read code, docs and the web as you need, run only commands that change nothing, change no file except this one, and fill in Findings, Answer and Open questions.
 
 ## Question
 <one question, and what the answer is for>
@@ -142,11 +143,17 @@ The `READY FOR REVIEW: round <n>` line is the marker watchers look for. A marker
 - Worktree: <path>   Branch: <branch>   Base: <base ref>
 - Diff: `git diff <base>...HEAD` (or the commit range <a>..<b> for a re-check round)
 - Read first: .fleet/BRIEF.md, .fleet/STATUS.md
+- Refs: #<seq> (use `<fleet> board --seqs <seq>` instead of copying prior prose)
+- Fleet CLI: <resolved python3 .../scripts/fleet>
 - Focus: <correctness, concurrency, security, data loss, tests ...>
 - High-risk paths: <what `fleet risk` prints: each match with its category and who covers it, or "none">
 - Round rule: <round 1: full review | later rounds: re-check the fixes for REVIEW-<n-1> and look for regressions; new findings block only at <severity>>
 
 Write findings to .fleet/REVIEW-<n>.md, most severe first, each with file:line, the failure scenario and a fix direction. End with one line: `VERDICT: APPROVE` or `VERDICT: CHANGES REQUESTED`. Do not edit code.
+Then post on the board with `<fleet> post`:
+- `VERDICT: APPROVE` (and no uncovered high-risk path): `<fleet> post --to orch --done --file .fleet/REVIEW-<n>.md --round <n> "VERDICT: APPROVE on round <n>."`
+- `VERDICT: CHANGES REQUESTED` (`Risk: none`, `n < limit`, no design/product question): `<fleet> post --to impl --file .fleet/REVIEW-<n>.md --round <n> "CHANGES REQUESTED round <n>: <1-line summary>. Fix and post round <n+1>."` (dual-critic verdicts auto-sync; split verdicts or round limit auto-escalate to orch).
+- Blocker / design decision: `<fleet> post --to orch --blocked --file .fleet/REVIEW-<n>.md --round <n> "<question>"`
 ```
 
 ## RISK.md (only `fleet approve-risk` writes it)

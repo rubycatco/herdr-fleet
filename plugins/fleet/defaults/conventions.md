@@ -12,6 +12,7 @@
 ## Critic
 - One critic per review round, in its own pane in the lane's worktree: Codex when it is installed, otherwise Claude Code, with the model and effort that its configuration sets.
 - The critic writes findings to .fleet/REVIEW-<n>.md, most severe first, and never edits code.
+- Peer-to-peer review: on `Risk: none` lanes with a live critic pane, implementer and critic hand rounds back and forth via `fleet post` (`--to critic` / `--to impl`) using zero-copy `#seq` citations, waking the orchestrator only on `VERDICT: APPROVE` (`--done`), `--blocked`, dual-critic disagreement, an uncovered high-risk path, or the review round limit. If no critic pane exists yet (e.g. Round 1), `fleet post --to critic` auto-escalates to the orchestrator so it can spawn the critic(s).
 - Stop rule: from round 3, the critic re-checks earlier fixes and looks for regressions only. New findings block only when they are high severity; the rest become follow-ups.
 - Review round limit: 4. When a lane's review files reach this many round numbers, `fleet board` says so, and the orchestrator asks the user before it starts another round. Keep this line's form: `- Review round limit: <n>`.
 
@@ -26,7 +27,7 @@
 ## Context and handoff
 - Reset a lane (/clear, then re-brief from .fleet/) at its next commit once its context passes about 60 %, or once it has auto-compacted (`fleet board` notes a lane that compacted since its last reset).
 - Use /compact only when an agent cannot stop at a boundary.
-- Hand the orchestrator off to a new pane when its context passes about 70 %.
+- Hand the orchestrator off to a new pane when its context passes about 70 % (`digest.json` preserves `last_seq` across `/clear` and handoff so `fleet wait --since <last_seq>` resumes cleanly).
 - New panes split beside the caller (right when the pane is wide, down when it is tall). Lanes get their own worktree workspace.
 
 ## Accounts
